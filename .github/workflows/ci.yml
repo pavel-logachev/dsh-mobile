@@ -30,9 +30,14 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-          cache-dependency-path: host/package-lock.json
+          cache-dependency-path: |
+            host/package-lock.json
+            relay/package-lock.json
       - name: Install locked dependencies
-        run: npm ci
+        # Host relay integration tests import the relay package from ../relay.
+        run: |
+          npm ci
+          npm ci --prefix ../relay
       - name: Compile host
         run: npm run build
       - name: Test host public boundaries

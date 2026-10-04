@@ -97,13 +97,18 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-          cache-dependency-path: host/package-lock.json
+          cache-dependency-path: |
+            host/package-lock.json
+            relay/package-lock.json
       - name: Install locked dependencies and test host
         working-directory: host
         shell: pwsh
         run: |
           npm ci
           if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+          # Host relay integration tests import the relay package from ../relay.
+          npm ci --prefix ../relay
+          if ($LASTEXITCODE -ne 0) { throw 'relay npm ci failed' }
           npm run build
           if ($LASTEXITCODE -ne 0) { throw 'Host build failed' }
           npm test
