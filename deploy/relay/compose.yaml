@@ -1,0 +1,67 @@
+name: dsh-mobile-relay
+
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: deploy/relay/Dockerfile
+    image: dsh-mobile-relay:0.2.0
+    container_name: dsh-mobile-relay
+    labels:
+      org.dsh-mobile-relay.transaction: ${RELAY_TRANSACTION:?Set unique RELAY_TRANSACTION matching armed rollback guard}
+    command:
+      - serve
+      - --state
+      - /data/relay.sqlite
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "8088"
+      - --external-tls
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    volumes:
+      - relay-data:/data
+    networks:
+      - relay-internal
+    expose:
+      - "8088"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8088/healthz',{signal:AbortSignal.timeout(1500)}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+          pids: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  relay-data:
+    name: dsh-mobile-relay-data
+
+networks:
+  relay-internal:
+    name: dsh-mobile-relay-internal
+    driver: bridge
+    internal: true

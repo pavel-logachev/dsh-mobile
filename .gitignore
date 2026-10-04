@@ -1,0 +1,47 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+local.properties
+**/local.properties
+/state/
+/runtime/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+
+# Dependencies/build output
+node_modules/
+dist/
+coverage/
+.gradle/
+**/.gradle/
+.kotlin/
+**/.kotlin/
+**/build/
+*.apk
+*.aab
+.idea/
+*.iml
+
+# Local acceptance artifacts
+artifacts/
+.impeccable/
+docs/private/
+deploy/relay/image-receipt.json
+deploy/relay/repair-receipt.json
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# Immutable versioned host builds mounted by the live DSH profile
+host/releases/

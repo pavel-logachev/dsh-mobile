@@ -1,0 +1,7 @@
+**
+!relay/
+!relay/package.json
+!relay/package-lock.json
+!relay/tsconfig.json
+!relay/src/
+!relay/src/**

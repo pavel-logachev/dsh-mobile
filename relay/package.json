@@ -1,0 +1,13 @@
+{
+  "name": "dsh-mobile-relay",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Bounded opaque TLS relay for the DSH Mobile companion",
+  "engines": { "node": ">=24.0.0 <25" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "bin": { "dsh-mobile-relay": "./dist/cli.js" },
+  "scripts": { "build": "tsc -p tsconfig.json", "test": "node --test test/*.test.ts", "check": "npm run build && npm test", "start": "node dist/cli.js serve" },
+  "dependencies": { "ws": "8.22.0" },
+  "devDependencies": { "@types/node": "^24.0.0", "@types/ws": "^8.18.1", "typescript": "^5.9.3" }
+}

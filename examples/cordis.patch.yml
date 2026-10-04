@@ -1,0 +1,23 @@
+# Generic, disabled example. Do NOT copy it into a running profile automatically.
+# Absolute placeholders below must be replaced in a private operator-owned copy.
+# This is the inspected Cordis patch insertion shape, not a dsh CLI command.
+- insert:
+    - id: dsh-mobile-companion
+      name: dsh-mobile-host/plugin
+      disabled: true
+      config:
+        # Explicit operator-declared compatibility; not automatic version detection.
+        dshVersion: '0.2.0-rc.2'
+        hostName: 'My private DSH companion'
+        bind: '127.0.0.1'
+        port: 9443
+        statePath: '<ABSOLUTE_PRIVATE_STATE_DIRECTORY>/mobile.sqlite'
+        workspaces:
+          - id: project
+            name: 'My project'
+            path: '<ABSOLUTE_OWNER_CONFIGURED_WORKSPACE>'
+        tls:
+          certPath: '<ABSOLUTE_PRIVATE_CERTIFICATE_PEM>'
+          keyPath: '<ABSOLUTE_PRIVATE_KEY_PEM>'
+        # Never enable insecure transport for real phone/production operation.
+        allowInsecureLoopback: false

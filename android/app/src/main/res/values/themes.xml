@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose supplies Material3 colors; this platform theme covers the launch window. -->
+    <style name="Theme.DshMobile.Base" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:colorAccent">@color/brand_accent</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <!-- API 26 has light navigation icons only; keep their background dark. -->
+        <item name="android:navigationBarColor">@color/launcher_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+    <style name="Theme.DshMobile" parent="Theme.DshMobile.Base" />
+</resources>

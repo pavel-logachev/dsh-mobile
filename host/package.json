@@ -1,0 +1,65 @@
+{
+  "name": "dsh-mobile-host",
+  "version": "0.1.0",
+  "description": "Private native mobile companion host for an existing DSH runtime",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "default": "./dist/plugin.js"
+    },
+    "./fixture": {
+      "types": "./dist/fixture-adapter.d.ts",
+      "default": "./dist/fixture-adapter.js"
+    },
+    "./demo": {
+      "types": "./dist/demo.d.ts",
+      "default": "./dist/demo.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./state": {
+      "types": "./dist/state.d.ts",
+      "default": "./dist/state.js"
+    },
+    "./relay-connector": {
+      "types": "./dist/relay-connector.d.ts",
+      "default": "./dist/relay-connector.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    }
+  },
+  "bin": {
+    "dsh-mobile-admin": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "demo": "node dist/demo.js",
+    "test": "node --test test/*.test.ts",
+    "check": "npm run build && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "8.18.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "ws": "8.22.0"
+  }
+}

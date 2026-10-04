@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.DshMobile" parent="Theme.DshMobile.Base">
+        <item name="android:navigationBarColor">@color/window_background</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>
