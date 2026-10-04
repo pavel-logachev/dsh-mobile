@@ -149,7 +149,13 @@ internal class RelayLoopbackProxy(
                         parameters.protocols = parameters.protocols.filter { it == "TLSv1.2" || it == "TLSv1.3" }.toTypedArray()
                         if (parameters.protocols.isEmpty()) throw IOException("relay TLS unavailable")
                     }
-                    override fun onOpen(handshake: ServerHandshake) { }
+                    override fun onOpen(handshake: ServerHandshake) {
+                        // Java-WebSocket uses receiveBufferSize for both its decode byte[] and SO_RCVBUF.
+                        // Keep the 8-KiB decode/header guard, but restore a separate TCP window after upgrade.
+                        // Linux's tiny window otherwise trickles a burst response so slowly that its queued
+                        // pong misses the unchanged ten-second upload barrier deadline.
+                        network.receiveBufferSize = 64 * 1024
+                    }
                     override fun onMessage(message: String) { this@Tunnel.close() }
                     override fun onMessage(bytes: ByteBuffer) {
                         try {

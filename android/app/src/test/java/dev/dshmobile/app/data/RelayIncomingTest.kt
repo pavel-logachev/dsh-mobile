@@ -92,6 +92,48 @@ class RelayIncomingTest {
         } finally { release.countDown(); input.abort(); worker.shutdownNow() }
     }
 
+    @Test fun `full inbound queue backpressures the receiver and resumes without losing accepted bytes`() {
+        val input = RelayIncoming()
+        val output = ByteArrayOutputStream()
+        val writing = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val offering = CountDownLatch(1)
+        val workers = Executors.newFixedThreadPool(2)
+        val first = ByteArray(32 * 1024) { 0 }
+        val drain = workers.submit {
+            input.drainTo(object : OutputStream() {
+                override fun write(byte: Int) { output.write(byte) }
+                override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                    if (output.size() == 0) {
+                        writing.countDown()
+                        assertTrue(release.await(3, TimeUnit.SECONDS))
+                    }
+                    output.write(bytes, offset, length)
+                }
+            })
+        }
+        try {
+            input.offer(first)
+            assertTrue(writing.await(2, TimeUnit.SECONDS))
+            repeat(8) { index -> input.offer(ByteArray(32 * 1024) { (index + 1).toByte() }) }
+            val last = workers.submit {
+                offering.countDown()
+                input.offer(ByteArray(32 * 1024) { 9 })
+                input.finish()
+            }
+            assertTrue(offering.await(2, TimeUnit.SECONDS))
+            assertThrows(java.util.concurrent.TimeoutException::class.java) { last.get(100, TimeUnit.MILLISECONDS) }
+            release.countDown()
+            last.get(2, TimeUnit.SECONDS)
+            drain.get(2, TimeUnit.SECONDS)
+            assertEquals(10 * 32 * 1024, output.size())
+            val result = output.toByteArray()
+            repeat(10) { index ->
+                assertArrayEquals(ByteArray(32 * 1024) { index.toByte() }, result.copyOfRange(index * 32 * 1024, (index + 1) * 32 * 1024))
+            }
+        } finally { release.countDown(); input.abort(); workers.shutdownNow() }
+    }
+
     @Test fun `explicit retirement aborts pending bytes even after EOF`() {
         val input = RelayIncoming()
         val writing = CountDownLatch(1)

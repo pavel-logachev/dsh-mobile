@@ -36,6 +36,7 @@ class RelayTlsTest {
                     host.enqueue(MockResponse().setBody(payload))
                     client.newCall(Request.Builder().url(endpoint.baseUrl + "/v1/capabilities").header("Authorization", "Bearer synthetic-device-secret").build()).execute().use {
                         assertEquals(200, it.code)
+                        assertEquals(okhttp3.Protocol.HTTP_2, it.protocol)
                         assertEquals(payload, it.body!!.string())
                     }
                     val received = host.takeRequest(5, TimeUnit.SECONDS)!!
@@ -46,6 +47,41 @@ class RelayTlsTest {
                     assertEquals("Bearer $bootstrapToken", bridge.headers.first().getFieldValue("Authorization"))
                     assertFalse(bridge.headers.first().iterateHttpFields().asSequence().any { bridge.headers.first().getFieldValue(it).contains("synthetic-device-secret") })
                 } finally { client.dispatcher.cancelAll(); client.connectionPool.evictAll(); client.dispatcher.executorService.shutdown() }
+            }
+        }
+    }
+    @Test fun `large pinned HTTP2 response survives a paused body consumer without replay`() {
+        val certificate = HeldCertificate.Builder().addSubjectAlternativeName(logical).build()
+        withBridge(certificate) { host, bridge ->
+            val endpoint = endpoint(certificate, bridge)
+            RelayLoopbackProxy(endpoint).use { proxy ->
+                val client = SecureTransport.client(endpoint, proxy)
+                val consumer = java.util.concurrent.Executors.newSingleThreadExecutor()
+                val headersRead = java.util.concurrent.CountDownLatch(1)
+                val resume = java.util.concurrent.CountDownLatch(1)
+                try {
+                    val payload = "slow-synthetic:" + "z".repeat(2 * 1024 * 1024 - 32)
+                    host.enqueue(MockResponse().setBody(payload))
+                    val complete = consumer.submit<String> {
+                        client.newCall(Request.Builder().url(endpoint.baseUrl + "/v1/snapshot").build()).execute().use {
+                            assertEquals(200, it.code)
+                            assertEquals(okhttp3.Protocol.HTTP_2, it.protocol)
+                            headersRead.countDown()
+                            assertTrue(resume.await(5, TimeUnit.SECONDS))
+                            it.body!!.string()
+                        }
+                    }
+                    assertTrue(headersRead.await(3, TimeUnit.SECONDS))
+                    // Keep the app paused until a matching pong is queued behind the burst response.
+                    assertTrue(bridge.pongSent.await(3, TimeUnit.SECONDS))
+                    resume.countDown()
+                    assertEquals(payload, complete.get(8, TimeUnit.SECONDS))
+                    assertEquals("The response is not rescued by an HTTP retry", 1, host.requestCount)
+                    assertEquals("Only one relay stream", 1, bridge.headers.size)
+                } finally {
+                    resume.countDown(); consumer.shutdownNow()
+                    client.dispatcher.cancelAll(); client.connectionPool.evictAll(); client.dispatcher.executorService.shutdown()
+                }
             }
         }
     }
@@ -252,6 +288,7 @@ class RelayTlsTest {
     private class Bridge(private val target: Int) : WebSocketServer(InetSocketAddress("127.0.0.1", 0), 1, listOf(RelayWebSocketDraft())) {
         val started = java.util.concurrent.CountDownLatch(1)
         val headers = CopyOnWriteArrayList<ClientHandshake>()
+        val pongSent = java.util.concurrent.CountDownLatch(1)
         private val pipes = ConcurrentHashMap<WebSocket, Socket>()
         private val pingTimes = CopyOnWriteArrayList<Long>()
         @Volatile var maxPingsInWindow = 0
@@ -262,7 +299,10 @@ class RelayTlsTest {
             maxPingsInWindow = maxOf(maxPingsInWindow, pingTimes.count { now - it < TimeUnit.SECONDS.toNanos(1) })
             if (wrongPongs) {
                 connection.sendFrame(org.java_websocket.framing.PongFrame().apply { setPayload(ByteBuffer.wrap(byteArrayOf(9))) })
-            } else super.onWebsocketPing(connection, frame)
+            } else {
+                super.onWebsocketPing(connection, frame)
+                pongSent.countDown()
+            }
         }
         override fun onStart() { started.countDown() }
         override fun onOpen(connection: WebSocket, handshake: ClientHandshake) {
