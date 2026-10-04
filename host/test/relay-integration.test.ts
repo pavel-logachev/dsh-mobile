@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
 import { createServer as createTcpServer } from 'node:net';
 import { request as httpsRequest, Agent as HttpsAgent } from 'node:https';
 import { connect as tlsConnect } from 'node:tls';
@@ -22,7 +22,7 @@ const candidates = ['openssl', ...(process.platform === 'win32' && process.env.P
 const openssl = candidates.find(candidate => spawnSync(candidate, ['version'], { stdio: 'ignore' }).status === 0);
 async function reservePort(): Promise<number> { const server = createTcpServer(); await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve)); const port = (server.address() as { port: number }).port; await new Promise<void>(resolve => server.close(() => resolve())); return port; }
 async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-relay-integration-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-relay-integration-')));
   const relayState = new RelayState(join(dir, 'relay.sqlite')), owner = relayState.provisionRoute();
   const relay = createRelayServer({ state: relayState, port: 0, pathPrefix: '/transport' }); const outer = (await relay.start()).baseUrl;
   const hostname = `h-${owner.routeId}.dsh.invalid`, certPath = join(dir, 'inner.pem'), keyPath = join(dir, 'inner.key');

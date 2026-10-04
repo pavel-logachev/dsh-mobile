@@ -19,7 +19,7 @@ async function invitationOutput(invitation: unknown, flags: Map<string, string |
   const output = flags.has('--output') ? value(flags, '--output') : undefined;
   if (output) {
     if (!isAbsolute(output)) throw new HostError('invalid_request');
-    const path = await privatePath(output), invitations = join(dirname(configPath), 'invitations');
+    const path = await privatePath(output), invitations = await privatePath(join(dirname(configPath), 'invitations'));
     if (dirname(path) !== invitations) throw new HostError('unsafe_private_path');
     await privateDirectory(invitations);
     await privateWrite(path, JSON.stringify(invitation) + '\n');

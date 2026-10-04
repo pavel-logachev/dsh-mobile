@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -11,7 +11,7 @@ import { once } from 'node:events';
 const grants = { readWorkspaceIds: ['alpha'], executeWorkspaceIds: ['alpha'] };
 
 test('OS-released runtime lock excludes another process; crash restart safely recovers without blocking admin access', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-lock-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-lock-')));
   const path = join(dir, 'host.sqlite'), requestId = randomUUID();
   const child = spawn(process.execPath, [new URL('./fixtures/runtime-child.ts', import.meta.url).pathname.replace(/^\/(?=[A-Za-z]:)/, ''), path, requestId], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
   let state: HostState | undefined;
@@ -29,7 +29,7 @@ test('OS-released runtime lock excludes another process; crash restart safely re
 });
 
 test('wildcard grants persist all future scope, permit explicit execute under all read and reject execute without all read', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-wildcard-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-wildcard-')));
   const state = new HostState(join(dir, 'host.sqlite'));
   t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); });
   const all = { readWorkspaceIds: ['*'], executeWorkspaceIds: ['*'] };
@@ -42,7 +42,7 @@ test('wildcard grants persist all future scope, permit explicit execute under al
 });
 
 test('expiry and revocation deny credentials and execute grants must be a subset of read scope', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-state-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-state-')));
   let now = 1000;
   const state = new HostState(join(dir, 'host.sqlite'), { now: () => now });
   t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -60,7 +60,7 @@ test('expiry and revocation deny credentials and execute grants must be a subset
 });
 
 test('operator grant replacement is atomic, keeps credentials/receipts intact and refuses revoked or unknown devices', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-grant-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-grant-')));
   const path = join(dir, 'host.sqlite'), state = new HostState(path), admin = new HostState(path);
   t.after(() => { admin.close(); state.close(); rmSync(dir, { recursive: true, force: true }); });
   const paired = state.consumePairing(state.createPairing(grants).pairingToken, 'Synthetic phone');
@@ -81,7 +81,7 @@ test('operator grant replacement is atomic, keeps credentials/receipts intact an
 });
 
 test('only server-start recovers unfinished receipts; independent admin opens never alter dispatching state', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-state-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-state-')));
   const path = join(dir, 'host.sqlite');
   const state = new HostState(path);
   const admin = new HostState(path);
@@ -103,7 +103,7 @@ test('only server-start recovers unfinished receipts; independent admin opens ne
 });
 
 test('a pairing offer issues an individual credential once and cannot be reused', (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-state-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-state-')));
   const state = new HostState(join(dir, 'host.sqlite'));
   t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); });
   const offer = state.createPairing(grants);

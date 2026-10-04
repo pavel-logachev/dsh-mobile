@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash, createPrivateKey, X509Certificate, randomBytes } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
 import { HostState } from '../src/state.ts';
 import { mkdtemp, readFile, rm, writeFile, symlink, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -13,7 +14,7 @@ import { runAdminCli } from '../src/cli.ts';
 import { prepareConfiguration, pairingInvitation } from '../src/config.ts';
 
 async function setup(t: { after(fn: () => Promise<void>): void }) {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-mobile-setup-'));
+  const root = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-setup-')));
   t.after(async () => { await rm(root, { recursive: true, force: true }); });
   const configPath = join(root, 'private', 'host.json');
   let out = '', error = '';
@@ -52,6 +53,45 @@ test('setup-direct creates stable registry TLS identity satisfying Android trust
   assert.ok(!h.output().includes(key)); assert.ok(!h.output().includes(pem));
 });
 
+test('setup-direct and pairing accept short-name private roots without rotating canonical identity', { skip: process.platform !== 'win32' }, async t => {
+  const root = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-short-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const shortScript = '$f=New-Object -ComObject Scripting.FileSystemObject; $f.GetFolder($env:DSHM_TEST_ROOT).ShortPath';
+  const shortRoot = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(shortScript, 'utf16le').toString('base64')], { encoding: 'utf8', env: { ...process.env, DSHM_TEST_ROOT: root } }).trim();
+  if (shortRoot === root) { t.skip('This volume does not expose 8.3 names'); return; }
+  const canonicalConfig = join(root, 'private', 'host.json'), shortConfig = join(shortRoot, 'private', 'host.json');
+  const args = ['setup-direct', '--config', shortConfig, '--host', 'computer.example', '--dsh-version', '0.2.1-alpha.1'];
+  let errors = '';
+  const io = { out() {}, error(text: string) { errors += text; } };
+  assert.equal(await runAdminCli(args, io), 0, errors);
+  const config = JSON.parse(await readFile(canonicalConfig, 'utf8')), key = await readFile(config.tls.keyPath, 'utf8');
+  assert.equal(await runAdminCli(args, io), 0, errors);
+  assert.equal(await runAdminCli(['setup-direct', '--config', canonicalConfig, '--host', 'computer.example', '--dsh-version', '0.2.1-alpha.1'], io), 0, errors);
+  assert.equal(await runAdminCli(['setup-direct', '--config', canonicalConfig[0]!.toLowerCase() + canonicalConfig.slice(1), '--host', 'computer.example', '--dsh-version', '0.2.1-alpha.1'], io), 0, errors);
+  assert.equal(await readFile(config.tls.keyPath, 'utf8'), key);
+  assert.equal(config.statePath, join(root, 'private', 'state', 'host.sqlite'));
+  assert.equal(config.tls.keyPath, join(root, 'private', 'tls-key.pem'));
+  // The config and private output may use different spellings of the same directory.
+  const shortOutput = join(shortRoot, 'private', 'invitations', 'short.private.json');
+  assert.equal(await runAdminCli(['pair', '--config', canonicalConfig, '--read', 'all', '--output', shortOutput], io), 0, errors);
+  const canonicalOutput = join(root, 'private', 'invitations', 'long.private.json');
+  assert.equal(await runAdminCli(['pair', '--config', shortConfig, '--read', 'all', '--output', canonicalOutput], io), 0, errors);
+  assert.ok(JSON.parse(await readFile(shortOutput, 'utf8')).pairingToken);
+  assert.ok(JSON.parse(await readFile(canonicalOutput, 'utf8')).pairingToken);
+});
+
+test('built admin CLI executes through an 8.3 entry path', { skip: process.platform !== 'win32' }, async t => {
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-cli-url-')));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const entry = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+  const script = '$f=New-Object -ComObject Scripting.FileSystemObject; $f.GetFile($env:DSHM_TEST_ENTRY).ShortPath';
+  const shortEntry = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { encoding: 'utf8', env: { ...process.env, DSHM_TEST_ENTRY: entry } }).trim();
+  if (shortEntry === entry) { t.skip('This volume does not expose 8.3 names'); return; }
+  const result = spawnSync(process.execPath, [shortEntry, '--help'], { encoding: 'utf8', timeout: 15000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /DSH Mobile local administration/);
+});
+
 test('setup-direct refuses unsafe hosts, partial state and unverified version without overwriting identity', async t => {
   const h = await setup(t);
   const key = await readFile(h.config.tls.keyPath, 'utf8');
@@ -75,7 +115,7 @@ test('setup-direct refuses unsafe hosts, partial state and unverified version wi
 });
 
 test('pairing CLI requires explicit private output before creating any offer or state', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-mobile-output-consent-'));
+  const root = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-output-consent-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const configPath = join(root, 'host.json'), statePath = join(root, 'state', 'host.sqlite');
   await writeFile(configPath, JSON.stringify({ hostName: 'Synthetic output consent', workspaceSource: 'dsh-registry', bind: '127.0.0.1', port: 9443, allowInsecureLoopback: true, statePath }));

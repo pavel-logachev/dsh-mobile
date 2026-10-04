@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, realpath } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -14,7 +15,7 @@ import { FixtureAdapter, FIXTURE, MULTI_PROJECT_FIXTURE } from '../src/fixture-a
 import { createWorkspaceSource } from '../src/workspace-source.ts';
 
 async function harness(t: { after: (fn: () => Promise<void>) => void }, pollIntervalMs = 10000) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-mobile-adapter-'));
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-adapter-')));
   const alpha = join(dir, 'alpha');
   await mkdir(alpha);
   const frame = structuredClone(opening);

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -13,7 +13,7 @@ import { HostState } from '../src/state.ts';
 const routeId = 'a'.repeat(32), connectorToken = 'c'.repeat(43);
 const grants = { readWorkspaceIds: ['alpha'], executeWorkspaceIds: ['alpha'] };
 async function setup(t: { after: (fn: () => Promise<void>) => void }, ack = true) {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-connector-')), state = new HostState(join(dir, 'host.sqlite'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-connector-'))), state = new HostState(join(dir, 'host.sqlite'));
   const http = createServer(), wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 32768 });
   let control: WebSocket | undefined, generation = randomUUID();
   const snapshots: any[] = [], headers: any[] = [];

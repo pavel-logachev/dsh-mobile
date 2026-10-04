@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { runAdminCli } from '../src/cli.ts';
 import { prepareConfiguration, validateBaseUrl } from '../src/config.ts';
 import { tmpdir } from 'node:os';
@@ -36,7 +36,7 @@ class TestAdapter implements HostAdapter {
 }
 
 async function setup(t: TestContext, adapter: HostAdapter = new TestAdapter()) {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-server-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-server-')));
   mkdirSync(join(dir, 'alpha')); mkdirSync(join(dir, 'beta'));
   const config: HostConfiguration = { hostName: 'Test fixture only', bind: '127.0.0.1', port: 0, statePath: join(dir, 'host.sqlite'), allowInsecureLoopback: true, workspaces: ['alpha', 'beta'].map(id => ({ id, name: id, path: join(dir, id) })) };
   const host = await startHostServer({ config, adapter });
@@ -125,7 +125,7 @@ test('empty DSH cursor -1 is preserved and long message text is not silently tru
 });
 
 test('local CLI initializes state and issues only intentional invitation output; devices/revoke never disclose credentials', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-cli-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-cli-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const configPath = join(dir, 'private.config.json');
   let output = '', errors = '';
@@ -357,7 +357,7 @@ test('idle permission rechecks cannot republish obsolete history across an async
   const watching = new Promise<void>(resolve => { watchStarted = resolve; });
   const publishUpdate = new Promise<void>(resolve => { publish = resolve; });
   let reads = 0, watchOpen = false;
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-stream-order-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-stream-order-')));
   const adapter = new TestAdapter();
   const current = structuredClone(snapshot);
   current.messages = [{ id: 'new', role: 'assistant', text: 'NEW AUTHORITATIVE TEXT', createdAt: 2 }]; current.cursor = 2;

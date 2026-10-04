@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { HostState, hashSecret } from '../src/state.ts';
 import { randomUUID } from 'node:crypto';
 const routeId = 'a'.repeat(32), grants = { readWorkspaceIds: ['alpha'], executeWorkspaceIds: ['alpha'] };
-function setup(t: { after: (fn: () => void) => void }) { const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-relay-state-')); const state = new HostState(join(dir, 'state.sqlite')); t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); }); return state; }
+function setup(t: { after: (fn: () => void) => void }) { const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-relay-state-'))); const state = new HostState(join(dir, 'state.sqlite')); t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); }); return state; }
 
 test('failed or abandoned publication revokes new grants/devices and stale ACK cannot re-enable them', t => {
   const state = setup(t), offer = state.createRemotePairing(grants, routeId);
@@ -60,7 +60,7 @@ test('outstanding bootstrap offers are bounded transactionally and wrong-route c
 });
 
 test('expired relay offers are cleaned without ever gaining a direct pairing lane', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-relay-expiry-')); let now = Date.now();
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-relay-expiry-'))); let now = Date.now();
   const state = new HostState(join(dir, 'host.sqlite'), { now: () => now }); t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); });
   const remote = state.createRemotePairing(grants, routeId, 1000), direct = state.createPairing(grants, 5000);
   state.acknowledgeRelaySnapshot(routeId, state.relayGrantSnapshot(routeId), 'generation');
@@ -72,7 +72,7 @@ test('expired relay offers are cleaned without ever gaining a direct pairing lan
 });
 
 test('expired remote device credentials are denied at the inner API as well as omitted from outer snapshots', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-relay-expiry-')); let now = Date.now();
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-relay-expiry-'))); let now = Date.now();
   const state = new HostState(join(dir, 'host.sqlite'), { now: () => now }); t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); });
   const offer = state.createRemotePairing(grants, routeId); state.acknowledgeRelaySnapshot(routeId, state.relayGrantSnapshot(routeId), 'generation');
   const device = state.consumeRemotePairing(offer.pairingToken, 'Expires', routeId); state.acknowledgeRelaySnapshot(routeId, state.relayGrantSnapshot(routeId), 'generation');

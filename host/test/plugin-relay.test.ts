@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +10,7 @@ import { RelayState } from '../../relay/src/index.ts';
 const candidates = ['openssl', ...(process.platform === 'win32' && process.env.ProgramFiles ? [join(process.env.ProgramFiles, 'Git', 'mingw64', 'bin', 'openssl.exe')] : [])];
 const openssl = candidates.find(candidate => spawnSync(candidate, ['version'], { stdio: 'ignore' }).status === 0);
 test('installed Cordis private-config variant owns HTTPS/WSS lifecycle, preserves injected services and rejects mixed config', { skip: !process.env.DSH_MOBILE_CORDIS_MODULE || !openssl, timeout: 15000 }, async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-plugin-relay-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-plugin-relay-'))); t.after(() => rmSync(dir, { recursive: true, force: true }));
   const state = new RelayState(join(dir, 'relay.sqlite')); const owner = state.provisionRoute(); state.close();
   const reserve = createServer(); await new Promise<void>(resolve => reserve.listen(0, '127.0.0.1', resolve)); const port = (reserve.address() as { port: number }).port; await new Promise<void>(resolve => reserve.close(() => resolve()));
   for (const [name, host, san] of [['outer', '127.0.0.1', 'IP:127.0.0.1'], ['inner', `h-${owner.routeId}.dsh.invalid`, `DNS:h-${owner.routeId}.dsh.invalid`]]) assert.equal(spawnSync(openssl!, ['req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-nodes', '-days', '1', '-keyout', join(dir, name! + '.key'), '-out', join(dir, name! + '.pem'), '-subj', `/CN=${host}`, '-addext', `subjectAltName=${san}`], { stdio: 'ignore' }).status, 0);

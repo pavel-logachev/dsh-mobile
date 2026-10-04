@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, realpathSync } from 'node:fs';
 import { request as httpsRequest } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +16,7 @@ function opensslPath(): string | undefined {
 const openssl = opensslPath();
 
 test('real HTTPS verifies certificate identity and intentional invitation SPKI pin without changing OS trust', { skip: !openssl ? 'Local OpenSSL unavailable; no certificate generator is installed by tests' : false }, async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-mobile-tls-'));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-tls-')));
   const certPath = join(dir, 'localhost.pem'), keyPath = join(dir, 'localhost.key');
   const generated = spawnSync(openssl!, ['req', '-x509', '-newkey', 'rsa:2048', '-sha256', '-nodes', '-days', '1', '-keyout', keyPath, '-out', certPath, '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1'], { stdio: 'ignore' });
   assert.equal(generated.status, 0, 'Ephemeral synthetic certificate generation succeeds');

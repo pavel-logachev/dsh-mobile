@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, realpath, rm, readFile, writeFile, symlink, unlink, lstat } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -20,7 +21,7 @@ function workspace(id: string, path: string, title: string): DshWorkspace {
 }
 
 test('registry mode projects live sidebar order, sanitized names, new/renamed/deleted projects and missing directories', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-mobile-registry-'));
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-registry-')));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const alpha = join(dir, 'alpha'), beta = join(dir, 'beta');
   await mkdir(alpha); await mkdir(beta);
@@ -46,7 +47,7 @@ test('registry mode projects live sidebar order, sanitized names, new/renamed/de
 });
 
 test('distinct canonical paths differing only by case remain separate DSH workspace identities', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-mobile-path-case-'));
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-path-case-')));
   t.after(() => rm(dir, { recursive: true, force: true }));
   // Synthetic canonical filesystem results model case-sensitive Windows folders
   // without changing case-sensitivity flags on any host directory.
@@ -59,7 +60,7 @@ test('distinct canonical paths differing only by case remain separate DSH worksp
 });
 
 test('registry source fails closed for unavailable/invalid services and caps visible projects at one hundred', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-mobile-registry-limit-'));
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-registry-limit-')));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const config = { workspaceSource: 'dsh-registry' as const };
   await assert.rejects(createWorkspaceSource(config), { code: 'workspace_registry_unavailable' });
@@ -79,7 +80,7 @@ test('registry source fails closed for unavailable/invalid services and caps vis
 });
 
 test('registry source fails closed when its active service or visible revision changes during status awaits', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-mobile-registry-await-')), path = await realpath(dir);
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-registry-await-'))), path = await realpath(dir);
   t.after(() => rm(dir, { recursive: true, force: true }));
   for (const change of ['lost', 'replaced', 'deleted', 'reordered', 'renamed', 'retargeted', 'remapped'] as const) {
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
@@ -108,7 +109,7 @@ test('registry source fails closed when its active service or visible revision c
 });
 
 test('registry API lists new/renamed projects and all-scope sessions live, omits missing and archived entries without reload', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-mobile-registry-api-'));
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-registry-api-')));
   const alpha = join(dir, 'alpha'), beta = join(dir, 'beta'); await mkdir(alpha); await mkdir(beta);
   let projects = [workspace(ALPHA, await realpath(alpha), 'Альфа (демо)')], archived: string[] = [];
   const config = { workspaceSource: 'dsh-registry' as const, hostName: 'Synthetic registry API', bind: '127.0.0.1', port: 0, statePath: join(dir, 'host.sqlite'), allowInsecureLoopback: true };
@@ -146,7 +147,7 @@ test('registry API lists new/renamed projects and all-scope sessions live, omits
 });
 
 test('listed metadata cannot cross alpha-only grants when a junction cwd retargets within the old cache TTL', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-mobile-retarget-api-'));
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-retarget-api-')));
   const alpha = join(dir, 'alpha'), beta = join(dir, 'beta'), cwd = join(dir, 'session-cwd');
   await mkdir(alpha); await mkdir(beta);
   const alphaPath = await realpath(alpha), betaPath = await realpath(beta);
@@ -177,7 +178,7 @@ test('listed metadata cannot cross alpha-only grants when a junction cwd retarge
 });
 
 test('mutations reject a registry workspace remap at the server-to-adapter admission barrier', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-mobile-remap-api-')), path = await realpath(dir);
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-remap-api-'))), path = await realpath(dir);
   const config = { workspaceSource: 'dsh-registry' as const, hostName: 'Synthetic remap', bind: '127.0.0.1', port: 0, statePath: join(dir, 'host.sqlite'), allowInsecureLoopback: true };
   let projectId = ALPHA;
   const registry = { list: () => [workspace(projectId, path, 'Synthetic workspace')], archivedSessionIds: [] };
@@ -209,7 +210,7 @@ test('mutations reject a registry workspace remap at the server-to-adapter admis
 });
 
 test('registry create with a preset attaches once and duplicate requestId returns the original receipt', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-mobile-create-api-')), path = await realpath(dir);
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-create-api-'))), path = await realpath(dir);
   const config = { workspaceSource: 'dsh-registry' as const, hostName: 'Synthetic create', bind: '127.0.0.1', port: 0, statePath: join(dir, 'host.sqlite'), allowInsecureLoopback: true };
   const registry = { list: () => [workspace(ALPHA, path, 'Synthetic project')], archivedSessionIds: [] };
   const source = await createWorkspaceSource(config, () => registry);
@@ -229,7 +230,7 @@ test('registry create with a preset attaches once and duplicate requestId return
 });
 
 test('standalone registry administration supports all-scope pairing/grants only and never needs DSH storage or credentials', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-mobile-registry-cli-'));
+  const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-registry-cli-')));
   const config = { workspaceSource: 'dsh-registry', hostName: 'Synthetic CLI', bind: '127.0.0.1', port: 9443, statePath: join(dir, 'host.sqlite'), allowInsecureLoopback: true };
   const configPath = join(dir, 'host.json'); await writeFile(configPath, JSON.stringify(config));
   let output = '', errors = ''; const io = { out: (text: string) => { output += text; }, error: (text: string) => { errors += text; } };
