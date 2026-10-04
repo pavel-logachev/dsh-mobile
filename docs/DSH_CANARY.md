@@ -1,27 +1,27 @@
 # Isolated real-DSH canary
 
-This canary executes the **actual installed DSH 0.2.0-rc.2 SessionController** and the companion's in-process adapter, with a deterministic implementation of the official `LlmAdapter` interface. It is not a replacement SessionController, RPC stub, or fixture host. Its model output is synthetic; it does not prove an external model, the user's running DSH profile, a production plugin mount, or physical-phone network acceptance.
+This canary executes the **actual DSH SessionController from an exact verified runtime: 0.2.0-rc.2 or 0.2.1-alpha.1** and the companion's in-process adapter, with a deterministic implementation of the official `LlmAdapter` interface. It is not a replacement SessionController, RPC stub, or fixture host. Its model output is synthetic; it does not prove an external model, the user's running DSH profile, a production plugin mount, or physical-phone network acceptance.
 
 ## Run
 
 From the repository root, with Node 24 and the host dependencies/build supplied:
 
 ```powershell
-node --test tools/dsh-canary/safety.test.mjs tools/dsh-canary/isolation.test.mjs tools/dsh-canary/registry-isolation.test.mjs
+node --test tools/dsh-canary/*.test.mjs
 node tools/dsh-canary/typecheck.mjs
 node tools/dsh-canary/run.mjs
 ```
 
 Full mode requires `host/dist/dsh-adapter.js` from the coordinated host build. The canary does not build or modify host-owned files. `--controller-only` proves the official controller lifecycle and cold reads without importing the companion adapter; its receipt explicitly says the mobile adapter was not run.
 
-Default runtime location is `$HOME/Documents/DeepSeekHarness/runtime`. An explicit installation can be supplied:
+The installation output anchor is `$HOME/Documents/DeepSeekHarness`, resolved before environment isolation. The default runtime is its `runtime` child. An explicit **read-only runtime source** can be supplied, including an inspected alpha build staged under the installation cache:
 
 ```powershell
 node tools/dsh-canary/run.mjs --runtime-root '<installation>/runtime'
 node tools/dsh-canary/typecheck.mjs '<installation>/runtime'
 ```
 
-The only runtime output root is the installation sibling `cache/dsh-mobile/canary`. `--cache-root` may name that exact root, not an arbitrary directory. A unique `run-*` child owns the synthetic home, JSONL sessions, storage, attachments, workspace and temporary files. Acceptance is bounded by `--timeout-ms` (default 45000, maximum 120000). Successful cleanup leaves only the synthetic receipt.
+The only output root is `<installation>/cache/dsh-mobile/canary`, **independent of `--runtime-root`**. Selecting `<installation>/cache/<staged-alpha>/runtime` does not create nested `cache/cache/...`; a normal canonical `--cache-root '<installation>/cache/dsh-mobile/canary'` remains valid. `--cache-root` may name that exact root, not an arbitrary directory or a sibling of an alternate runtime. A unique `run-*` child owns the synthetic home, JSONL sessions, storage, attachments, workspace and temporary files. All versions, including alpha runs, write receipts at `<installation>/cache/dsh-mobile/canary/run-<unique>/receipt.json`; use the actual `receiptPath` returned by each run, not a guessed historical staging path. Acceptance is bounded by `--timeout-ms` (default 45000, maximum 120000). Successful cleanup leaves only the synthetic receipt.
 
 ### Real registry-mode profile insertion
 
@@ -41,7 +41,7 @@ The canary asserts that the companion and registry share a realm, the required s
 
 The installed `sdk-minimal` template includes an external model adapter and shell/tool plugins. The normal base/profile graph also has live credential/account, configuration and telemetry services. A template name therefore cannot establish a credential-free canary.
 
-The harness imports the installed official package exports and composes a new Cordis Context directly. It does not start the CLI, copy a profile, load a home patch, start a replacement DSH GUI, or inject into the user's running process. Installed DSH manifests are checked for exact `0.2.0-rc.2`; entry SHA-256 hashes are written to the receipt. Cordis and timer packages retain their independently versioned versions.
+The harness imports the installed official package exports and composes a new Cordis Context directly. It does not start the CLI, copy a profile, load a home patch, start a replacement DSH GUI, or inject into the user's running process. Installed DSH manifests are checked against the exact allowlist `0.2.0-rc.2`, `0.2.1-alpha.1`, and every DSH component must match the selected verified runtime; entry SHA-256 hashes are written to the receipt. Cordis and timer packages retain their independently versioned versions.
 
 Actual services include the LLM registry, Agent registry/factory/loop, default-model selection, Session store, JSONL persistence, query/projection services, workspace registry, JSON/domain storage, local FS/attachments, Typert registry, commands, client connection/file uploads, system-prompt service, empty native ToolRuntime and SessionController. The optional preset registry is absent: the companion reports an empty preset catalog, not a fabricated preset. No tools are advertised or executable.
 

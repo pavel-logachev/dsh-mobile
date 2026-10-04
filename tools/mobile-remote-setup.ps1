@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$RouteCredentialsPath,
     [Parameter(Mandatory)][string]$RelayUrl,
     [string]$WorkspacesPath,
+    [ValidateSet('0.2.0-rc.2','0.2.1-alpha.1')][string]$DshVersion = '0.2.1-alpha.1',
     [string]$HostName = 'DSH Mobile private host',
     [string]$OpenSslPath,
     [switch]$Initialize,
@@ -138,9 +139,13 @@ if ($RelayUrl.Length -gt 1024 -or -not $relaySyntax.Success -or ($relaySyntax.Gr
 if (-not $HostName.Trim() -or [Text.Encoding]::UTF8.GetByteCount($HostName) -gt 128 -or $HostName -match '[\x00-\x1f\x7f]') {
     throw 'Invalid host display name.'
 }
-if (-not $WorkspacesPath) { throw 'Explicit -WorkspacesPath required; no workspace is selected implicitly.' }
-$workspaceInput = @(Read-PrivateJson $WorkspacesPath 65536)
-if ($workspaceInput.Count -lt 1 -or $workspaceInput.Count -gt 100) { throw 'Choose one to 100 explicit workspaces.' }
+# Registry is the product path. A supplied file is the deliberate advanced subset mode.
+$registryMode = -not $WorkspacesPath
+$workspaceInput = @()
+if ($WorkspacesPath) {
+    $workspaceInput = @(Read-PrivateJson $WorkspacesPath 65536)
+    if ($workspaceInput.Count -lt 1 -or $workspaceInput.Count -gt 100) { throw 'Choose one to 100 explicit workspaces.' }
+}
 $workspaces = @()
 $ids = @(); $paths = @()
 foreach ($entry in $workspaceInput) {
@@ -159,14 +164,14 @@ $certPath = Join-Path $private 'tls-cert.pem'
 $keyPath = Join-Path $private 'tls-key.pem'
 $configPath = Join-Path $private 'host.json'
 $statePath = Join-Path $private 'state/mobile.sqlite'
-$candidate = [ordered]@{dshVersion='0.2.0-rc.2';hostName=$HostName.Trim();bind='127.0.0.1';port=19445;statePath=$statePath;
-    workspaces=@($workspaces);tls=[ordered]@{certPath=$certPath;keyPath=$keyPath};publicUrl="https://$authority";includeCertificatePem=$true;
+$candidate = [ordered]@{dshVersion=$DshVersion;hostName=$HostName.Trim();bind='127.0.0.1';port=19445;statePath=$statePath;
+    workspaceSource=$(if ($registryMode) {'dsh-registry'} else {'explicit'});workspaces=@($workspaces);tls=[ordered]@{certPath=$certPath;keyPath=$keyPath};publicUrl="https://$authority";includeCertificatePem=$true;
     relay=[ordered]@{url=$RelayUrl;routeId=$route.routeId;connectorToken=$route.connectorToken}}
 $configText = ($candidate | ConvertTo-Json -Depth 8) + "`n"
 $pluginPath = Join-Path $root 'host/dist/plugin.js'
 $pluginQuoted = ConvertTo-Json -InputObject $pluginPath -Compress
 $configQuoted = ConvertTo-Json -InputObject $configPath -Compress
-$patchText = "# Prepared only. Owner must review before enabling one additive insertion.`n- insert:`n    - id: dsh-mobile-companion`n      name: $pluginQuoted`n      disabled: true`n      config:`n        dshVersion: '0.2.0-rc.2'`n        configPath: $configQuoted`n"
+$patchText = "# Prepared only. Owner must review before enabling one additive insertion.`n- insert:`n    - id: dsh-mobile-companion`n      name: $pluginQuoted`n      disabled: true`n      config:`n        dshVersion: '$DshVersion'`n        configPath: $configQuoted`n"
 $undoText = @"
 # Owner-reviewed activation and undo
 
@@ -278,6 +283,7 @@ if (-not $exists) {
 Assert-PrivateAcl $private
 foreach ($name in ($files + $directories)) { Assert-PrivateAcl (Join-Path $private $name) }
 Write-Host 'Selected workspace scope (filtering, not a filesystem sandbox):'
+if ($registryMode) { Write-Host '  All registered DSH projects, including future registrations. Read/execute grants remain separate approvals.' }
 foreach ($workspace in $workspaces) { Write-Host ("  {0}: {1} [{2}]" -f $workspace.id,$workspace.name,$workspace.path) }
 Write-Host "Private config prepared/verified: $configPath"
 Write-Host "Inner TLS certificate SHA-256: $($certInfo.certificateSha256)"

@@ -18,7 +18,7 @@ Mode: **Operate**. Owner-approved native Android control surface: dark graphite 
 
 ## Screens
 
-- Pairing: paste/import one-use invitation, show trusted endpoint and phone label before connecting. No raw DSH token or TLS ignore action. QR camera is a later input convenience, not a fake current feature.
+- Pairing: primary offline QR scan through CameraX + ZXing, with secondary file import/manual JSON paste for a one-use invitation. Optional CAMERA permission is requested only on scan after a short rationale; denial/missing camera keeps import/paste available, permanent denial also offers app settings. Native Back, viewfinder, hint and optional torch; frames stay in memory on the phone, without logging, network access, telemetry or a Google Play services dependency. Show trusted host, endpoint, fingerprint and phone label before explicit confirmation; scanning never connects automatically. No raw DSH token or TLS ignore action.
 - Chat: selectable text/code, tonal user message, assistant text without heavy cards, compact activity. No raw event/tool/JSON dump.
 - Chats/new chat: permitted sessions, configured workspace selection and optional available preset. No global desktop workspace mutation.
 - Connection/settings: host, last good sync, truthful unsupported background-notification notice, local forget distinct from server revoke.

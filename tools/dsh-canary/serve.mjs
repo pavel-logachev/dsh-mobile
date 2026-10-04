@@ -12,7 +12,7 @@ export async function serve({ runtime, directories, runRoot, projectRoot, option
   const { HostError } = await import(pathToFileURL(path.join(projectRoot, 'host', 'dist', 'errors.js')).href);
   runtime.deterministic.serve = true;
   const workspace = { id: 'canary', name: 'Synthetic canary workspace', path: directories.workspace };
-  const adapter = await adapterModule.createDshAdapter({ dshVersion: '0.2.0-rc.2', sessionController: runtime.ctx.sessionController, agentPresets: runtime.ctx.get('agentPresets'), workspaces: [workspace], pollIntervalMs: 100, throttleMs: 20 });
+  const adapter = await adapterModule.createDshAdapter({ dshVersion: runtime.version, sessionController: runtime.ctx.sessionController, agentPresets: runtime.ctx.get('agentPresets'), workspaces: [workspace], pollIntervalMs: 100, throttleMs: 20 });
   // Reject non-synthetic input BEFORE it enters the real controller/durable history.
   const safeAdapter = {
     upstreamVersion: adapter.upstreamVersion,

@@ -7,6 +7,8 @@ import type { HostConfiguration, PreparedHostConfiguration, WorkspaceConfig } fr
 import { validateRelayUrl } from './relay-connector.ts';
 
 export type LocalHostConfiguration = HostConfiguration & {
+  /** Setup records the checked version; plugin YAML must still declare it explicitly. */
+  dshVersion?: string;
   /** Operator-configured invitation URL. Never includes a credential or query. */
   publicUrl?: string;
   /** Explicitly include the leaf certificate as an invitation trust anchor. */

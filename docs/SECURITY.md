@@ -4,7 +4,7 @@ DSH Mobile is an independent development preview. This document describes the in
 
 ## Trust assumptions
 
-- The adapter requires the owner's explicit `dshVersion: '0.2.0-rc.2'` declaration; it does not detect the installation automatically. This is the only declared supported version. A version declaration is not live compatibility evidence.
+- The adapter requires an explicit `dshVersion` declaration from an exact allowlist of inspected releases (`0.2.0-rc.2`, `0.2.1-alpha.1`); no semver range is accepted. Setup may read `dsh --version` to fill it, but the plugin itself does not detect the installation. A version declaration is not live compatibility evidence.
 - The owner trusts the host computer, its DSH installation, configured model/providers and the granted device. Host compromise is outside the protection offered by a phone client.
 - Android Keystore protects stored credentials; it is not a guarantee against an unlocked, rooted or compromised device. A trusted user's screenshots, keyboard and screen sharing can disclose chat contents.
 - The companion exposes a narrow session API, not arbitrary RPC, a terminal or a filesystem browser. Read and execute grants are distinct. An operator can explicitly choose permissions for **all current and future registered DSH projects**, represented by `['*']` grants. This intentionally broad trust is not a least-privilege default; explicit-list scope remains available.

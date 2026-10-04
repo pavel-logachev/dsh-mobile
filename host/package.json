@@ -1,7 +1,7 @@
 {
   "name": "dsh-mobile-host",
-  "version": "0.1.0",
-  "description": "Private native mobile companion host for an existing DSH runtime",
+  "version": "0.4.0",
+  "description": "Native mobile companion host plugin for an existing DeepSeek Harness runtime",
   "private": true,
   "type": "module",
   "engines": {
@@ -49,14 +49,20 @@
     "dsh-mobile-admin": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node ../tools/build-host.mjs",
     "demo": "node dist/demo.js",
     "test": "node --test test/*.test.ts",
     "check": "npm run build && npm test"
   },
   "devDependencies": {
+    "@types/js-yaml": "4.0.9",
     "@types/node": "^24.0.0",
+    "@types/qrcode": "1.5.6",
     "@types/ws": "8.18.2",
+    "esbuild": "0.25.12",
+    "js-yaml": "4.3.2",
+    "jsqr": "1.4.0",
+    "qrcode": "1.5.4",
     "typescript": "^5.9.3"
   },
   "dependencies": {

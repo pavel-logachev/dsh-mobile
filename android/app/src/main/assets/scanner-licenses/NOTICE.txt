@@ -1,0 +1,15 @@
+DSH Mobile offline QR scanner dependencies
+
+AndroidX CameraX 1.6.2 (camera-core, camera-camera2, camera-lifecycle, camera-view)
+Copyright The Android Open Source Project
+https://developer.android.com/jetpack/androidx/releases/camera
+Licensed under the Apache License, Version 2.0 (see Apache-2.0.txt in this directory).
+
+ZXing core 3.5.4
+Copyright ZXing authors
+https://github.com/zxing/zxing/tree/zxing-3.5.4/core
+Licensed under the Apache License, Version 2.0 (see Apache-2.0.txt in this directory).
+
+DSH Mobile links unmodified published libraries. ZXing core only is included;
+ZXing's Java SE/imageio or network clients and ML Kit are not used.
+This notice covers the scanner additions, not an exhaustive inventory of all app dependencies.

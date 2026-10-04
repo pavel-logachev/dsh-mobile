@@ -56,10 +56,14 @@ $result = Invoke-Setup $local
 if ($result.code -eq 0 -or $result.output -notmatch 'Host setup state missing') { throw 'Missing state must require explicit initialization.' }
 if (Test-Path -LiteralPath (Join-Path $local 'DSHMobile/host')) { throw 'Verification created state unexpectedly.' }
 Write-Host 'PASS: missing state fails closed without creating any owner identity.'
-$result = Invoke-Setup $local -Initialize -ScopeFile ''
-if ($result.code -eq 0 -or $result.output -notmatch 'Explicit -WorkspacesPath required' -or
-    (Test-Path -LiteralPath (Join-Path $local 'DSHMobile/host'))) { throw 'Missing explicit scope must fail before private state writes.' }
-Write-Host 'PASS: explicit workspace input is required; no project directory is guessed.'
+$registryLocal = Join-Path $testRoot 'registry-local'
+$result = Invoke-Setup $registryLocal -Initialize -ScopeFile ''
+if ($result.code -ne 0) { throw 'Registry-default setup failed (output intentionally omitted).' }
+$registryConfig = [IO.File]::ReadAllText((Join-Path $registryLocal 'DSHMobile/host/host.json')) | ConvertFrom-Json
+if ($registryConfig.workspaceSource -cne 'dsh-registry' -or $registryConfig.workspaces.Count -ne 0 -or $registryConfig.dshVersion -cne '0.2.1-alpha.1') { throw 'Missing subset file must choose the declared registry mode, not a guessed workspace.' }
+$result = Invoke-Setup $registryLocal -ScopeFile ''
+if ($result.code -ne 0) { throw 'Registry repeat verification failed.' }
+Write-Host 'PASS: registry mode is the default and verifies without a guessed project path.'
 $result = Invoke-Setup $local -Initialize
 if ($result.code -ne 0) { throw 'Explicit setup initialization failed (output intentionally omitted).' }
 $private = Join-Path $local 'DSHMobile/host'

@@ -133,7 +133,7 @@ export async function coldChecks(runtime, sessionId) {
 
 export async function adapterChecks(runtime, module, workspace, coldSessionId) {
   const { ctx, deterministic } = runtime;
-  const adapter = await module.createDshAdapter({ dshVersion: '0.2.0-rc.2', sessionController: ctx.sessionController, agentPresets: ctx.get('agentPresets'), workspaces: [workspace], pollIntervalMs: 100, throttleMs: 10 });
+  const adapter = await module.createDshAdapter({ dshVersion: runtime.version, sessionController: ctx.sessionController, agentPresets: ctx.get('agentPresets'), workspaces: [workspace], pollIntervalMs: 100, throttleMs: 10 });
   try {
     assert.deepEqual(await adapter.listPresets(signal()), [], 'Absent preset registry must be an explicit empty catalog');
     const listed = await adapter.listSessions(signal());

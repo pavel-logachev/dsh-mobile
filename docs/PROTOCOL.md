@@ -8,11 +8,19 @@ All routes are under `/v1`. JSON uses UTF-8 and camelCase. Timestamps are epoch 
 
 Production: HTTPS. An operator creates a short-lived invitation locally. Debug-only HTTP is allowed only on exact loopback hosts `127.0.0.1` and `localhost` (Android reaches the host through adb reverse). Reject URL userinfo, query, fragment and unexpected base path. HTTPS invitations may specify a single PEM certificate as an explicit trust anchor; hostname and certificate validity checks still apply. For CA-issued certificates ordinary system trust is used. Always require the invitation's SHA-256 SPKI pin for HTTPS.
 
-Direct invitation v1 JSON (paste/import text first; camera scanning is a later capability):
+Direct invitation v1 JSON (QR scan, file import or manual paste):
 
 ```json
 {"version":1,"baseUrl":"https://computer.example:9443","pairingToken":"<one-use-secret>","pinSha256":"sha256/<base64-SPKI-sha256>","certificatePem":"<optional-local-trust-anchor>"}
 ```
+
+### QR invitation envelope (`dshm1`)
+
+Android scanning is fully offline (CameraX + ZXing QR-only), with no Google Play services dependency or telemetry. Optional `CAMERA` access is requested on demand after the scan action/rationale, never for file import/manual paste; denial or no camera preserves both alternatives. Frames and payloads stay in memory; the scanner never saves/logs/sends them and the camera stops before trust review. Only the subsequent explicitly confirmed pairing step may contact the invited PC.
+
+QR scan, file import and manual paste accept either the unchanged invitation JSON (v1 or v2), or exactly `dshm1:` followed by canonical **base64url without padding** of a single **zlib-wrapped DEFLATE** stream of that JSON's UTF-8 bytes, through the same bounded decoder and invitation parser. Use Node `zlib.deflateSync(Buffer.from(json, 'utf8')).toString('base64url')`; Android uses `Inflater(/* nowrap = */ false)`. Raw DEFLATE (`deflateRawSync` / `nowrap=true`), gzip, dictionaries, concatenated streams, trailing bytes, padding, whitespace inside the compact envelope and other prefixes/URLs are rejected. Envelope version `1` is independent of invitation/API versions.
+
+Limits: raw JSON and inflated UTF-8 JSON ≤65,536 bytes; compressed bytes ≤65,536; complete compact text ≤87,388 ASCII characters (6-character prefix + at most 87,382 base64url characters). Validate the limits before allocating/expanding, require a complete stream with a valid checksum and strict UTF-8, then reject JSON nesting deeper than 32 containers with a linear scan of braces/brackets outside strings (respecting escapes) **before** recursive parsing. Apply the **same** invitation validation and host/endpoint/SPKI-fingerprint trust confirmation to all three inputs; confirmation is bound to the exact immutable parsed invitation shown, not the current editable text. Scanning never pairs automatically. New input cancels/versions pending file reads and ignores late completions. Only the scanner's non-secret route boolean survives rotation; payloads and trust review are never saved, and a decode delivered after lifecycle stop/disposal is discarded for safe re-scan. Never log or persist the QR payload/decoded invitation; it contains one-use secrets. A host must fall back to a file when the invitation cannot fit a QR symbol; do not truncate it.
 
 Import invitations only from the owner's trusted desktop/local channel. A pin cannot authenticate an attacker-substituted whole invitation that replaces both endpoint and trust material. If pairing succeeds on the host but the response is lost, do not replay it expecting credential recovery: inspect/revoke the potentially issued device grant locally and create a new offer.
 

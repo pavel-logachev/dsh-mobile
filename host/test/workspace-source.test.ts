@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, realpath, rm, writeFile, symlink, unlink, lstat } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, readFile, writeFile, symlink, unlink, lstat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -233,8 +233,10 @@ test('standalone registry administration supports all-scope pairing/grants only 
   const config = { workspaceSource: 'dsh-registry', hostName: 'Synthetic CLI', bind: '127.0.0.1', port: 9443, statePath: join(dir, 'host.sqlite'), allowInsecureLoopback: true };
   const configPath = join(dir, 'host.json'); await writeFile(configPath, JSON.stringify(config));
   let output = '', errors = ''; const io = { out: (text: string) => { output += text; }, error: (text: string) => { errors += text; } };
-  assert.equal(await runAdminCli(['pair', '--config', configPath, '--read', 'all', '--execute', 'all'], io), 0);
-  const invitation = JSON.parse(output);
+  const invitationPath = join(dir, 'invitations', 'registry.private.json');
+  assert.equal(await runAdminCli(['pair', '--config', configPath, '--read', 'all', '--execute', 'all', '--output', invitationPath], io), 0);
+  const invitation = JSON.parse(await readFile(invitationPath, 'utf8'));
+  assert.doesNotMatch(output + errors, /pairingToken|accessToken|token_hash/);
   const state = new HostState(config.statePath);
   t.after(async () => { state.close(); await rm(dir, { recursive: true, force: true }); });
   const device = state.consumePairing(invitation.pairingToken, 'Synthetic phone');
@@ -244,6 +246,6 @@ test('standalone registry administration supports all-scope pairing/grants only 
   assert.deepEqual(state.authenticate(device.deviceToken)?.grants, { readWorkspaceIds: ['*'], executeWorkspaceIds: [] });
   assert.equal(await runAdminCli(['grant', '--config', configPath, '--device', device.deviceId, '--read', ALPHA], io), 1);
   assert.match(errors, /Explicit workspace IDs are only supported in explicit-list mode/);
-  assert.equal(await runAdminCli(['pair', '--config', configPath, '--read', 'all', '--execute', ALPHA], io), 1);
+  assert.equal(await runAdminCli(['pair', '--config', configPath, '--read', 'all', '--execute', ALPHA, '--output', join(dir, 'invitations', 'denied.private.json')], io), 1);
   assert.doesNotMatch(output + errors, new RegExp(`${device.deviceToken}|${invitation.pairingToken}`));
 });

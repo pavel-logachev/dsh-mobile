@@ -4,7 +4,6 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { request } from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { VERSION } from './composition.mjs';
 import { assertOwnedPath } from './safety.mjs';
 
 /** Real installed Loader/Include patch, services and controller; no live profile. */
@@ -35,7 +34,7 @@ export async function registryChecks({ runtime, loader, directories, runRoot, pr
       { id: 'agent-preset-registry', name: entries['dsh-agent-preset-registry'], config: { default: 'canary-empty' } },
       { id: 'canary-empty-preset', name: entries['dsh-agent-preset'], config: { id: 'canary-empty', name: 'Synthetic empty preset', plugins: [] } },
     ] },
-    { insert: [{ id: 'dsh-mobile-companion', name: pluginUrl, config: { dshVersion: VERSION, configPath } }] },
+    { insert: [{ id: 'dsh-mobile-companion', name: pluginUrl, config: { dshVersion: runtime.version, configPath } }] },
   ];
   // JSON is also valid YAML; use the installed profile patch reader, not an
   // invented patch algorithm or a direct invocation of companion.apply().

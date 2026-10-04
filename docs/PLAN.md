@@ -4,7 +4,7 @@ DSH Mobile is a development preview. Source availability and passing local tests
 
 ## 1. Contracts and native vertical slice
 
-- Maintain an inspected DSH controller adapter and explicit supported-version gate (`0.2.0-rc.2`), not invented endpoints or a generic raw RPC proxy.
+- Maintain an inspected DSH controller adapter and explicit exact supported-version allowlist (`0.2.0-rc.2`, `0.2.1-alpha.1`), not invented endpoints or a generic raw RPC proxy.
 - Maintain pairing/revocation, read/execute grants, a durable command ledger and public-boundary tests for authentication, duplicates, reconnect and uncertain delivery.
 - Keep the Kotlin/Compose client native, with encrypted connection/draft/pending state, foreground observation and explicit recovery.
 - Verify host build/tests, Android JVM tests/lint/APKs and synthetic fixture behavior before a release candidate.

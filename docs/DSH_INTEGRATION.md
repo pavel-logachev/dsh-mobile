@@ -2,7 +2,7 @@
 
 ## Compatibility and evidence
 
-The adapter contract was inspected against **DSH 0.2.0-rc.2** and the installed **@deepseek-ai/cordis 4.0.4**. It is not a generic DSH HTTP client. The plugin receives the existing `ctx.sessionController` and `ctx.agentPresets`; provider accounts, agent execution, tools and authoritative history remain in that same DSH process. No browser launch token, cookie or provider credential is read.
+The adapter contract was inspected against **DSH 0.2.0-rc.2** (Cordis 4.0.4) and **DSH 0.2.1-alpha.1** (Cordis 4.0.5-alpha.1): declarations and compiled JS of the used controller, workspace and Cordis APIs, plus isolated full and registry canaries on both runtimes. It is not a generic DSH HTTP client. The plugin receives the existing `ctx.sessionController` and `ctx.agentPresets`; provider accounts, agent execution, tools and authoritative history remain in that same DSH process. No browser launch token, cookie or provider credential is read.
 
 Relevant installed package sources/declarations (generic relative locations):
 
@@ -14,7 +14,7 @@ Relevant installed package sources/declarations (generic relative locations):
 - `dsh-user-questions/lib/types/types.d.ts` and `dsh-user-approval/lib/types/types.d.ts`: pending question projection and approval audit events.
 - `cordis/lib/types/registry.d.ts`, `fiber.d.ts` and `lib/index.js`: object plugins, required dependency injection, asynchronous effect disposal.
 
-The plugin requires an explicit `dshVersion: '0.2.0-rc.2'`. This is an **operator-declared version**, not automatic detection. Other declared versions fail closed. Method presence alone cannot establish semantic compatibility; inspect and test a new runtime before changing this gate.
+The plugin requires an explicit `dshVersion` from the exact allowlist `0.2.0-rc.2`, `0.2.1-alpha.1`. This is an **operator-declared version** (setup may fill it from `dsh --version`), not runtime detection. Other declared versions fail closed. Method presence alone cannot establish semantic compatibility; inspect and test a new runtime before changing this gate.
 
 ## Files and public seams
 

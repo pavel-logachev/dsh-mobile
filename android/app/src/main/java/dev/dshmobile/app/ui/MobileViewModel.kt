@@ -8,6 +8,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.dshmobile.app.data.createMobileRepository
+import dev.dshmobile.app.ui.pairing.PairingInput
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -20,11 +21,11 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     val state = repository.state
 
     // Memory-only: invitation secrets never enter SavedState, logs, or Compose saveable state.
-    var invitation by mutableStateOf("")
-        private set
+    private val pairingInput = PairingInput(viewModelScope, repository::pair)
+    val invitation: String get() = pairingInput.invitation
+    val importError: String? get() = pairingInput.importError
+    val importingInvitation: Boolean get() = pairingInput.importing
     var deviceName by mutableStateOf("")
-        private set
-    var importError by mutableStateOf<String?>(null)
         private set
     var editorDraft by mutableStateOf("")
         private set
@@ -38,7 +39,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch { repository.restore() }
         viewModelScope.launch {
             state.collect {
-                if (it.paired) invitation = ""
+                if (it.paired) pairingInput.edit("")
                 val sessionId = it.snapshot?.session?.id
                 if (sessionId != editorSessionId || it.pending != null || pendingDraftWrites == 0) {
                     editorSessionId = sessionId
@@ -48,14 +49,11 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun editInvitation(value: String) {
-        invitation = value
-        importError = null
-    }
+    fun editInvitation(value: String) { pairingInput.edit(value) }
     fun editDeviceName(value: String) { deviceName = value.take(80) }
     fun importInvitation(uri: Uri) {
-        viewModelScope.launch {
-            val content = withContext(Dispatchers.IO) {
+        pairingInput.import {
+            withContext(Dispatchers.IO) {
                 runCatching {
                     getApplication<Application>().contentResolver.openInputStream(uri)?.use { stream ->
                         val output = java.io.ByteArrayOutputStream()
@@ -70,13 +68,12 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                     } ?: error("unavailable")
                 }.getOrNull()
             }
-            if (content == null) importError = "invitation_import_failed" else editInvitation(content)
         }
     }
-    fun pair(defaultName: String) {
-        val secret = invitation
+    fun supersedeInvitationImport() { pairingInput.supersedeImport() }
+    internal fun pair(review: InvitationReview, defaultName: String) {
         val name = deviceName.trim().ifBlank { defaultName }
-        viewModelScope.launch { repository.pair(secret, name) }
+        pairingInput.pair(review, name)
     }
     fun refresh() { viewModelScope.launch { repository.refresh() } }
     fun selectSession(id: String) {
@@ -130,7 +127,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     fun resolvePending() { viewModelScope.launch { repository.resolvePending() } }
     fun abandonPending() { viewModelScope.launch { repository.abandonPending() } }
     fun forget() {
-        invitation = ""
+        pairingInput.edit("")
         viewModelScope.launch { repository.forget() }
     }
     fun foreground(active: Boolean) { viewModelScope.launch { repository.setForeground(active) } }

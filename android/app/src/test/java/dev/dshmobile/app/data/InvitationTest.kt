@@ -32,6 +32,35 @@ class InvitationTest {
         assertThrows(MobileFailure::class.java) { Invitation.parse(invitation("https://computer.example").replace("\"version\":1", "\"version\":2"), debug = false) }
     }
 
+    @Test(timeout = 5000) fun `file import and raw paste reject deep JSON before recursive parsing`() {
+        for (depth in listOf(10_000, 30_000)) {
+            val json = "{\"nested\":" + "[".repeat(depth) + "0" + "]".repeat(depth) + "}"
+            assertEquals("invitation_invalid", assertThrows(MobileFailure::class.java) {
+                Invitation.parse(json, debug = false)
+            }.key)
+        }
+    }
+
+    @Test fun `depth guard allows 32 total containers and rejects the next level`() {
+        fun nested(arrays: Int) = invitation("https://computer.example").dropLast(1) +
+            ",\"extension\":" + "[".repeat(arrays) + "0" + "]".repeat(arrays) + "}"
+        assertEquals("https://computer.example", Invitation.parse(nested(31), debug = false).endpoint.baseUrl)
+        assertEquals("invitation_invalid", assertThrows(MobileFailure::class.java) {
+            Invitation.parse(nested(32), debug = false)
+        }.key)
+    }
+
+    @Test fun `brackets and escaped quotes or backslashes inside strings do not count as depth`() {
+        val label = "a \\\" quoted " + "[{".repeat(200) + "}\\\\ tail"
+        val withLabel = invitation("https://computer.example").dropLast(1) + ",\"label\":\"$label\"}"
+        assertEquals("synthetic-one-use-token", Invitation.parse(withLabel, debug = false).pairingToken)
+        val afterEscapedBackslash = invitation("https://computer.example").dropLast(1) +
+            ",\"label\":\"\\\\\",\"nested\":" + "[".repeat(40) + "0" + "]".repeat(40) + "}"
+        assertEquals("invitation_invalid", assertThrows(MobileFailure::class.java) {
+            Invitation.parse(afterEscapedBackslash, debug = false)
+        }.key)
+    }
+
     @Test fun `HTTPS endpoint is normalized and requires its SPKI pin`() {
         val parsed = Invitation.parse(invitation("https://COMPUTER.example:443/"), debug = false)
         assertEquals("https://computer.example", parsed.endpoint.baseUrl)

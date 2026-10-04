@@ -1,0 +1,165 @@
+name: Draft release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# No signing key or custom repository secret is required. The built-in token
+# gets write permission only in the final draft-release job.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  android:
+    name: Verify unsigned Android / JDK 21 / API 36
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test create-only release contract without GitHub access
+        shell: bash
+        run: python3 .github/tests/release_workflow_test.py
+      - name: Validate official Gradle wrapper
+        uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+      - name: Set up JDK
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install required Android SDK packages
+        shell: bash
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdkmanager"
+          set +o pipefail
+          yes | "$sdkmanager" --licenses >/dev/null
+          set -o pipefail
+          "$sdkmanager" --install 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
+      - name: Build, unit-test and lint debug and release
+        working-directory: android
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest :app:assembleRelease :app:lintRelease
+      - name: Verify actual release permission and component surface
+        shell: bash
+        run: |
+          apk=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          aapt2="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          "$aapt2" dump permissions "$apk" > "$RUNNER_TEMP/apk-permissions.txt"
+          sed -n "s/^uses-permission: name='\([^']*\)'$/\1/p" "$RUNNER_TEMP/apk-permissions.txt" | LC_ALL=C sort > "$RUNNER_TEMP/actual-permissions.txt"
+          printf '%s\n' android.permission.CAMERA android.permission.INTERNET dev.dshmobile.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION | LC_ALL=C sort > "$RUNNER_TEMP/expected-permissions.txt"
+          diff -u "$RUNNER_TEMP/expected-permissions.txt" "$RUNNER_TEMP/actual-permissions.txt"
+          "$aapt2" dump xmltree "$apk" --file AndroidManifest.xml > "$RUNNER_TEMP/apk-manifest.txt"
+          if grep -Eqi 'mlkit|datatransport|com\.google\.android\.gms|ACCESS_NETWORK_STATE' "$RUNNER_TEMP/apk-manifest.txt"; then
+            echo 'Forbidden scanner/network-metrics component in release APK.' >&2
+            exit 1
+          fi
+      - name: Stage unsigned verification APK and checksums
+        shell: bash
+        run: |
+          tag="$GITHUB_REF_NAME"
+          [[ "$tag" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]
+          mkdir -p release-assets
+          run="ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cp android/app/build/outputs/apk/release/app-release-unsigned.apk "release-assets/dsh-mobile-$tag-$run-UNSIGNED-verification.apk"
+          cp android/app/build/outputs/mapping/release/mapping.txt "release-assets/dsh-mobile-$tag-$run-mapping.txt"
+          cd release-assets
+          for file in *.apk *.txt; do sha256sum "$file" > "$file.sha256"; done
+      - name: Upload Android verification assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-android
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 30
+
+  host:
+    name: Verify and package host / Node 24
+    # The repository packaging helper uses npm.cmd and ships a Windows installer.
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: host/package-lock.json
+      - name: Install locked dependencies and test host
+        working-directory: host
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Host build failed' }
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw 'Host tests failed' }
+      - name: Package host and verify archive checksum
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP 'host-release-assets'
+          if (-not (Test-Path -LiteralPath './tools/package-host.ps1' -PathType Leaf)) { throw 'Host packager is missing from this tag' }
+          & ./tools/package-host.ps1 -OutputDirectory $output
+          $archives = @(Get-ChildItem -LiteralPath $output -Filter '*.zip' -File)
+          if ($archives.Count -ne 1) { throw 'Expected exactly one host archive' }
+          $zip = $archives[0]
+          $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath ($zip.FullName + '.sha256') -Value ($hash + '  ' + $zip.Name) -Encoding ascii
+      - name: Upload host assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-host
+          path: ${{ runner.temp }}/host-release-assets/*
+          if-no-files-found: error
+          retention-days: 30
+
+  draft:
+    name: Create draft GitHub Release
+    needs: [android, host]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+      - name: Verify checksums and create a new draft only
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          [[ "$tag" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]
+          cd release-assets
+          for checksum in *.sha256; do sha256sum --check "$checksum"; done
+          printf '%s\n' \
+            'Android CI assets are UNSIGNED, for verification only; they cannot be installed.' \
+            'The owner signs the same tag locally with tools/android-release.ps1 and uploads the signed APK and its SHA-256 before publishing.' \
+            'See docs/ANDROID_RELEASE.md. No signing key or DPAPI secret is held by CI.' > "$RUNNER_TEMP/release-notes.txt"
+          # Never mutate an existing release, draft or published. A lookup failure
+          # fails closed; a release created after lookup makes creation fail without upload.
+          gh api "repos/$GH_REPO/releases" --paginate --jq ".[] | select(.tag_name == \"$tag\") | .id" > "$RUNNER_TEMP/existing-release"
+          if [[ -s "$RUNNER_TEMP/existing-release" ]]; then
+            echo 'Refusing to modify an existing release for this tag, including a draft.' >&2
+            exit 1
+          fi
+          gh release create "$tag" ./* --draft --verify-tag --title "DSH Mobile $tag" --notes-file "$RUNNER_TEMP/release-notes.txt"

@@ -7,6 +7,8 @@ interface MobileRepository {
     val state: StateFlow<MobileState>
     suspend fun restore()
     suspend fun pair(invitationJson: String, deviceName: String)
+    /** Pair only the immutable invitation which the user reviewed, not mutable input text. */
+    suspend fun pair(invitation: Invitation, deviceName: String)
     suspend fun refresh()
     suspend fun selectSession(sessionId: String)
     suspend fun createSession(workspaceId: String, presetId: String? = null)

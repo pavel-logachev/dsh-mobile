@@ -148,9 +148,18 @@ internal class NetworkMobileRepository(
         if (foreground && stored.host != null) refreshLocked()
     }
     override suspend fun pair(invitationJson: String, deviceName: String) = action {
+        pairLocked(Invitation.parse(InvitationQrPayload.decode(invitationJson), debug, now()), deviceName)
+    }
+    override suspend fun pair(invitation: Invitation, deviceName: String) = action {
+        pairLocked(invitation, deviceName)
+    }
+    private suspend fun pairLocked(invitation: Invitation, deviceName: String) {
         restoreLocked()
         if (stored.host != null) throw MobileFailure("command_unresolved")
-        val invitation = Invitation.parse(invitationJson, debug, now())
+        // Recheck time/transport at dispatch without reparsing or substituting the reviewed object.
+        EndpointPolicy.validate(invitation.endpoint, debug)
+        if (!safeToken(invitation.pairingToken) || invitation.endpoint.relay?.expiresAt?.let { it <= now() } == true)
+            throw MobileFailure("invitation_invalid")
         val name = deviceName.trim()
         if (name.isBlank() || name.length > 80 || name.any { it.isISOControl() }) throw MobileFailure("invitation_invalid")
         mutableState.value = state.value.copy(connection = ConnectionState.CONNECTING, busy = true, error = null)

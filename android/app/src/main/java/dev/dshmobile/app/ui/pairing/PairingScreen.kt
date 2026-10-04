@@ -1,5 +1,16 @@
 package dev.dshmobile.app.ui.pairing
 
+import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
+import android.content.pm.PackageManager
+import androidx.core.net.toUri
+import androidx.core.content.edit
+import android.provider.Settings
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -11,6 +22,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.*
@@ -28,14 +40,45 @@ import java.net.URI
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun PairingScreen(state: MobileState, model: MobileViewModel) {
-    var trust by remember { mutableStateOf<TrustPreview?>(null) }
+    var trust by remember { mutableStateOf<InvitationReview?>(null) }
     var previewError by remember { mutableStateOf<String?>(null) }
     var manual by rememberSaveable { mutableStateOf(false) }
     var reset by remember { mutableStateOf(false) }
     val defaultName = stringResource(R.string.mobile_default_device)
     val accents = LocalMobileColors.current
+    val context = LocalContext.current
+    // Only this non-secret route flag survives rotation; payload/review stay memory-only.
+    var scanning by rememberSaveable { mutableStateOf(false) }
+    var permissionDialog by remember { mutableStateOf<CameraPermissionAction?>(null) }
+    val currentBusy by rememberUpdatedState(state.busy)
+    val cameraPreferences = remember(context) { context.getSharedPreferences("camera_permission", Context.MODE_PRIVATE) }
+    fun permissionAction(granted: Boolean): CameraPermissionAction = cameraPermissionAction(
+        context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY), granted,
+        cameraPreferences.getBoolean("requested", false),
+        context.activity()?.let { ActivityCompat.shouldShowRequestPermissionRationale(it, Manifest.permission.CAMERA) } ?: false,
+    )
+    val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!currentBusy) {
+            if (granted) { previewError = null; scanning = true }
+            else {
+                previewError = "invitation_camera_denied"
+                if (permissionAction(false) == CameraPermissionAction.Settings) permissionDialog = CameraPermissionAction.Settings
+            }
+        }
+    }
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) { trust = null; previewError = null; model.importInvitation(uri) }
+        if (uri != null && !currentBusy) { scanning = false; trust = null; previewError = null; model.importInvitation(uri) }
+    }
+    if (scanning) {
+        InvitationScannerScreen(onBack = { scanning = false }, onResult = { result ->
+            scanning = false
+            if (!currentBusy) when (val outcome = handleInvitationScan(result)) {
+                is PairingScanOutcome.Review -> { model.editInvitation(outcome.json); previewError = null; trust = outcome.review }
+                is PairingScanOutcome.Error -> { model.editInvitation(""); trust = null; previewError = outcome.key }
+                PairingScanOutcome.Cancelled -> Unit
+            }
+        })
+        return
     }
     Scaffold(containerColor = MaterialTheme.colorScheme.background, topBar = {
         TopAppBar(title = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -59,28 +102,47 @@ internal fun PairingScreen(state: MobileState, model: MobileViewModel) {
                     }
                 }
             }
-            Button(onClick = { importer.launch("*/*") }, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("pairing_import"),
-                colors = ButtonDefaults.buttonColors(containerColor = accents.action, contentColor = accents.onAction), shape = MaterialTheme.shapes.medium) { Text(stringResource(R.string.mobile_import)) }
-            TextButton(onClick = { manual = !manual }, enabled = !state.busy, modifier = Modifier.heightIn(min = 48.dp).testTag("pairing_manual")) {
-                Text(stringResource(if (manual) R.string.mobile_hide_json else R.string.mobile_paste_json))
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = {
+                    if (!currentBusy) {
+                        model.supersedeInvitationImport()
+                        trust = null
+                        previewError = null
+                        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                        when (val action = permissionAction(granted)) {
+                            CameraPermissionAction.Scan -> scanning = true
+                            CameraPermissionAction.Unavailable -> previewError = "invitation_scan_unavailable"
+                            else -> permissionDialog = action
+                        }
+                    }
+                }, enabled = !state.busy && !scanning, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("pairing_scan"),
+                    colors = ButtonDefaults.buttonColors(containerColor = accents.action, contentColor = accents.onAction), shape = MaterialTheme.shapes.medium) {
+                    Text(stringResource(R.string.mobile_scan_qr))
+                }
+                Text(stringResource(R.string.mobile_scan_hint), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedButton(onClick = { importer.launch("*/*") }, enabled = !state.busy && !scanning,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("pairing_import"), shape = MaterialTheme.shapes.medium) { Text(stringResource(R.string.mobile_import)) }
+                TextButton(onClick = { model.supersedeInvitationImport(); manual = !manual }, enabled = !state.busy && !scanning, modifier = Modifier.heightIn(min = 48.dp).testTag("pairing_manual")) {
+                    Text(stringResource(if (manual) R.string.mobile_hide_json else R.string.mobile_paste_json))
+                }
             }
             if (model.invitation.isNotBlank()) Text(stringResource(R.string.mobile_invitation_ready), style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
             if (manual) OutlinedTextField(value = model.invitation, onValueChange = { model.editInvitation(it); previewError = null; trust = null },
                 label = { Text(stringResource(R.string.mobile_invitation)) }, supportingText = { Text(stringResource(R.string.mobile_invitation_hint)) },
-                visualTransformation = PasswordVisualTransformation(), isError = previewError != null, minLines = 2, maxLines = 4, enabled = !state.busy,
+                visualTransformation = PasswordVisualTransformation(), isError = previewError != null, minLines = 2, maxLines = 4, enabled = !state.busy && !scanning,
                 modifier = Modifier.fillMaxWidth().testTag("pairing_invitation"))
             OutlinedTextField(value = model.deviceName, onValueChange = model::editDeviceName, label = { Text(stringResource(R.string.mobile_device_name)) },
-                placeholder = { Text(defaultName) }, singleLine = true, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("pairing_device_name"))
+                placeholder = { Text(defaultName) }, singleLine = true, enabled = !state.busy && !scanning, modifier = Modifier.fillMaxWidth().testTag("pairing_device_name"))
             previewError?.let { ErrorText(it) }; model.importError?.let { ErrorText(it) }; state.error?.let { ErrorText(it) }
             OutlinedButton(onClick = {
-                try { trust = previewInvitation(model.invitation); previewError = null }
+                try { trust = InvitationReview.parse(model.invitation); previewError = null }
                 catch (failure: MobileFailure) { trust = null; previewError = failure.key }
                 catch (_: Exception) { trust = null; previewError = "invitation_invalid" }
-            }, enabled = model.invitation.isNotBlank() && !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("pairing_preview")) {
+            }, enabled = model.invitation.isNotBlank() && !state.busy && !model.importingInvitation && !scanning, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("pairing_preview")) {
                 Text(stringResource(if (state.busy) R.string.mobile_connecting else R.string.mobile_preview_host))
             }
-            if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+            if (state.busy || model.importingInvitation) LinearProgressIndicator(Modifier.fillMaxWidth())
             if (state.error != null) OutlinedButton(onClick = { reset = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("reset_connection")) {
                 Text(stringResource(R.string.mobile_reset_connection))
             }
@@ -90,7 +152,24 @@ internal fun PairingScreen(state: MobileState, model: MobileViewModel) {
             }
         }
     }
-    trust?.let { preview ->
+    permissionDialog?.let { action ->
+        val settings = action == CameraPermissionAction.Settings
+        AlertDialog(onDismissRequest = { permissionDialog = null }, title = { Text(stringResource(R.string.mobile_camera_permission_title)) },
+            text = { Text(stringResource(if (settings) R.string.mobile_camera_permission_settings else R.string.mobile_camera_permission_rationale)) },
+            confirmButton = { TextButton(onClick = {
+                permissionDialog = null
+                if (settings) {
+                    try { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:${context.packageName}".toUri())) }
+                    catch (_: Exception) { previewError = "invitation_camera_denied" }
+                } else {
+                    cameraPreferences.edit { putBoolean("requested", true) }
+                    permission.launch(Manifest.permission.CAMERA)
+                }
+            }, enabled = !state.busy) { Text(stringResource(if (settings) R.string.mobile_open_app_settings else R.string.mobile_camera_permission_allow)) } },
+            dismissButton = { TextButton(onClick = { permissionDialog = null }) { Text(stringResource(R.string.mobile_back)) } })
+    }
+    trust?.let { review ->
+        val preview = review.preview
         AlertDialog(onDismissRequest = { if (!state.busy) trust = null }, title = { Text(stringResource(R.string.mobile_trust_title)) }, text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(stringResource(R.string.mobile_trust_intro))
@@ -108,12 +187,18 @@ internal fun PairingScreen(state: MobileState, model: MobileViewModel) {
                 if (preview.customCertificate) Text(stringResource(R.string.mobile_custom_certificate))
                 Text(stringResource(R.string.mobile_trust_verify))
             }
-        }, confirmButton = { TextButton(onClick = { trust = null; model.pair(defaultName) }, enabled = !state.busy, modifier = Modifier.testTag("pairing_connect")) { Text(stringResource(R.string.mobile_trust_connect)) } },
+        }, confirmButton = { TextButton(onClick = { trust = null; model.pair(review, defaultName) }, enabled = !state.busy, modifier = Modifier.testTag("pairing_connect")) { Text(stringResource(R.string.mobile_trust_connect)) } },
             dismissButton = { TextButton(onClick = { trust = null }, enabled = !state.busy) { Text(stringResource(R.string.mobile_back)) } })
     }
     if (reset) AlertDialog(onDismissRequest = { reset = false }, title = { Text(stringResource(R.string.mobile_forget_title)) }, text = { Text(stringResource(R.string.mobile_forget_confirmation)) },
         confirmButton = { TextButton(onClick = { reset = false; trust = null; previewError = null; model.forget() }, enabled = !state.busy, modifier = Modifier.testTag("reset_connection_confirm")) { Text(stringResource(R.string.mobile_reset_connection)) } },
         dismissButton = { TextButton(onClick = { reset = false }) { Text(stringResource(R.string.mobile_back)) } })
+}
+
+private tailrec fun Context.activity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.activity()
+    else -> null
 }
 
 @Composable

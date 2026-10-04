@@ -5,14 +5,17 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { installIsolation, sanitizeEnvironment } from './isolation.mjs';
 import { assertOwnedPath, parseArgs } from './safety.mjs';
-import { composeRuntime, officialLoader, VERSION } from './composition.mjs';
+import { composeRuntime, officialLoader } from './composition.mjs';
 import { controllerChecks, coldChecks, adapterChecks } from './checks.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const options = parseArgs(process.argv.slice(2));
 if (options.registryCheck) assert.ok(process.execArgv.includes('--expose-internals'), 'registry-check requires node --expose-internals to avoid Windows-pinned native Loader cache');
-const runtimeRoot = await realpath(options.runtimeRoot ?? path.join(os.homedir(), 'Documents', 'DeepSeekHarness', 'runtime'));
-const approvedCache = path.join(path.dirname(runtimeRoot), 'cache', 'dsh-mobile', 'canary');
+// Runtime may be an inspected alternate build staged under cache. Output ownership
+// is anchored to the installation, never to the selected runtime's parent.
+const installationRoot = await realpath(path.join(os.homedir(), 'Documents', 'DeepSeekHarness'));
+const runtimeRoot = await realpath(options.runtimeRoot ?? path.join(installationRoot, 'runtime'));
+const approvedCache = path.join(installationRoot, 'cache', 'dsh-mobile', 'canary');
 const cacheRoot = path.resolve(options.cacheRoot ?? approvedCache);
 assert.equal(cacheRoot.toLowerCase(), approvedCache.toLowerCase(), 'Only the installation cache/dsh-mobile/canary root is permitted');
 await mkdir(cacheRoot, { recursive: true });
@@ -30,7 +33,7 @@ sanitizeEnvironment(directories.home, directories.temp);
 process.chdir(directories.workspace);
 const isolation = installIsolation(runRoot, options);
 const loader = officialLoader(runtimeRoot);
-const receipt = { kind: 'isolated-real-dsh-canary', version: VERSION, node: process.version, startedAt: Date.now(), success: false, phases: [], installed: loader.evidence, isolation, cleanup: {} };
+const receipt = { kind: 'isolated-real-dsh-canary', version: null, node: process.version, startedAt: Date.now(), success: false, phases: [], installed: loader.evidence, isolation, cleanup: {} };
 let runtime;
 let stage = 'installed-version';
 let serveCleanup;
@@ -44,7 +47,7 @@ async function bounded(work) {
 }
 try {
   await bounded(async () => {
-    await loader.version();
+    receipt.version = await loader.version();
     mark('compose-real-runtime');
     runtime = await composeRuntime(loader, directories);
     receipt.components = runtime.mounted;

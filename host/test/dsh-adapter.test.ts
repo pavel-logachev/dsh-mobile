@@ -408,7 +408,11 @@ test('request-local cwd dedup is bounded and retries missing paths on the next l
 test('operator-declared unsupported versions are rejected and no preset registry means host default only', async (t) => {
   const h = await harness(t);
   const options = { sessionController: h.controller, workspaces: [{ id: 'alpha', name: 'Alpha', path: h.alpha }] };
-  await assert.rejects(createDshAdapter({ ...options, dshVersion: '0.2.0-rc.3' }), { code: 'invalid_config' });
+  await assert.rejects(createDshAdapter({ ...options, dshVersion: '0.2.0-rc.3' }), { code: 'unsupported_dsh_version', message: 'Supported DSH versions: 0.2.0-rc.2, 0.2.1-alpha.1. Check dsh --version before declaring dshVersion.' });
+  const alpha = await createDshAdapter({ ...options, dshVersion: '0.2.1-alpha.1' });
+  t.after(async () => { alpha.dispose(); });
+  assert.equal(alpha.upstreamVersion, '0.2.1-alpha.1');
+  assert.equal((await alpha.listSessions(new AbortController().signal)).length, 1);
   const noPresets = await createDshAdapter({ ...options, dshVersion: '0.2.0-rc.2' });
   t.after(async () => { noPresets.dispose(); });
   assert.deepEqual(await noPresets.listPresets(new AbortController().signal), []);

@@ -215,7 +215,8 @@ try {
         throw 'Release APK package/SDK/debuggable/transport guard failed; do not distribute.'
     }
     $permissions = @([regex]::Matches($badging, "(?m)^uses-permission: name='([^']+)'") | ForEach-Object { $_.Groups[1].Value })
-    if ($permissions.Count -ne 2 -or @($permissions | Where-Object { $_ -cnotin @('android.permission.INTERNET', "$package.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION") }).Count -ne 0) {
+    # CAMERA is optional and requested only for the local QR scan, never for pairing/import.
+    if ($permissions.Count -ne 3 -or @($permissions | Where-Object { $_ -cnotin @('android.permission.INTERNET', 'android.permission.CAMERA', "$package.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION") }).Count -ne 0) {
         throw 'Unexpected release permission surface; review before signing.'
     }
     $version = $meta.Groups[2].Value

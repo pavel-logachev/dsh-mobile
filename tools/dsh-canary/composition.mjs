@@ -6,7 +6,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createDeterministicAdapter, ephemeralBrowserCredentials, PROVIDER, MODEL } from './deterministic.mts';
 
-export const VERSION = '0.2.0-rc.2';
+const VERIFIED_VERSIONS = ['0.2.0-rc.2', '0.2.1-alpha.1'];
 const COMPONENTS = [
   ['cordis-plugin-timer', {}], ['dsh-typert-registry', {}],
   ['dsh-llm', {}], ['dsh-session', {}], ['dsh-session-projection', {}],
@@ -23,22 +23,25 @@ const COMPONENTS = [
 export function officialLoader(runtimeRoot) {
   const require = createRequire(path.join(runtimeRoot, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'));
   const evidence = [];
+  let installedVersion;
   const allowed = new Set(['cordis', 'cordis-plugin-loader', 'cordis-plugin-include', 'dsh-app-boot', 'dsh-agent-preset-registry', 'dsh-agent-preset', 'dsh-api-workspace-controller', 'dsh-credentials', ...COMPONENTS.map(([id]) => id), 'dsh-session-persistence-jsonl', 'dsh-storage-json', 'dsh-fs-local', 'dsh-attachment-local']);
   return {
     evidence,
+    get installedVersion() { return installedVersion; },
     async load(id) {
       assert.ok(allowed.has(id), 'Official canary composition allowlist');
       const pkg = path.join(runtimeRoot, 'node_modules', '@deepseek-ai', id, 'package.json');
       const manifest = JSON.parse(await readFile(pkg, 'utf8'));
-      if (id.startsWith('dsh-')) assert.equal(manifest.version, VERSION, `Installed ${id} version`);
+      if (id.startsWith('dsh-')) assert.equal(manifest.version, installedVersion, `Installed ${id} version must match the verified DSH runtime`);
       const entry = require.resolve(`@deepseek-ai/${id}`);
       evidence.push({ package: manifest.name, version: manifest.version, sha256: createHash('sha256').update(await readFile(entry)).digest('hex') });
       return import(pathToFileURL(entry).href);
     },
     async version() {
       const manifest = JSON.parse(await readFile(path.join(runtimeRoot, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'), 'utf8'));
-      assert.equal(manifest.version, VERSION, 'Installed DSH version must be exactly rc.2');
-      return manifest.version;
+      assert.ok(VERIFIED_VERSIONS.includes(manifest.version), `Verified DSH versions only: ${VERIFIED_VERSIONS.join(', ')}`);
+      installedVersion = manifest.version;
+      return installedVersion;
     },
   };
 }
@@ -79,7 +82,7 @@ export async function composeRuntime(loader, directories) {
     assert.deepEqual(ctx.tools.schemas(), []);
     ctx.tools.guard(() => 'Tool execution is prohibited in the real DSH canary');
     const workspace = await ctx.workspaceRegistry.create(directories.workspace, 'Synthetic canary workspace');
-    return { ctx, deterministic, mounted, workspace, async dispose() {
+    return { ctx, deterministic, mounted, workspace, version: loader.installedVersion, async dispose() {
       for (const agent of ctx.agents.list()) agent.cancel({ kind: 'disposed' });
       deterministic.releaseAll();
       await ctx.fiber.dispose();

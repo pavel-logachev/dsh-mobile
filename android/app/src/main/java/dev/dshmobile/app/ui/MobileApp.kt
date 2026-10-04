@@ -106,6 +106,9 @@ private fun PairedApp(state: MobileState, model: MobileViewModel) {
 internal fun safeErrorResource(key: String): Int = when (key) {
     "invitation_invalid" -> R.string.mobile_error_invitation_invalid
     "invitation_import_failed" -> R.string.mobile_error_invitation_import_failed
+    "invitation_scan_unavailable" -> R.string.mobile_error_invitation_scan_unavailable
+    "invitation_scan_failed" -> R.string.mobile_error_invitation_scan_failed
+    "invitation_camera_denied" -> R.string.mobile_error_invitation_camera_denied
     "transport_not_allowed" -> R.string.mobile_error_transport_not_allowed
     "pin_required" -> R.string.mobile_error_pin_required
     "certificate_invalid" -> R.string.mobile_error_certificate_invalid

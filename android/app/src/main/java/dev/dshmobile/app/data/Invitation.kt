@@ -41,11 +41,33 @@ internal object EndpointPolicy {
     }
 }
 
+/** Linear guard before the recursive JSON parser; invitation schemas need at most two levels. */
+private fun requireShallowJson(json: String) {
+    var depth = 0
+    var inString = false
+    var escaped = false
+    for (character in json) {
+        if (inString) {
+            when {
+                escaped -> escaped = false
+                character == '\\' -> escaped = true
+                character == '"' -> inString = false
+            }
+        } else when (character) {
+            '"' -> inString = true
+            '{', '[' -> if (++depth > 32) throw MobileFailure("invitation_invalid")
+            '}', ']' -> if (--depth < 0) throw MobileFailure("invitation_invalid")
+        }
+    }
+    if (inString || depth != 0) throw MobileFailure("invitation_invalid")
+}
+
 /** Invitation is intentionally not a data class: its generated toString must never leak a secret. */
 class Invitation(val endpoint: HostEndpoint, val pairingToken: String) {
     companion object {
         fun parse(json: String, debug: Boolean, now: Long = System.currentTimeMillis()): Invitation {
-            if (json.toByteArray().size > 64 * 1024) throw MobileFailure("invitation_invalid")
+            if (json.length > 64 * 1024 || json.toByteArray(Charsets.UTF_8).size > 64 * 1024) throw MobileFailure("invitation_invalid")
+            requireShallowJson(json)
             val objectValue = try { mobileJson.parseToJsonElement(json) as? JsonObject } catch (_: Exception) { null }
                 ?: throw MobileFailure("invitation_invalid")
             val version = objectValue["version"] as? JsonPrimitive

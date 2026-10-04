@@ -4,7 +4,7 @@ Status: development preview. These are reproducible commands, not a record of a 
 
 ## Prerequisites
 
-- Host: Node.js **24.x**, npm, and the committed lockfile. The host uses Node's built-in SQLite; no separate database service is required.
+- Host: Node.js **24.x**, npm, and the committed lockfile. The host uses Node's built-in SQLite; no separate database service is required. For official Node/OpenSSL sources, prerequisite consent, a new-shell version check and protecting DSH's own Node launcher, follow [the recipient prerequisite procedure](SETUP.md#prerequisite-download-and-installation--separate-consent).
 - Android: **JDK 21** recommended (JDK 17 is also supported by the Windows helper); SDK platform **android-36**, build-tools **36.0.0**, and platform-tools for optional device work.
 - Dependencies are downloaded from configured public repositories. Keep caches, local SDK/JDK paths, credentials and generated output outside tracked files.
 
@@ -21,9 +21,33 @@ npm run build
 npm test
 ```
 
-`npm run check` combines build and test. Current scripts are defined in [the host package](../host/package.json). Tests must use synthetic fixtures or disposable state, never private chats or production credentials. Passing them does not prove that the companion plugin has been loaded into a real DSH installation. Runtime/plugin setup must follow the [architecture boundary](ARCHITECTURE.md), not auto-modify an active installation. The adapter/plugin requires an explicit owner declaration `dshVersion: '0.2.0-rc.2'`; it does not automatically detect the installed version. This is the only declared supported version, and other version declarations are rejected. The declaration itself is not proof of live compatibility. Do not invent DSH startup flags from the companion package's script names.
+`npm run check` combines build and test. Current scripts are defined in [the host package](../host/package.json). Tests must use synthetic fixtures or disposable state, never private chats or production credentials. Passing them does not prove that the companion plugin has been loaded into a real DSH installation. Runtime/plugin setup must follow the [architecture boundary](ARCHITECTURE.md), not auto-modify an active installation. The adapter/plugin requires an explicit owner `dshVersion` declaration from the exact allowlist `0.2.0-rc.2`, `0.2.1-alpha.1`; every other declaration is rejected (no semver range). Both versions' declarations and compiled JS were inspected and normal/registry isolated real-runtime canaries passed. The installer checks `dsh --version`; standalone `setup-direct` defaults to `--dsh-version auto` and validates the actual command output, while the plugin does not infer a version. An owner declaration is still not proof that the live profile mounted correctly. Do not invent DSH startup flags from the companion package's script names.
 
 For explicit companion installation and rollback instructions, see [DSH integration](DSH_INTEGRATION.md) and its [disabled Cordis patch example](../examples/cordis.patch.yml). These are operator-reviewed steps, not an automatic deployment performed by the build.
+
+### Portable Windows host release
+
+Use Node 24 plus the committed lockfile to build. QR (`qrcode` core/renderer) and the bounded inert YAML parser are bundled by [build-host.mjs](../tools/build-host.mjs); `ws` is the only external runtime dependency, and the zip includes it. Development-only independent QR decoding uses `jsqr`. Package with the [reproducible helper](../tools/package-host.ps1):
+
+```powershell
+# Output outside Git; use an empty/new directory (existing archives are not overwritten).
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tools/package-host.ps1 `
+  -OutputDirectory '<ABSOLUTE_RELEASE_OUTPUT_DIRECTORY>'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tools/install-host.test.ps1 `
+  -CacheDirectory '<ABSOLUTE_DISPOSABLE_TEST_CACHE>'
+```
+
+The helper emits `dsh-mobile-host-<host-package-version>.zip` and `.zip.sha256`. Entry order is sorted and timestamps fixed; two builds from the same source/dependencies were byte-identical. Payload: built JS/declarations, package metadata, LICENSE and bundled-dependency licenses, pinned `ws`, reviewed Windows installer and per-file hash inventory. There is no recipient-side npm install, source checkout, TypeScript, TLS private state or Android SDK. Inventory hashes validate extraction; the release SHA-256 must be verified before executing the installer.
+
+The [guarded installer](../tools/install-host.ps1) targets `%LOCALAPPDATA%/DSHMobile/plugin/<version>` immutably, preflights Node/DSH/profile, and creates stable registry direct TLS config only if absent. It prints its marked additive patch without activating by default. Profile mutation requires `-Activate` (including `-Upgrade`, `-Rollback`, `-Uninstall` actions), backup and HMR/listener checks; it never restarts DSH or changes firewall/OS trust. The [recipient agent runbook](SETUP.md) contains numbered consent gates, LAN/Tailscale instructions, QR and rollback.
+
+Synthetic installer tests override LOCALAPPDATA and DSH_HOME, use a fake `dsh --version`, a unique test port and a synthetic TCP watcher. They prove file/ACL/profile/upgrade logic and reproducibility, not production HMR acceptance. The inert YAML parser detects unmarked companion IDs semantically, including flow style, quoted keys and aliases, while comments/code-tag scalar contents are not entries. Source setup uses vetted OpenSSL 3 to generate P-256/SHA256 with CA:false/serverAuth/digitalSignature and exact SANs; Node's X509Certificate is read/verify-only.
+
+Pairing requires explicit output consent: `pair` needs `--qr` and/or a new private `--output`; `remote-pair` requires `--output` and optionally `--qr`. Both reject missing output before creating an offer/grant. Invitation JSON is never printed to stdout. QR/private files are one-use credentials, not diagnostics; automation reads the protected file. The built-dist CLI regression exercises a long valid certificate, proves successful `--qr --output` capacity fallback and confirms the saved remote grant is not revoked. The QR bundle shares the external built `errors.js` identity with CLI rather than bundling another `HostError` class.
+
+```powershell
+node --test tools/onboarding-docs.test.mjs tools/dsh-canary/*.test.mjs
+```
 
 ## Android on Windows
 

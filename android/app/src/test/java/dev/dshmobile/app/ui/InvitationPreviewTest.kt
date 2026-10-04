@@ -63,6 +63,26 @@ class InvitationPreviewTest {
         }
     }
 
+    @Test fun `manual paste accepts the exact compact invitation printed by the PC`() {
+        val json = remoteInvitation()
+        val output = java.io.ByteArrayOutputStream().also { out -> java.util.zip.DeflaterOutputStream(out).use { it.write(json.toByteArray(Charsets.UTF_8)) } }
+        val compact = "dshm1:" + java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(output.toByteArray())
+        assertEquals(previewInvitation(json, debug = false), previewInvitation(compact, debug = false))
+    }
+
+    @Test(timeout = 5000) fun `import and paste preview reject ten and thirty thousand levels as invitation invalid`() {
+        for (depth in listOf(10_000, 30_000)) {
+            val json = "{\"nested\":" + "[".repeat(depth) + "0" + "]".repeat(depth) + "}"
+            val output = java.io.ByteArrayOutputStream().also { out -> java.util.zip.DeflaterOutputStream(out).use { it.write(json.toByteArray()) } }
+            val compact = "dshm1:" + java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(output.toByteArray())
+            for (input in listOf(json, compact)) {
+                val failure = assertThrows(MobileFailure::class.java) { previewInvitation(input, debug = false) }
+                assertEquals("invitation_invalid", failure.key)
+                assertNull(failure.cause)
+            }
+        }
+    }
+
     @Test fun `release never previews debug HTTP bypass`() {
         val invitation = """{"version":1,"baseUrl":"http://localhost:9443","pairingToken":"synthetic-one-use-secret"}"""
         assertTrue(previewInvitation(invitation, debug = true).debugHttp)

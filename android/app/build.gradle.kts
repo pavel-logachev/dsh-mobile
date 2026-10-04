@@ -13,8 +13,8 @@ android {
         applicationId = "dev.dshmobile.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 4
+        versionName = "0.4.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -56,6 +56,11 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.okhttp.sse)
     implementation(libs.java.websocket)
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+    implementation(libs.zxing.core)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)

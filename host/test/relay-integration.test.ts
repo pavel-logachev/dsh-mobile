@@ -35,10 +35,11 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   const certificate = readFileSync(certPath, 'utf8');
   const options = { allowInsecureRelayLoopback: true };
   let output = '', errors = ''; const io = { out: (s: string) => { output += s; }, error: (s: string) => { errors += s; } };
-  const invitationPath = join(dir, 'invite.private.json');
-  assert.equal(await runAdminCli(['remote-pair', '--config', configPath, '--read', FIXTURE.workspaceId, '--execute', FIXTURE.workspaceId, '--output', invitationPath], io, options), 0, errors);
+  const invitationPath = join(dir, 'invitations', 'invite.private.json');
+  assert.equal(await runAdminCli(['remote-pair', '--config', configPath, '--read', FIXTURE.workspaceId, '--execute', FIXTURE.workspaceId, '--qr', '--output', invitationPath], io, options), 0, errors);
   const invitation = JSON.parse(readFileSync(invitationPath, 'utf8'));
   assert.equal(invitation.version, 2); assert.equal(invitation.baseUrl, `https://${hostname}`); assert.ok(invitation.certificatePem); assert.match(invitation.pinSha256, /^sha256\//);
+  assert.match(errors, /Do not share/); assert.match(errors, /QR version|QR capacity/);
   assert.equal(output.includes(invitation.pairingToken), false); assert.equal(output.includes(invitation.relay.accessToken), false); assert.equal(JSON.stringify(invitation).includes(owner.connectorToken), false);
   return { dir, owner, relay, host, config, configPath, certificate, hostname, outer, invitation, io, options };
 }
@@ -87,7 +88,7 @@ test('remote-pair accepts wildcard registry grants without reading the DSH profi
   const f = await fixture(t);
   const config = { ...f.config, workspaceSource: 'dsh-registry', workspaces: [] };
   writeFileSync(f.configPath, JSON.stringify(config));
-  const invitationPath = join(f.dir, 'registry.private.json');
+  const invitationPath = join(f.dir, 'invitations', 'registry.private.json');
   assert.equal(await runAdminCli(['remote-pair', '--config', f.configPath, '--read', 'all', '--execute', 'all', '--output', invitationPath], f.io, f.options), 0);
   const invitation = JSON.parse(readFileSync(invitationPath, 'utf8'));
   const paired = await remoteCall(f, invitation.relay, '/pairings', { body: { pairingToken: invitation.pairingToken, deviceName: 'Synthetic all-project phone' } });

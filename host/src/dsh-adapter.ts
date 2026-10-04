@@ -5,7 +5,8 @@ import type { WorkspaceSource } from './workspace-source.ts';
 import { HostError } from './errors.ts';
 import type { ChatMessage, HostAdapter, HostSession, HostSnapshot, Preset, WorkspaceConfig } from './types.ts';
 
-export const COMPATIBLE_DSH_VERSION = '0.2.0-rc.2';
+import { isCompatibleDshVersion } from './compatibility.ts';
+export { COMPATIBLE_DSH_VERSIONS } from './compatibility.ts';
 const MAX_MESSAGES = 100;
 const isUuid = (value: string): boolean => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 
@@ -280,7 +281,7 @@ function waitForWake(register: (wake: () => void) => void, timeoutMs: number, si
 }
 
 export async function createDshAdapter(options: DshAdapterOptions): Promise<DshAdapter> {
-  if (options.dshVersion !== COMPATIBLE_DSH_VERSION) throw new HostError('invalid_config');
+  if (!isCompatibleDshVersion(options.dshVersion)) throw new HostError('unsupported_dsh_version');
   if (options.workspaceSource && options.workspaces?.length) throw new HostError('invalid_config');
   if (options.realpathCacheMaxEntries !== undefined && (!Number.isInteger(options.realpathCacheMaxEntries) || options.realpathCacheMaxEntries < 1 || options.realpathCacheMaxEntries > 4096)) throw new HostError('invalid_config');
   const source = options.workspaceSource ?? await createWorkspaceSource({ workspaces: [...options.workspaces ?? []] });
@@ -288,11 +289,11 @@ export async function createDshAdapter(options: DshAdapterOptions): Promise<DshA
 }
 
 export class DshAdapter implements HostAdapter {
-  readonly upstreamVersion = COMPATIBLE_DSH_VERSION;
+  readonly upstreamVersion: string;
   private readonly options: DshAdapterOptions;
   private readonly source: WorkspaceSource;
   private readonly lifetime = new AbortController();
-  constructor(options: DshAdapterOptions, source: WorkspaceSource) { this.options = options; this.source = source; }
+  constructor(options: DshAdapterOptions, source: WorkspaceSource) { this.options = options; this.source = source; this.upstreamVersion = options.dshVersion; }
   dispose(): void { this.lifetime.abort(); }
   private signal(signal: AbortSignal): AbortSignal { return AbortSignal.any([signal, this.lifetime.signal]); }
   private async workspaceMap(): Promise<{ workspaces: ReadonlyMap<string, CanonicalWorkspace>; view: readonly WorkspaceConfig[] }> {
