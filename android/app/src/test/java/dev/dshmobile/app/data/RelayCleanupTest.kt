@@ -1,16 +1,21 @@
 package dev.dshmobile.app.data
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import okhttp3.CertificatePinner
 import okhttp3.Request
 import okhttp3.tls.HeldCertificate
 import org.junit.Assert.*
 import org.junit.Test
+import java.net.ConnectException
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class RelayCleanupTest {
     private val host = "h-0123456789abcdef0123456789abcdef.dsh.invalid"
@@ -23,27 +28,52 @@ class RelayCleanupTest {
         val owner = TransportIoOwner()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
-        assertTrue(owner.submit { entered.countDown(); release.await(5, TimeUnit.SECONDS) })
-        assertTrue(entered.await(2, TimeUnit.SECONDS))
-        repeat(8) { assertTrue(owner.submit { fail("Terminal close must discard queued cancellation tasks") }) }
+        val queuedTasks = AtomicInteger()
+        val ordinaryFinished = CountDownLatch(1)
         lateinit var proxy: RelayLoopbackProxy
         proxy = RelayLoopbackProxy(endpoint(9), owner) { owner.close { proxy.closePhysical() } }
-        val listenerAddress = proxy.proxy.address() as java.net.InetSocketAddress
+        val listenerAddress = proxy.proxy.address() as InetSocketAddress
         val callers = Executors.newFixedThreadPool(2)
         try {
+            assertTrue(owner.submit {
+                entered.countDown()
+                try { release.await() } finally { ordinaryFinished.countDown() }
+            })
+            assertTrue("Ordinary IO started", entered.await(2, TimeUnit.SECONDS))
+            repeat(8) { assertTrue(owner.submit { queuedTasks.incrementAndGet() }) }
+            assertFalse("All eight ordinary slots are occupied", owner.submit { queuedTasks.incrementAndGet() })
+            val ready = CountDownLatch(2)
             val begin = CountDownLatch(1)
-            val first = callers.submit { begin.await(); proxy.retire() }
-            val second = callers.submit { begin.await(); proxy.close() }
+            val first = callers.submit { ready.countDown(); begin.await(); proxy.retire() }
+            val second = callers.submit { ready.countDown(); begin.await(); proxy.close() }
+            assertTrue("Both retirement callers are ready", ready.await(2, TimeUnit.SECONDS))
             begin.countDown()
             first.get(1, TimeUnit.SECONDS)
             second.get(1, TimeUnit.SECONDS)
+            assertEquals("Retirement did not release or interrupt ordinary IO", 1L, ordinaryFinished.count)
             owner.close { proxy.closePhysical() }
+            assertFalse("Terminal retirement rejects new ordinary work", owner.submit { queuedTasks.incrementAndGet() })
             release.countDown()
             owner.awaitClosed()
-            assertThrows(java.io.IOException::class.java) {
-                Socket().use { it.connect(listenerAddress, 500) }
-            }
-        } finally { release.countDown(); proxy.retire(); proxy.closePhysical(); callers.shutdownNow() }
+            assertEquals("Terminal close discarded all queued cancellation tasks", 0, queuedTasks.get())
+            awaitConnectionRefused(listenerAddress)
+        } finally {
+            proxy.retire()
+            owner.close { proxy.closePhysical() }
+            release.countDown()
+            callers.shutdownNow()
+            owner.awaitClosed()
+        }
+    }
+
+    private suspend fun awaitConnectionRefused(address: InetSocketAddress) = withTimeout(2_000) {
+        // JDK close can return before a blocked Linux accept releases its native listener.
+        // A final TCP handshake may still succeed; await actual refusal, not an IO timeout.
+        while (true) {
+            try { Socket().use { it.connect(address, 500) } }
+            catch (_: ConnectException) { return@withTimeout }
+            yield()
+        }
     }
     @Test fun `closing during pending outer upgrade aborts actual TCP and prevents later startup`() = runBlocking {
         repeat(12) {
