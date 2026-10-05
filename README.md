@@ -4,10 +4,10 @@
 
 # DSH Mobile
 
-**Нативное Android-приложение для [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): чаты всех ваших проектов, отправка задач и наблюдение за агентом с телефона. Модели, инструменты и подписки остаются на компьютере.**
+**Нативное Android-приложение для [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): открывайте чаты всех проектов и отправляйте задачи с телефона.** Ответы агента обновляются в реальном времени. Модели, инструменты и подписки остаются на компьютере.
 
 <p align="center">
-  <a href="https://github.com/pavel-logachev/dsh-mobile/releases/tag/v0.4.0"><strong>Скачать APK 0.4.0</strong></a> &nbsp;·&nbsp;
+  <a href="https://github.com/pavel-logachev/dsh-mobile/releases/tag/v0.4.0">Скачать APK 0.4.0</a> &nbsp;·&nbsp;
   <a href="docs/SETUP.md">Установка</a> &nbsp;·&nbsp;
   <a href="docs/ARCHITECTURE.md">Архитектура</a> &nbsp;·&nbsp;
   <a href="docs/SECURITY.md">Безопасность</a> &nbsp;·&nbsp;
@@ -17,16 +17,16 @@
   <a href="#english">English</a>
 </p>
 
-> **Статус:** версия 0.4, работает у автора на телефоне с его DSH. Независимый неофициальный проект, не продукт DeepSeek.
+> Версия 0.4 работает у автора на телефоне с его DSH. Проект неофициальный, разрабатывается независимо от DeepSeek.
 
 ## Что умеет
 
-- **Все проекты DSH.** Телефон показывает тот же список проектов, что боковая панель DSH, в том же порядке. Новый проект появляется сам, без повторной привязки.
-- **Чаты и задачи.** Поиск, фильтр по проекту, группировка «Сегодня / Вчера / На неделе», создание чата в нужном проекте и с нужным пресетом, отправка текстовой задачи, остановка выполнения.
-- **Живой ответ.** Ответ агента обновляется в реальном времени и рендерится как Markdown: заголовки, списки, таблицы, блоки кода с копированием.
-- **Честная доставка.** Если сеть пропала в момент отправки, приложение не отправит задачу второй раз вслепую, а сверит её статус с компьютером.
-- **Привязка по QR-коду.** Компьютер показывает одноразовый QR, телефон сканирует. Камера запрашивается только на время сканирования, распознавание идёт без сети и без сервисов Google.
-- **Тёмная и светлая темы**, русский и английский интерфейс, крупный шрифт.
+- Телефон показывает тот же список проектов, что боковая панель DSH, в том же порядке. Новый проект появляется сам, без повторной привязки.
+- Чаты можно искать, фильтровать по проекту и группировать: «Сегодня / Вчера / На неделе». При создании чата выбираются проект и пресет. Из чата можно отправить текстовую задачу или остановить выполнение.
+- Ответ агента отображается в Markdown с заголовками, списками, таблицами и блоками кода, которые можно копировать.
+- Если сеть пропала во время отправки, приложение сверит статус задачи с компьютером перед повторной отправкой.
+- Для привязки компьютер показывает одноразовый QR-код, который сканирует телефон. Камера запрашивается только на время сканирования, распознавание идёт без сети и без сервисов Google.
+- Есть тёмная и светлая темы, русский и английский интерфейс, крупный шрифт.
 
 <p align="center">
   <img src="docs/screenshots/home-dark.png" width="240" alt="Список чатов с фильтром по проектам">
@@ -42,29 +42,29 @@ Android-приложение ──HTTPS (Wi‑Fi или Tailscale)──▶ п�
                     └─ или через ваш собственный relay (опционально)
 ```
 
-На компьютере в DSH устанавливается небольшой плагин-компаньон. Он открывает узкий защищённый API только для привязанных телефонов. Сам веб-интерфейс DSH наружу не публикуется. Телефон проверяет компьютер по закреплённому сертификату из приглашения, а у каждого телефона свой ключ и свои права, которые можно отозвать.
+На компьютере в DSH устанавливается небольшой плагин-компаньон. Он даёт привязанным телефонам доступ к ограниченному API через защищённое соединение. Сам веб-интерфейс DSH наружу не публикуется. Телефон проверяет компьютер по закреплённому сертификату из приглашения, а у каждого телефона свой ключ и свои права, которые можно отозвать.
 
 ## Установка
 
-Полная пошаговая инструкция — **[docs/SETUP.md](docs/SETUP.md)**. Она написана так, что её можно целиком отдать своему агенту DSH: агент проверит версии, установит плагин и спросит вас перед каждым важным действием. Если коротко:
+Пошаговую инструкцию [docs/SETUP.md](docs/SETUP.md) можно передать своему агенту DSH. По ней агент проверит версии, установит плагин и запросит согласие перед каждым важным действием. Основные шаги:
 
-1. **Проверьте требования:** Windows, DeepSeek Harness `0.2.0-rc.2` или `0.2.1-alpha.1`, Node.js 24, OpenSSL 3, Android 8.0+.
-2. **Скачайте из [Releases](https://github.com/pavel-logachev/dsh-mobile/releases/latest)** подписанный APK, архив плагина `dsh-mobile-host-<версия>.zip` и их файлы `.sha256`. Сверьте контрольные суммы.
-3. **Установите плагин:** запустите `install-host.ps1` из архива и укажите адрес компьютера (IP в домашней сети или имя в Tailscale). Скрипт сначала только готовит конфигурацию, а подключает плагин к DSH отдельным шагом `-Activate`, без перезапуска DSH.
-4. **Разрешите доступ:** чтение всех проектов и, если хотите, запуск задач. Правило брандмауэра Windows добавляется только для частной сети и только с вашего согласия.
-5. **Установите APK** на телефон. Android попросит разрешить установку из этого источника.
-6. **Привяжите телефон:** на компьютере `pair --qr`, в приложении «Сканировать QR-код», затем сверьте адрес и отпечаток сертификата и подтвердите.
+1. Проверьте требования: Windows, DeepSeek Harness `0.2.0-rc.2` или `0.2.1-alpha.1`, Node.js 24, OpenSSL 3, Android 8.0+.
+2. Скачайте из [Releases](https://github.com/pavel-logachev/dsh-mobile/releases/latest) подписанный APK, архив плагина `dsh-mobile-host-<версия>.zip` и их файлы `.sha256`. Сверьте контрольные суммы.
+3. Установите плагин: запустите `install-host.ps1` из архива и укажите адрес компьютера (IP в домашней сети или имя в Tailscale). Скрипт сначала только готовит конфигурацию, а подключает плагин к DSH отдельным шагом `-Activate`, без перезапуска DSH.
+4. Разрешите доступ: чтение всех проектов и, если хотите, запуск задач. Правило брандмауэра Windows добавляется только для частной сети и только с вашего согласия.
+5. Установите APK на телефон. Android попросит разрешить установку из этого источника.
+6. Привяжите телефон: на компьютере `pair --qr`, в приложении «Сканировать QR-код», затем сверьте адрес и отпечаток сертификата и подтвердите.
 
-**Вне дома.** Поставьте [Tailscale](https://tailscale.com/) на компьютер и телефон и укажите при установке имя компьютера в tailnet. Это бесплатно, роутер настраивать не нужно. Свой relay на VPS — продвинутый вариант для тех, кому Tailscale не подходит: [RELAY_DEPLOYMENT.md](docs/RELAY_DEPLOYMENT.md). Общего публичного relay проект не предоставляет.
+Для подключения вне дома поставьте [Tailscale](https://tailscale.com/) на компьютер и телефон и укажите при установке имя компьютера в tailnet. Это бесплатно, роутер настраивать не нужно. Если Tailscale не подходит, можно настроить свой relay на VPS: [RELAY_DEPLOYMENT.md](docs/RELAY_DEPLOYMENT.md). Общего публичного relay проект не предоставляет.
 
 ## Безопасность
 
-- **Плагин работает внутри DSH** с теми же правами, что и сам DSH на вашем компьютере. Фильтрация по проектам — это не песочница: агент DSH с телефона может делать всё то же, что и с компьютера. Права на запуск задач давайте только своим доверенным устройствам.
+- Плагин работает внутри DSH с теми же правами, что и сам DSH на вашем компьютере. Фильтрация по проектам не создаёт песочницу. Агент DSH с телефона может делать всё то же, что и с компьютера. Права на запуск задач давайте только своим доверенным устройствам.
 - Приглашение одноразовое и живёт не дольше 15 минут. Передавайте его только напрямую: QR-кодом с экрана своего компьютера или файлом по доверенному каналу.
 - Ключи телефона хранятся в Android Keystore и не попадают в резервные копии. Ключи компьютера лежат в профиле пользователя Windows с доступом только для владельца.
 - Relay, если вы его используете, пересылает зашифрованный трафик и не видит содержимое чатов. Но он видит IP-адреса, время и объём трафика.
 
-Подробно — в [SECURITY.md](docs/SECURITY.md).
+Подробности в [SECURITY.md](docs/SECURITY.md).
 
 ## Сборка из исходников
 
@@ -100,7 +100,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& ../tools/android-build
 
 ## English
 
-DSH Mobile is an independent, unofficial native Android companion for DeepSeek Harness. It lists the chats of every registered DSH project, lets you create chats, send text tasks, watch live Markdown replies and stop running work, while models, tools, subscriptions and history stay on your computer. A small companion plugin runs inside DSH and exposes a narrow, pinned-TLS API to paired phones. Pairing is a one-use QR invitation, and scanning works offline without Google Play services. Connect over the same Wi‑Fi, over Tailscale, or through your own optional relay. Supported DSH versions: `0.2.0-rc.2` and `0.2.1-alpha.1`. See the agent-ready [setup runbook](docs/SETUP.md). Project filtering is not a sandbox, and there are no push notifications, attachments or approvals yet.
+DSH Mobile is an unofficial native Android app for DeepSeek Harness, developed independently. It shows chats from every registered DSH project. You can create a chat, send a text task, read live Markdown replies or stop running work. Models, tools, subscriptions and history stay on your computer.
+
+A companion plugin runs inside DSH and gives paired phones access to a limited API over TLS. The phone pins the computer’s certificate. Pairing uses a one-use QR invitation; scanning works offline without Google Play services. You can connect over the same Wi‑Fi, over Tailscale or through your own relay.
+
+Supported DSH versions are `0.2.0-rc.2` and `0.2.1-alpha.1`. You can give the [setup runbook](docs/SETUP.md) to your DSH agent. Project filtering does not create a sandbox. Push notifications, attachments and approvals are not supported yet.
 
 ## Лицензия
 
