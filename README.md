@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/dsh-mobile-showcase.jpg" alt="DSH Mobile — список чатов и чат с работающим агентом на Android" width="100%">
+  <img src="docs/assets/dsh-mobile-showcase.png" alt="DSH Mobile — список чатов и чат с работающим агентом на Android" width="100%">
 </p>
 
 # DSH Mobile
@@ -7,22 +7,19 @@
 **Нативное Android-приложение для [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): чаты всех ваших проектов, отправка задач и наблюдение за агентом с телефона. Модели, инструменты и подписки остаются на компьютере.**
 
 <p align="center">
-  <a href="https://github.com/pavel-logachev/dsh-mobile/releases/latest">Скачать APK</a> &nbsp;·&nbsp;
+  <a href="https://github.com/pavel-logachev/dsh-mobile/releases/tag/v0.4.0"><strong>Скачать APK 0.4.0</strong></a> &nbsp;·&nbsp;
   <a href="docs/SETUP.md">Установка</a> &nbsp;·&nbsp;
   <a href="docs/ARCHITECTURE.md">Архитектура</a> &nbsp;·&nbsp;
   <a href="docs/SECURITY.md">Безопасность</a> &nbsp;·&nbsp;
+  <a href="https://github.com/pavel-logachev/dsh-mobile/actions/workflows/ci.yml">CI</a> &nbsp;·&nbsp;
+  Android 8+ &nbsp;·&nbsp;
+  <a href="LICENSE">MIT</a> &nbsp;·&nbsp;
   <a href="#english">English</a>
 </p>
 
-<p align="center">
-  <a href="https://github.com/pavel-logachev/dsh-mobile/actions/workflows/ci.yml"><img src="https://github.com/pavel-logachev/dsh-mobile/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/Android-8.0%2B-2f3e73" alt="Android 8.0+">
-  <img src="https://img.shields.io/badge/DSH-0.2.0--rc.2%20%7C%200.2.1--alpha.1-167c69" alt="DSH 0.2.0-rc.2 | 0.2.1-alpha.1">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-6b5fd6" alt="MIT"></a>
-</p>
-
-> [!NOTE]
-> Независимый неофициальный проект, не продукт DeepSeek. Статус — **development preview**: проверен тестами, на эмуляторе и на одном реальном DSH владельца; это не гарантированный сервис удалённого доступа.
+> **Статус:** development preview. Проверен тестами, на эмуляторе и на одном реальном DSH владельца. Не проверены физический телефон в домашней Wi‑Fi-сети, Tailscale на мобильном интернете и установка на чистую Windows.
+>
+> Независимый неофициальный проект, не продукт DeepSeek и не гарантированный сервис удалённого доступа.
 
 ## Что умеет
 
@@ -85,9 +82,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& ../tools/android-build
 
 | Часть | Что проверяется |
 |---|---|
-| Плагин | 79 тестов: права устройств, отзыв, повторная доставка, гонки при смене проектов. Изолированные прогоны на настоящем DSH обеих поддерживаемых версий |
-| Установщик | 21 сценарий на синтетическом профиле: подготовка, активация, обновление, откат, удаление, сохранение байтов профиля |
-| Android | 127 JVM-тестов, lint; регрессионная приёмка и снимки экранов на эмуляторе |
+| Плагин | 85 тестов: права устройств, отзыв, повторная доставка, гонки при смене проектов. Изолированные прогоны на настоящем DSH обеих поддерживаемых версий |
+| Установщик | 28 сценариев на синтетическом профиле: подготовка, активация, обновление, откат, удаление, сохранение байтов профиля |
+| Android | 142 JVM-теста, lint; регрессионная приёмка и снимки экранов на эмуляторе |
 | Релиз | В APK только три разрешения: интернет, камера и внутреннее служебное. Никакой телеметрии и сервисов Google |
 
 ## Ограничения
