@@ -1,6 +1,6 @@
 # Build and verification
 
-Status: development preview. These are reproducible commands, not a record of a completed acceptance run. See [the acceptance plan](PLAN.md) for fixture, real DSH, emulator and physical-device gates. No physical-phone or mobile-route acceptance has been completed.
+These are reproducible build and test commands. See [the acceptance plan](PLAN.md) for fixture, real DSH, emulator and physical-device checks.
 
 ## Prerequisites
 

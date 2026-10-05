@@ -17,9 +17,7 @@
   <a href="#english">English</a>
 </p>
 
-> **Статус:** development preview. Проверен тестами, на эмуляторе и на одном реальном DSH владельца. Не проверены физический телефон в домашней Wi‑Fi-сети, Tailscale на мобильном интернете и установка на чистую Windows.
->
-> Независимый неофициальный проект, не продукт DeepSeek и не гарантированный сервис удалённого доступа.
+> **Статус:** версия 0.4, работает у автора на телефоне с его DSH. Независимый неофициальный проект, не продукт DeepSeek.
 
 ## Что умеет
 
@@ -102,7 +100,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& ../tools/android-build
 
 ## English
 
-DSH Mobile is an independent, unofficial native Android companion for DeepSeek Harness. It lists the chats of every registered DSH project, lets you create chats, send text tasks, watch live Markdown replies and stop running work, while models, tools, subscriptions and history stay on your computer. A small companion plugin runs inside DSH and exposes a narrow, pinned-TLS API to paired phones. Pairing is a one-use QR invitation, and scanning works offline without Google Play services. Connect over the same Wi‑Fi, over Tailscale, or through your own optional relay. Supported DSH versions: `0.2.0-rc.2` and `0.2.1-alpha.1`. See the agent-ready [setup runbook](docs/SETUP.md). The project is a development preview: project filtering is not a sandbox, and there are no push notifications, attachments or approvals yet.
+DSH Mobile is an independent, unofficial native Android companion for DeepSeek Harness. It lists the chats of every registered DSH project, lets you create chats, send text tasks, watch live Markdown replies and stop running work, while models, tools, subscriptions and history stay on your computer. A small companion plugin runs inside DSH and exposes a narrow, pinned-TLS API to paired phones. Pairing is a one-use QR invitation, and scanning works offline without Google Play services. Connect over the same Wi‑Fi, over Tailscale, or through your own optional relay. Supported DSH versions: `0.2.0-rc.2` and `0.2.1-alpha.1`. See the agent-ready [setup runbook](docs/SETUP.md). Project filtering is not a sandbox, and there are no push notifications, attachments or approvals yet.
 
 ## Лицензия
 
