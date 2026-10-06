@@ -22,9 +22,9 @@ The optional Cordis module is the inspected installed 4.0.4 module, read-only. I
 
 ## Final results
 
-- Host without optional Cordis: 111 tests, 107 pass, 4 intentional skips, 0 failures; build/check exit 0.
-- Host with installed Cordis: 111/111 pass, no skips/failures; build/check exit 0.
-- Android six wrapper tasks: BUILD SUCCESSFUL, exit 0; JVM XML totals 184 tests, zero failures/errors.
+- Host without optional Cordis: 121 tests, 117 pass, 4 intentional skips, 0 failures; build/check exit 0.
+- Host with installed Cordis: 121/121 pass, no skips/failures; build/check exit 0.
+- Android six wrapper tasks (previous remediation run; unchanged in host-only follow-up): BUILD SUCCESSFUL, exit 0; JVM XML totals 184 tests, zero failures/errors.
 - `lintDebug` and `lintRelease`: no errors; warnings remain (19 debug/21 release). These do not certify OS background delivery.
 - Both APK permission audits and `git diff --check`: pass.
 
@@ -64,6 +64,17 @@ All nine assigned findings have implementation and regression coverage. Each fin
 Final focused self-review was read-only over the full revision scope from `efae41d`, including working-tree/new files; no delegation. Corrected idle attention emission, sequence-independent pending comparison, delayed-busy navigation trigger and safe failure reporting. No dependency, SDK, manifest permission, relay wire, release installation or runtime/profile changes. Changes overlapping UI-polish remain focused on notification effects/selection and the existing Settings notification panel.
 
 The lazy idle probe budget is eight sessions per minute, with ten seconds per pass; a previously unobserved idle pending request may therefore appear late in a very large workspace. This is explicit bounded recovery, not a startup scan or a claim of immediate idle-history coverage. Normal live pending events and known pending restarts are processed promptly. Real OS AtomicFile/KeyStore, FGS and Compose tap interaction still require the hardware gates below; JVM tests model the atomic race/backup boundary rather than running API26 framework code.
+
+## Idle recovery re-review follow-up
+
+Commits: `5b8794f` (fair retry/reactivation), `2892990` (authoritative idle evidence). Final host gates: 121 tests, 117 pass/4 intentional skips without Cordis; 121/121 pass with installed Cordis; both build/check exit 0. Focused self-review covered the full diff from `8ec5130`, including uncommitted tests; git diff --check passed. No delegation or push.
+
+Host-only changes after `8ec5130`; no Android/runtime/dependency changes. Tests were added before each finding's implementation: the retry/exclusion/invalid/unprobed/fairness/reactivation cases reproduced failures, and the corrected adapter→feed tests were additionally checked against the original running-gated predicate (both failed). A held-baseline disable/re-enable test exposed a stale-generation reset and now passes with post-await abort checks. A real AbortSignal timeout test proves unprobed IDs survive the ten-second pass budget.
+
+- Lazy discovery now rotates the batch before I/O and retains IDs after failures, exclusion and early exit. Failed probes have capped exponential retry spacing (2–16 reconciliation passes); a permanently broken chat does not block peers. Current+temporarily excluded IDs stay bounded to 10,000. Successful idle probes remain in rotation so later pending state is discoverable.
+- A zero→one enabled-device transition discards the old observation generation, rebuilds its queue from a fresh list and runs a fresh asynchronous baseline with initializing coverage. Old suspended reads cannot publish pending state or resets into the new generation.
+- Notification evidence no longer requires list-summary running:true. Installed user-question projection active.state=open is authoritative, continued/empty/settled views do not inherit pending from historic tool calls. Installed approval audit pairs are folded inside their open turn. A terminal stop makes leftover question/approval state non-alerting. The existing historical desktop notice is retained.
+- Read-only runtime evidence: dsh-user-questions/lib/types/projection.js (active open/continued fold; results settle or continue), dsh-user-approval/lib/types/index.js and invariant.js (turn-enclosed asked/decided audit). The adapter→feed fixtures exercise running:false open question and approval, continued-only, cancelled-terminal stale state, episode clearing and close-before-activation/no mutation. They are not live production acceptance.
 
 ## Not accepted on hardware
 
