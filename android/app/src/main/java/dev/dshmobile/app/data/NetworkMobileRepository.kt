@@ -240,8 +240,15 @@ internal class NetworkMobileRepository(
     }
     override suspend fun selectSession(sessionId: String) = action {
         restoreLocked()
-        if (state.value.connection != ConnectionState.ONLINE || !foreground) throw MobileFailure("offline_no_send")
-        if (!validId(sessionId) || state.value.sessions.none { it.id == sessionId }) throw MobileFailure("invalid_selection")
+        if (!foreground) throw MobileFailure("offline_no_send")
+        if (!validId(sessionId)) throw MobileFailure("invalid_selection")
+        if (state.value.connection != ConnectionState.ONLINE || state.value.sessions.none { it.id == sessionId }) refreshLocked()
+        if (state.value.sessions.none { it.id == sessionId }) {
+            // Index can be bounded: the host snapshot independently enforces current read grants.
+            val target = api().snapshot(sessionId)
+            if (state.value.workspaces.none { it.id == target.session.workspaceId }) throw MobileFailure("invalid_selection")
+            mutableState.value = state.value.copy(sessions = state.value.sessions + target.session)
+        }
         stopObserver()
         mutableState.value = state.value.copy(busy = true, error = null)
         val snapshot = api().snapshot(sessionId)

@@ -31,6 +31,7 @@ import kotlinx.coroutines.launch
     var failed by remember { mutableStateOf(false) }
     var pendingPermission by remember { mutableStateOf(false) }
     LaunchedEffect(store) { try { local = store.read(); local = syncNotificationPreferences(context) } catch (_: Exception) { failed = true } }
+    LaunchedEffect(store) { store.changes.collect { runCatching { local = store.read() } } }
     fun change(enabled: Boolean, project: String? = null, chat: String? = null) {
         scope.launch {
             try {
@@ -48,7 +49,7 @@ import kotlinx.coroutines.launch
                 else context.getSystemService(android.app.NotificationManager::class.java).cancelAll()
                 failed = false
                 runCatching { local = syncNotificationPreferences(context) }
-            } catch (_: Exception) { failed = true; runCatching { local = store.update { it.copy(enabled = false) } } }
+            } catch (_: Exception) { failed = true; runCatching { local = store.update { it.copy(enabled = false, monitoringStatus = "blocked") } } }
         }
     }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
@@ -74,6 +75,12 @@ import kotlinx.coroutines.launch
     Text(stringResource(R.string.notif_rationale), style = MaterialTheme.typography.bodyMedium)
     Text(stringResource(R.string.notif_restart), style = MaterialTheme.typography.bodySmall)
     if (state.capabilities?.notifications != true) Text(stringResource(R.string.notif_unsupported))
+    when (local.monitoringStatus) {
+        "degraded" -> Text(stringResource(R.string.notif_degraded), color = MaterialTheme.colorScheme.error)
+        "initializing" -> if (local.enabled) Text(stringResource(R.string.notif_initializing))
+        "offline" -> Text(stringResource(R.string.notif_offline))
+        "blocked" -> Text(stringResource(R.string.notif_blocked), color = MaterialTheme.colorScheme.error)
+    }
     if (failed) Text(stringResource(R.string.notif_blocked), color = MaterialTheme.colorScheme.error)
     if (local.dirty) Text(stringResource(R.string.notif_unsynced), style = MaterialTheme.typography.bodySmall)
     TextButton(onClick = onSystem) { Text(stringResource(R.string.notif_system)) }

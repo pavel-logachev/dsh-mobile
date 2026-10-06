@@ -72,6 +72,33 @@ class RepositoryTest {
             }
         }
     }
+    @Test fun `notification navigation refreshes newly authorized chat and cold state without mutations`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            fixture.index = """{"items":[${session()},${session().replace("\"id\":\"chat\"", "\"id\":\"other\"")}],"nextCursor":null}"""
+            repo.selectSession("other")
+            assertNull(repo.state.value.error)
+            assertEquals("other", repo.state.value.snapshot?.session?.id)
+            assertEquals("other", store.value.selectedSessionId)
+            assertTrue(fixture.requests.any { it.requestUrl?.encodedPath == "/v1/sessions" }); assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `notification navigation retries cold offline failure without a command or losing drafts`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            repo.updateDraft("draft survives navigation")
+            fixture.failIndex = true; repo.refresh(); assertEquals(ConnectionState.OFFLINE, repo.state.value.connection)
+            repo.selectSession("other"); assertNotNull(repo.state.value.error); assertEquals("chat", store.value.selectedSessionId)
+            fixture.failIndex = false
+            fixture.index = """{"items":[${session()},${session().replace("\"id\":\"chat\"", "\"id\":\"other\"")}],"nextCursor":null}"""
+            repo.selectSession("other"); assertEquals("other", store.value.selectedSessionId)
+            assertEquals("draft survives navigation", store.value.drafts["chat"]); assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `notification target beyond bounded index loads only an authorized snapshot`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            repo.selectSession("other"); assertEquals("other", store.value.selectedSessionId)
+            assertTrue(repo.state.value.sessions.any { it.id == "other" }); assertTrue(fixture.mutations.isEmpty())
+        }
+    }
     @Test fun `a durable command exists before POST and canonical request ID reconciles it once`() = runBlocking {
         withRepository { repo, store, fixture, _ ->
             fixture.message = { request ->

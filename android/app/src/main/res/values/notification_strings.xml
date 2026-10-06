@@ -19,4 +19,8 @@
     <string name="notif_filters">Project and chat notifications</string>
     <string name="notif_projects">Projects</string>
     <string name="notif_chats">Chats (up to 256 overrides)</string>
+    <string name="notif_monitoring">DSH Mobile monitoring</string>
+    <string name="notif_initializing">Checking notification coverage…</string>
+    <string name="notif_degraded">Some events may have been missed.</string>
+    <string name="notif_offline">Connection interrupted. Reconnecting; alerts may be delayed.</string>
 </resources>

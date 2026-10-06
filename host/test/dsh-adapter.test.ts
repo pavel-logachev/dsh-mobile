@@ -313,7 +313,7 @@ test('the plugin composes and disposes with actual installed Cordis and harmless
   } finally { admin.close(); }
   await fiber.dispose();
   await assert.rejects(fetch(`http://127.0.0.1:${port}/v1/capabilities`));
-  assert.deepEqual(h.cleanup(), { closed: 2, resumed: 0 }, 'baseline and terminal proof each close one opening without activation');
+  assert.deepEqual(h.cleanup(), { closed: 1, resumed: 0 }, 'idle baseline is lazy; terminal proof closes one opening without activation');
   assert.deepEqual(h.calls(), { created: undefined, prompted: undefined, cancelled: undefined });
   // A dispose racing async realpath/server startup must await cleanup too.
   const racing = ctx.plugin(plugin, config);

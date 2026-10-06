@@ -61,10 +61,14 @@ private fun PairedApp(state: MobileState, model: MobileViewModel) {
     val motion = LocalMotionEnabled.current
     val savedScreens = rememberSaveableStateHolder()
     fun goBack() { route = if (route == "settings") previousRoute else "home" }
-    LaunchedEffect(model.notificationChat, state.busy, model.interactionBlocked) {
+    LaunchedEffect(model.notificationChat, state.connection, state.lastSyncedAt, state.busy, model.interactionBlocked, state.error) {
         val target = model.notificationChat
-        if (target != null && !state.busy && !model.interactionBlocked) {
-            sessionId = target; model.selectSession(target); route = "chat"; model.consumeNotificationChat()
+        if (target != null && !state.busy && !model.interactionBlocked && state.error == null && state.snapshot?.session?.id != target && state.connection == dev.dshmobile.app.model.ConnectionState.ONLINE) model.selectNotificationChat(target)
+    }
+    LaunchedEffect(model.notificationChat, state.snapshot?.session?.id, state.busy, state.error) {
+        val target = model.notificationChat
+        if (target != null && notificationTargetSelected(target, state.snapshot?.session?.id, state.busy, state.error)) {
+            sessionId = target; route = "chat"; model.consumeNotificationChat(target)
         }
     }
     // Native predictive Back commits only on completion; a canceled gesture keeps the screen.

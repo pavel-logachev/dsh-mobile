@@ -37,17 +37,20 @@ internal class StateCipher(private val key: () -> SecretKey) {
     }
 }
 
-internal class EncryptedStateStore(context: Context) : SecureStateStore {
-    private val file = AtomicFile(File(context.applicationContext.noBackupFilesDir, "mobile-state.enc"))
-    private val mutex = Mutex()
-    private val cipher = StateCipher(::key)
-    private val alias = "dsh-mobile-state-v1"
+internal class EncryptedStateStore internal constructor(private val file: AtomicStateFile, private val cipher: StateCipher, private val deleteKey: () -> Unit) : SecureStateStore {
+    constructor(context: Context) : this(AndroidAtomicStateFile(File(context.applicationContext.noBackupFilesDir, "mobile-state.enc")), StateCipher { key() }, {
+        KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(ALIAS)
+    })
+    private val mutex = StateFileOwners.mutex(file.identity)
 
-    private fun key(): SecretKey {
+    private companion object {
+    const val MAX_STORED_BYTES = 2 * 1024 * 1024
+    const val ALIAS = "dsh-mobile-state-v1"
+    fun key(): SecretKey {
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (keyStore.getKey(alias, null) as? SecretKey)?.let { return it }
+        (keyStore.getKey(ALIAS, null) as? SecretKey)?.let { return it }
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").run {
-            init(KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+            init(KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
                 .setKeySize(256)
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
@@ -55,6 +58,8 @@ internal class EncryptedStateStore(context: Context) : SecureStateStore {
                 .build())
             generateKey()
         }
+    }
+
     }
 
     override suspend fun read(): StoredState = withContext(Dispatchers.IO) {
@@ -80,7 +85,7 @@ internal class EncryptedStateStore(context: Context) : SecureStateStore {
                 cipher.encrypt(plain)
             } catch (failure: Exception) { safeDebugDiagnostic("store.encrypt", failure); throw failure }
             finally { plain.fill(0) }
-            var stream: java.io.FileOutputStream? = null
+            var stream: java.io.OutputStream? = null
             try {
                 stream = file.startWrite()
                 stream.write(sealed)
@@ -97,19 +102,17 @@ internal class EncryptedStateStore(context: Context) : SecureStateStore {
         mutex.withLock {
             // Commit an empty encrypted record first: if deletion is interrupted there is no credential.
             val sealed = cipher.encrypt(mobileJson.encodeToString(StoredState()).toByteArray())
-            var stream: java.io.FileOutputStream? = null
+            var stream: java.io.OutputStream? = null
             try {
                 stream = file.startWrite()
                 stream.write(sealed)
                 file.finishWrite(stream)
                 file.delete()
-                val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-                keyStore.deleteEntry(alias)
+                deleteKey()
             } catch (_: Exception) {
                 file.failWrite(stream)
                 throw MobileFailure("storage_failed")
             }
         }
     }
-    private companion object { const val MAX_STORED_BYTES = 2 * 1024 * 1024 }
 }

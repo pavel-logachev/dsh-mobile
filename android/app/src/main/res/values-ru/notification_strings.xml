@@ -19,4 +19,8 @@
     <string name="notif_filters">Уведомления проектов и чатов</string>
     <string name="notif_projects">Проекты</string>
     <string name="notif_chats">Чаты (до 256 отдельных настроек)</string>
+    <string name="notif_monitoring">DSH Mobile: мониторинг</string>
+    <string name="notif_initializing">Проверяется полнота уведомлений…</string>
+    <string name="notif_degraded">Часть событий могла быть пропущена.</string>
+    <string name="notif_offline">Связь прервана. Переподключение; уведомления могут задерживаться.</string>
 </resources>
