@@ -25,6 +25,7 @@ internal class NotificationStore internal constructor(private val file: AtomicSt
         }
     })
     private val mutex = StateFileOwners.mutex(file.identity)
+    val changes: kotlinx.coroutines.flow.StateFlow<Long> get() = updates
     suspend fun read(): NotificationLocal = withContext(Dispatchers.IO) { mutex.withLock { readLocked() } }
     suspend fun update(change: (NotificationLocal) -> NotificationLocal): NotificationLocal = withContext(Dispatchers.IO) {
         mutex.withLock {
@@ -34,6 +35,7 @@ internal class NotificationStore internal constructor(private val file: AtomicSt
             val sealed = try { cipher.encrypt(plain) } finally { plain.fill(0) }
             val out = file.startWrite()
             try { out.write(sealed); file.finishWrite(out) } catch (_: Exception) { file.failWrite(out); throw MobileFailure("storage_failed") }
+            updates.value = updates.value + 1
             value
         }
     }
@@ -46,5 +48,5 @@ internal class NotificationStore internal constructor(private val file: AtomicSt
         } catch (_: java.io.FileNotFoundException) { return NotificationLocal() }
         catch (_: Exception) { throw MobileFailure("storage_failed") }
     }
-    companion object { private const val ALIAS = "dsh-mobile-notifications-v1" }
+    companion object { private val updates = kotlinx.coroutines.flow.MutableStateFlow(0L); private const val ALIAS = "dsh-mobile-notifications-v1" }
 }

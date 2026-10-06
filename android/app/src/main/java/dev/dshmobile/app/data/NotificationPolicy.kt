@@ -32,7 +32,8 @@ import kotlinx.serialization.Serializable
 @Serializable internal data class NotificationLocal(val enabled: Boolean = false, val deviceId: String? = null,
     val settings: NotificationSettings = NotificationSettings(), val dirty: Boolean = false,
     val epoch: String? = null, val cursor: String? = null, val lastSequence: Long = -1,
-    val processed: List<ProcessedNotification> = emptyList(), val attention: Map<String, String> = emptyMap()) {
+    val processed: List<ProcessedNotification> = emptyList(), val attention: Map<String, String> = emptyMap(),
+    val monitoringStatus: String = "initializing") {
     fun applyPage(page: NotificationPage, now: Long): AppliedNotifications {
         val reset = page.resetRequired || epoch != page.epoch
         var seen = (if (reset) emptyList() else processed).filter { it.at > now - 7 * 86400000L }
@@ -51,7 +52,7 @@ import kotlinx.serialization.Serializable
             if (event.kind == "attention-cleared" || event.expiresAt > now) display += event
         }
         return AppliedNotifications(copy(epoch = page.epoch, cursor = page.nextCursor, lastSequence = sequence,
-            processed = seen, attention = pending.toMap()), display.filter { it.kind != "attention-needed" || pending[it.sessionId] == it.attentionId }, reset)
+            processed = seen, attention = pending.toMap(), monitoringStatus = page.coverage), display.filter { it.kind != "attention-needed" || pending[it.sessionId] == it.attentionId }, reset)
     }
 }
 internal data class AppliedNotifications(val state: NotificationLocal, val display: List<NotificationEvent>, val reset: Boolean)

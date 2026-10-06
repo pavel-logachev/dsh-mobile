@@ -38,17 +38,21 @@ class NotificationService : Service() {
             return START_NOT_STICKY
         }
         if (!alertsAllowed()) { stopSelf(); return START_NOT_STICKY }
-        val stop = PendingIntent.getService(this, 0, Intent(this, NotificationService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val notification = NotificationCompat.Builder(this, CONNECTION).setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle(getString(R.string.notif_connected)).setContentText(getString(R.string.notif_restart))
-            .setOngoing(true).setOnlyAlertOnce(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-            .addAction(0, getString(R.string.notif_disable), stop).build()
+        val notification = connectionNotification("initializing")
         try {
             if (Build.VERSION.SDK_INT >= 34) startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
             else startForeground(1, notification)
         } catch (_: SecurityException) { stopSelf(); return START_NOT_STICKY }
         if (running?.isActive != true) running = scope.launch { monitor() }
         return START_NOT_STICKY
+    }
+    private fun connectionNotification(status: String): android.app.Notification {
+        val stop = PendingIntent.getService(this, 0, Intent(this, NotificationService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        return NotificationCompat.Builder(this, CONNECTION).setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle(getString(if (status == "ready") R.string.notif_connected else R.string.notif_monitoring))
+            .setContentText(getString(when (status) { "ready" -> R.string.notif_restart; "initializing" -> R.string.notif_initializing; "offline" -> R.string.notif_offline; else -> R.string.notif_degraded }))
+            .setOngoing(true).setOnlyAlertOnce(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .addAction(0, getString(R.string.notif_disable), stop).build()
     }
     private fun alertsAllowed() = manager.areNotificationsEnabled() && (Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
     private suspend fun monitor() {
@@ -104,6 +108,7 @@ class NotificationService : Service() {
                         if (sessions.none { it.id == chat } || updated.settings.chats.find { it.sessionId == chat }?.enabled == false)
                             manager.cancel(tag(host.deviceId, chat, ATTENTION), 2)
                     }
+                    manager.notify(1, connectionNotification(updated.monitoringStatus))
                     local = updated; attempt = 0
                     if (page.hasMore && (++catchupPages >= 4 || System.currentTimeMillis() - passStarted >= 30000)) { retryAfter = 5000; break }
                     if (!page.hasMore) { catchupPages = 0; passStarted = System.currentTimeMillis() }
@@ -113,9 +118,11 @@ class NotificationService : Service() {
             finally { observer?.cancel(); api?.close(); api = null }
             if (terminal) {
                 manager.cancelAll()
-                runCatching { store.update { it.copy(enabled = false) } }
+                runCatching { store.update { it.copy(enabled = false, monitoringStatus = "blocked") } }
                 break
             }
+            runCatching { store.update { it.copy(monitoringStatus = "offline") } }
+            manager.notify(1, connectionNotification("offline"))
             delay(notificationRetryDelay(attempt++, retryAfter, Random.nextDouble(0.5, 1.0)))
         }
         stopSelf()
