@@ -49,7 +49,7 @@ import kotlinx.coroutines.launch
                 else context.getSystemService(android.app.NotificationManager::class.java).cancelAll()
                 failed = false
                 runCatching { local = syncNotificationPreferences(context) }
-            } catch (_: Exception) { failed = true; runCatching { local = store.update { it.copy(enabled = false) } } }
+            } catch (_: Exception) { failed = true; runCatching { local = store.update { it.copy(enabled = false, monitoringStatus = "blocked") } } }
         }
     }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->

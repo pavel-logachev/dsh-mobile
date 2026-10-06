@@ -145,18 +145,21 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
     fun consumeNotificationChat() { notificationChat = null }
-    fun foreground(active: Boolean) { viewModelScope.launch {
-        repository.setForeground(active)
-        if (active) {
-            val context = getApplication<Application>()
-            runCatching {
-                val local = dev.dshmobile.app.data.syncNotificationPreferences(context)
-                val host = dev.dshmobile.app.data.EncryptedStateStore(context).read().host
-                if (local.enabled && host?.deviceId == local.deviceId && context.getSystemService(android.app.NotificationManager::class.java).areNotificationsEnabled())
-                    androidx.core.content.ContextCompat.startForegroundService(context, android.content.Intent(context, dev.dshmobile.app.data.NotificationService::class.java))
-            }
-        }
-    } }
+    private val notificationResume = NotificationResume(viewModelScope, allowed = {
+        val context = getApplication<Application>()
+        val local = dev.dshmobile.app.data.NotificationStore(context).read()
+        val host = dev.dshmobile.app.data.EncryptedStateStore(context).read().host
+        local.enabled && host?.deviceId == local.deviceId && context.getSystemService(android.app.NotificationManager::class.java).areNotificationsEnabled()
+    }, start = {
+        val context = getApplication<Application>()
+        androidx.core.content.ContextCompat.startForegroundService(context, android.content.Intent(context, dev.dshmobile.app.data.NotificationService::class.java))
+    }, failed = {
+        dev.dshmobile.app.data.NotificationStore(getApplication()).update { it.copy(enabled = false, monitoringStatus = "blocked") }
+    }, sync = { dev.dshmobile.app.data.syncNotificationPreferences(getApplication()) })
+    fun foreground(active: Boolean) {
+        notificationResume.foreground(active)
+        viewModelScope.launch { repository.setForeground(active) }
+    }
     override fun onCleared() {
         repository.close() // Observation only. Never cancels a host task.
         super.onCleared()
