@@ -21,6 +21,7 @@ import dev.dshmobile.app.ui.theme.LocalMobileColors
 @Composable
 internal fun Composer(state: MobileState, model: MobileViewModel, onCancel: () -> Unit) {
     val accents = LocalMobileColors.current
+    val haptic = rememberActionHaptic()
     val draftSize = remember(model.editorDraft) { model.editorDraft.toByteArray(Charsets.UTF_8).size }
     val sendEnabled = MobileReducer.canSend(state, model.editorDraft) && !model.interactionBlocked
     val running = state.snapshot?.activity == "running"
@@ -45,7 +46,7 @@ internal fun Composer(state: MobileState, model: MobileViewModel, onCancel: () -
                         modifier = Modifier.padding(bottom = 2.dp).size(48.dp).testTag("stop_run")) {
                         Icon(MobileIcons.Stop, stringResource(R.string.mobile_cancel_run))
                     }
-                    FilledIconButton(onClick = model::sendMessage, enabled = sendEnabled,
+                    FilledIconButton(onClick = { model.sendMessage(haptic) }, enabled = sendEnabled,
                         shape = CircleShape, colors = IconButtonDefaults.filledIconButtonColors(containerColor = accents.action, contentColor = accents.onAction),
                         modifier = Modifier.padding(bottom = 2.dp).size(52.dp).testTag("send_message")) {
                         Icon(MobileIcons.Send, stringResource(R.string.mobile_send))

@@ -109,8 +109,8 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             } finally { pendingDraftWrites-- }
         }
     }
-    fun sendMessage() {
-        if (interactionBlocked || state.value.busy || state.value.pending != null) return
+    fun sendMessage(onAccepted: () -> Unit = {}) {
+        if (interactionBlocked || !dev.dshmobile.app.model.MobileReducer.canSend(state.value, editorDraft)) return
         val origin = state.value.snapshot?.session?.id ?: return
         if (origin != editorSessionId) return
         val text = editorDraft // Exact visible text, not a possibly delayed repository draft.
@@ -118,12 +118,24 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             try {
                 editorActions.withLock {
-                    if (state.value.snapshot?.session?.id == origin) repository.sendMessage(text)
+                    if (state.value.snapshot?.session?.id == origin) {
+                        val before = state.value
+                        repository.sendMessage(text)
+                        if (dev.dshmobile.app.ui.chat.sendWasAccepted(before, state.value, text)) onAccepted()
+                    }
                 }
             } finally { interactionBlocked = false }
         }
     }
-    fun cancelRun() { viewModelScope.launch { repository.cancelRun() } }
+    fun cancelRun(onAdmitted: () -> Unit = {}) {
+        if (interactionBlocked || !dev.dshmobile.app.ui.components.canCancel(state.value)) return
+        interactionBlocked = true
+        onAdmitted() // Feedback for the explicit stop request, not a claim that the host stopped.
+        viewModelScope.launch {
+            try { editorActions.withLock { repository.cancelRun() } }
+            finally { interactionBlocked = false }
+        }
+    }
     fun resolvePending() { viewModelScope.launch { repository.resolvePending() } }
     fun abandonPending() { viewModelScope.launch { repository.abandonPending() } }
     fun forget() {
