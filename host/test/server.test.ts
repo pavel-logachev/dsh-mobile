@@ -15,6 +15,7 @@ import type { HostAdapter, HostSnapshot, DeviceGrants, HostConfiguration } from 
 const snapshot: HostSnapshot = { session: { id: 's-alpha', title: 'Synthetic conversation', workspaceId: 'alpha', updatedAt: 1, running: false }, messages: [{ id: 'm1', role: 'assistant', text: 'Fixture only', createdAt: 1 }], cursor: 1, hasMore: false, activity: 'idle' };
 
 class TestAdapter implements HostAdapter {
+  notifications() { return { subscribe() { return () => {}; }, list: async () => this.listSessions(), evidence: async (id: string) => ({ sessionId: id, workspaceId: this.snapshots.get(id)!.session.workspaceId, cursor: 1, pending: false, completed: [] }) }; }
   readonly upstreamVersion = 'synthetic-test';
   prompts: string[] = [];
   snapshots = new Map<string, HostSnapshot>([['s-alpha', structuredClone(snapshot)], ['s-beta', { ...structuredClone(snapshot), session: { ...snapshot.session, id: 's-beta', workspaceId: 'beta' } }]]);
@@ -54,6 +55,26 @@ async function setup(t: TestContext, adapter: HostAdapter = new TestAdapter()) {
   }
   return { host, hosts, config, adapter, baseUrl, request, pair };
 }
+
+test('notification routes authenticate, stream real pages, enforce policy revisions and stream caps', async t => {
+  const { request, pair } = await setup(t); const { deviceToken } = await pair();
+  assert.equal((await request('/notification-events')).status, 401);
+  const settings = { expectedRevision: 0, enabled: true, projects: [], chats: [] };
+  assert.equal((await request('/notification-settings', deviceToken, 'PUT', settings)).status, 200);
+  assert.equal((await request('/notification-settings', deviceToken, 'PUT', { ...settings, enabled: false })).status, 409);
+  const page = await (await request('/notification-events', deviceToken)).json();
+  assert.equal(page.resetRequired, true);
+  const sse = await request('/notification-events/stream?after=' + page.nextCursor, deviceToken);
+  assert.equal(sse.status, 200); const reader = sse.body!.getReader();
+  try {
+    const frame = new TextDecoder().decode((await reader.read()).value);
+    assert.match(frame, /event: notification-page/);
+    assert.equal((await request('/notification-events/stream', deviceToken)).status, 429);
+  } finally { await reader.cancel(); }
+  assert.equal((await request('/notification-events?limit=101', deviceToken)).status, 400);
+  assert.equal((await request('/notification-events?after=bad', deviceToken)).status, 400);
+  assert.equal((await request('/notification-events?limit=1&limit=2', deviceToken)).status, 400);
+});
 
 test('quiet extensions survive GET and SSE and count toward the payload ceiling', async t => {
   const adapter = new TestAdapter(), value = adapter.snapshots.get('s-alpha')!;

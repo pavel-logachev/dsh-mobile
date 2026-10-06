@@ -44,7 +44,7 @@ async function harness(t: { after: (fn: () => Promise<void>) => void }, pollInte
     dshVersion: '0.2.0-rc.2', sessionController: controller,
     agentPresets: { async remoteExportList() { return { presets }; } },
     workspaces: [{ id: 'alpha', name: 'Alpha', path: alpha }],
-    events: { subscribe(_id, listener) { listeners.add(listener); return () => { listeners.delete(listener); }; } },
+    events: { subscribeNotifications() { return () => {}; }, subscribe(_id, listener) { listeners.add(listener); return () => { listeners.delete(listener); }; } },
     pollIntervalMs, throttleMs: 5,
   });
   const cleanupResources: (() => Promise<unknown>)[] = [];
@@ -53,6 +53,21 @@ async function harness(t: { after: (fn: () => Promise<void>) => void }, pollInte
     rows: (value: typeof rows) => { rows = value; }, calls: () => ({ created, prompted, cancelled }),
     emit: (value: DshObservation) => { for (const listener of listeners) listener(value); }, listeners: () => listeners.size };
 }
+
+test('notification evidence is cold-safe and demands authoritative completed turn and pending episode', async t => {
+  const h = await harness(t); const signal = new AbortController().signal;
+  const source = h.adapter.notifications()!;
+  assert.deepEqual((await source.evidence('session-fixture', signal)).completed, [{ turn: 1, sourceSeq: 7 }]);
+  (h.frame.records[7]!.event.data as any).reason.kind = 'cancelled';
+  assert.equal((await source.evidence('session-fixture', signal)).completed.length, 0);
+  h.frame.records.pop(); h.frame.cursor = 6; h.row.running = true;
+  assert.equal((await source.evidence('session-fixture', signal)).completed.length, 0);
+  (h.frame.records as any[]).push({ type: 'event', event: { seq: 7, time: 1700000000008, type: 'approval/asked', data: { id: 'approval', toolName: 'write' } } }); h.frame.cursor = 7;
+  assert.equal((await source.evidence('session-fixture', signal)).pending, true);
+  (h.frame.records as any[]).push({ type: 'event', event: { seq: 8, time: 1700000000009, type: 'approval/decided', data: { id: 'approval', outcome: 'allowed-once' } } }); h.frame.cursor = 8;
+  assert.equal((await source.evidence('session-fixture', signal)).pending, false);
+  assert.equal(h.cleanup().resumed, 0);
+});
 
 test('registry sessions map by canonical cwd, hide archived/missing roots, and create uses live admission scope', async t => {
   const h = await harness(t);
@@ -276,9 +291,29 @@ test('the plugin composes and disposes with actual installed Cordis and harmless
   await fiber;
   const response = await fetch(`http://127.0.0.1:${port}/v1/capabilities`);
   assert.equal(response.status, 401);
+  const admin = new (await import('../src/state.ts')).HostState(config.statePath);
+  try {
+    const paired = admin.consumePairing(admin.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Notification stub');
+    const headers = { Authorization: 'Bearer ' + paired.deviceToken, 'Content-Type': 'application/json' };
+    assert.equal((await fetch(`http://127.0.0.1:${port}/v1/notification-settings`, { method: 'PUT', headers, body: JSON.stringify({ expectedRevision: 0, enabled: true, projects: [], chats: [] }) })).status, 200);
+    const head = await (await fetch(`http://127.0.0.1:${port}/v1/notification-events`, { headers })).json();
+    h.row.sessionId = 'pc-new-chat'; h.frame.header.id = 'pc-new-chat';
+    const started = { type: 'event', event: { seq: 8, time: Date.now() + 0, type: 'turn/start', data: { turn: 2 } } };
+    const answer = { type: 'event', event: { seq: 9, time: Date.now() + 1, type: 'assistant/message', surfaceOp: 'append', data: { turn: 2, step: 1, message: { id: 'pc-answer', role: 'assistant', content: [{ type: 'text', text: 'Synthetic final answer' }] } } } };
+    const end = { type: 'event', event: { seq: 10, time: Date.now() + 2, type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } } };
+    (h.frame.records as any[]).push(started, answer, end); h.frame.cursor = 10;
+    ctx.emit('session/event', { id: 'pc-new-chat' }, started.event);
+    ctx.emit('session/event', { id: 'pc-new-chat' }, answer.event);
+    ctx.emit('session/event', { id: 'pc-new-chat' }, end.event);
+    const deadline = Date.now() + 3000;
+    let page: any;
+    do { page = await (await fetch(`http://127.0.0.1:${port}/v1/notification-events?after=${head.nextCursor}`, { headers })).json(); if (page.items?.length) break; await new Promise(r => setTimeout(r, 10)); } while (Date.now() < deadline);
+    assert.equal(page.items?.[0]?.sessionId, 'pc-new-chat', 'global bridge observes a newly created PC session without phone observation');
+    assert.equal(page.items?.[0]?.kind, 'answer-finished');
+  } finally { admin.close(); }
   await fiber.dispose();
   await assert.rejects(fetch(`http://127.0.0.1:${port}/v1/capabilities`));
-  assert.deepEqual(h.cleanup(), { closed: 0, resumed: 0 });
+  assert.deepEqual(h.cleanup(), { closed: 2, resumed: 0 }, 'baseline and terminal proof each close one opening without activation');
   assert.deepEqual(h.calls(), { created: undefined, prompted: undefined, cancelled: undefined });
   // A dispose racing async realpath/server startup must await cleanup too.
   const racing = ctx.plugin(plugin, config);

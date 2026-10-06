@@ -1,3 +1,4 @@
+import { NotificationFeed } from './notifications.ts';
 import { randomBytes } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http';
@@ -92,6 +93,8 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
   const state = options.state ?? new HostState(config.statePath);
   if (state.path !== config.statePath) { if (!options.state) state.close(); throw new HostError('invalid_config'); }
   const relay = config.relay ? createRelayConnector({ relay: config.relay, state, targetPort: config.port, allowInsecureLoopback: options.allowInsecureRelayLoopback === true }) : undefined;
+  let notifications: NotificationFeed | undefined;
+  const notificationStreams = new Set<string>();
   const limits = new RateLimiter();
   const shutdown = new AbortController();
   let closing = false, started: Promise<{ baseUrl: string }> | undefined;
@@ -293,6 +296,39 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     } catch (error) { stop(); throw error; }
   }
 
+  async function streamNotifications(deviceId: string, after: string | undefined, res: ServerResponse, signal: AbortSignal) {
+    if (!notifications) throw new HostError('unavailable');
+    if (notificationStreams.has(deviceId) || (streamCounts.get(deviceId) ?? 0) >= 3 || streams.size >= 32) throw new HostError('rate_limited');
+    notificationStreams.add(deviceId); streamCounts.set(deviceId, (streamCounts.get(deviceId) ?? 0) + 1);
+    let closed = false, timer: ReturnType<typeof setInterval> | undefined, working = false;
+    const stop = () => {
+      if (closed) return; closed = true;
+      if (timer) clearInterval(timer); streams.delete(registration); notificationStreams.delete(deviceId);
+      const count = (streamCounts.get(deviceId) ?? 1) - 1; if (count) streamCounts.set(deviceId, count); else streamCounts.delete(deviceId);
+      signal.removeEventListener('abort', stop); res.off('close', stop); if (res.headersSent && !res.destroyed) res.end();
+    };
+    const registration = { deviceId, stop }; streams.add(registration);
+    signal.addEventListener('abort', stop, { once: true }); res.once('close', stop);
+    let cursor = after, heartbeat = Date.now(), lastCoverage = '';
+    async function send(first = false) {
+      if (working || closed) return; working = true;
+      try {
+        const page = await notifications!.page(deviceId, cursor, 100);
+        signal.throwIfAborted(); if (closed) return;
+        if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
+        if (first || page.items.length || page.resetRequired || page.hasMore || page.coverage !== lastCoverage) {
+          const frame = `event: notification-page\nid: ${page.nextCursor}\ndata: ${JSON.stringify(page)}\n\n`;
+          if (Buffer.byteLength(frame) > 128 * 1024 || res.writableLength > 128 * 1024 || !res.write(frame)) { stop(); return; }
+          cursor = page.nextCursor; lastCoverage = page.coverage;
+        }
+        if (Date.now() - heartbeat >= (options.heartbeatMs ?? 15000)) { heartbeat = Date.now(); if (!res.write(': heartbeat\n\n')) stop(); }
+      } catch (error) { stop(); if (first) throw error; }
+      finally { working = false; }
+    }
+    try { await send(true); if (!closed) { timer = setInterval(() => { void send(); }, 1000); timer.unref(); } }
+    catch (error) { stop(); throw error; }
+  }
+
   function authorized(req: IncomingMessage): AuthorizedDevice {
     const header = req.headers.authorization;
     if (typeof header !== 'string' || !/^Bearer [A-Za-z0-9_-]{43}$/.test(header)) throw new HostError('unauthorized');
@@ -308,7 +344,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     if (!req.url?.startsWith('/v1/') || req.url.length > 2048 || /[#\x00-\x20\\]/.test(req.url)) throw new HostError('invalid_request');
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname + url.search !== req.url) throw new HostError('invalid_request');
-    const allowedQuery = req.method === 'GET' && url.pathname === '/v1/sessions' ? ['workspaceId', 'limit', 'cursor'] : [];
+    const allowedQuery = req.method === 'GET' ? url.pathname === '/v1/sessions' ? ['workspaceId', 'limit', 'cursor'] : url.pathname === '/v1/notification-events' ? ['after', 'limit'] : url.pathname === '/v1/notification-events/stream' ? ['after'] : [] : [];
     for (const key of url.searchParams.keys()) if (!allowedQuery.includes(key) || url.searchParams.getAll(key).length !== 1) throw new HostError('invalid_request');
     const segments = url.pathname.split('/').slice(2).map(segment => {
       try {
@@ -334,13 +370,50 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     }
     const device = authorized(req);
     limits.take(`device:${device.deviceId}`, 120);
+    if (url.pathname === '/v1/notification-settings' && ['GET', 'PUT'].includes(req.method ?? '')) {
+      if (!notifications) throw new HostError('unavailable');
+      if (req.method === 'GET') {
+        limits.take(`notification:${device.deviceId}`, 60);
+        const sessions = (await adapter.listSessions(signal)).filter(s => !workspaceSource.archivedSessionIds().has(s.id));
+        const ids = await workspaceIds(); signal.throwIfAborted();
+        sendJson(res, 200, notifications.pruneSettings(device.deviceId, ids, sessions)); return;
+      }
+      limits.take(`notification-policy:${device.deviceId}`, 6);
+      const body = await bodyJson(req, signal);
+      if (Buffer.byteLength(JSON.stringify(body)) > 32768) throw new HostError('payload_too_large');
+      // Parse first without committing; unauthorized override IDs are hidden.
+      const sessions = await adapter.listSessions(signal), ids = await workspaceIds();
+      for (const p of Array.isArray(body.projects) ? body.projects : []) {
+        if (!p || typeof p.workspaceId !== 'string') throw new HostError('invalid_request');
+        checkKnownScope(device.deviceId, p.workspaceId, ids, false, true);
+      }
+      for (const c of Array.isArray(body.chats) ? body.chats : []) {
+        const session = sessions.find(s => s.id === c?.sessionId);
+        if (!session || workspaceSource.archivedSessionIds().has(session.id)) throw new HostError('not_found');
+        checkKnownScope(device.deviceId, session.workspaceId, ids, false, true);
+      }
+      sendJson(res, 200, notifications.putSettings(device.deviceId, body)); return;
+    }
+    if (req.method === 'GET' && ['/v1/notification-events', '/v1/notification-events/stream'].includes(url.pathname)) {
+      if (!notifications) throw new HostError('unavailable');
+      limits.take(`notification:${device.deviceId}`, 60);
+      const after = url.searchParams.get('after') ?? undefined;
+      if (url.pathname.endsWith('/stream')) {
+        limits.take(`notification-open:${device.deviceId}`, 6);
+        if (req.headers['last-event-id'] !== undefined && req.headers['last-event-id'] !== after) throw new HostError('invalid_request');
+        await streamNotifications(device.deviceId, after, res, signal); return;
+      }
+      const raw = url.searchParams.get('limit') ?? '50';
+      if (!/^[1-9][0-9]{0,2}$/.test(raw) || Number(raw) > 100) throw new HostError('invalid_request');
+      sendJson(res, 200, await notifications.page(device.deviceId, after, Number(raw))); return;
+    }
     if (req.method === 'GET' && url.pathname === '/v1/workspaces') {
       const workspaces = await workspaceSource.list(); signal.throwIfAborted();
       const current = freshDevice(device.deviceId);
       sendJson(res, 200, { items: workspaces.filter(workspace => allowsWorkspace(current.grants.readWorkspaceIds, workspace.id)).map(workspace => ({ id: workspace.id, name: workspace.name, canExecute: allowsWorkspace(current.grants.executeWorkspaceIds, workspace.id) })) }); return;
     }
     if (req.method === 'GET' && url.pathname === '/v1/capabilities') {
-      sendJson(res, 200, { protocolVersion: 1, hostName: config.hostName, upstreamVersion: adapter.upstreamVersion, capabilities: { sessions: true, textPrompt: true, cancel: true, liveSnapshots: true, attachments: false, questions: false, approvals: false, push: false } }); return;
+      sendJson(res, 200, { protocolVersion: 1, hostName: config.hostName, upstreamVersion: adapter.upstreamVersion, capabilities: { sessions: true, textPrompt: true, cancel: true, liveSnapshots: true, attachments: false, questions: false, approvals: false, push: false, notifications: !!notifications?.baselineReady }, notificationCapabilities: { version: 1, coverage: notifications?.coverage ?? 'degraded', feed: !!notifications, unifiedPush: false, retentionMs: 604800000 } }); return;
     }
     if (req.method === 'GET' && url.pathname === '/v1/presets') {
       const presets = await adapter.listPresets(signal); signal.throwIfAborted(); freshDevice(device.deviceId);
@@ -484,6 +557,8 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       started ??= (async () => {
         state.claimRuntime(); claimed = true;
         if (relay) state.recoverPendingRelayPublications();
+        const sources = adapter.notifications?.();
+        if (sources) { notifications = new NotificationFeed(state, sources); await notifications.start(); }
         await new Promise<void>((resolve, reject) => {
           const failed = () => { state.releaseRuntime(); claimed = false; reject(new HostError('unavailable')); };
           server.once('error', failed);
@@ -499,6 +574,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     async close() {
       if (closing) return;
       closing = true; shutdown.abort();
+      await notifications?.close();
       await relay?.close();
       for (const stream of streams) stream.stop();
       onRevoke();

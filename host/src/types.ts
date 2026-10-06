@@ -14,6 +14,7 @@ export interface HostSnapshot {
 }
 export interface HostAdapter {
   readonly upstreamVersion: string;
+  notifications?(): import('./notifications.ts').NotificationSources | undefined;
   listPresets(signal: AbortSignal): Promise<Preset[]>;
   listSessions(signal: AbortSignal): Promise<HostSession[]>;
   snapshot(sessionId: string, signal: AbortSignal): Promise<HostSnapshot>;

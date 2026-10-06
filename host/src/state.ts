@@ -67,6 +67,7 @@ export class HostState {
         result TEXT, error TEXT, http_status INTEGER NOT NULL, updated_at INTEGER NOT NULL,
         PRIMARY KEY(device_id, request_id)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS notification_state (id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS runtime_lock (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, pid INTEGER NOT NULL) STRICT;
     `);
     // Early development databases have no scope column; unknown prior scope fails closed.
@@ -87,6 +88,19 @@ export class HostState {
     this.db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); this.db.exec('COMMIT'); return result; }
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  /** Notification metadata only; bounded by the feed before committing. Uses this same SQLite DB. */
+  readNotificationState<T>(id: string): T | undefined {
+    const row = this.db.prepare('SELECT value FROM notification_state WHERE id=?').get(id);
+    return row ? JSON.parse(String(row.value)) as T : undefined;
+  }
+  writeNotificationState(id: string, value: unknown): void { this.writeNotificationStates([[id, value]]); }
+  writeNotificationStates(values: [string, unknown][]): void {
+    this.transaction(() => {
+      const insert = this.db.prepare('INSERT INTO notification_state(id,value) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value');
+      for (const [id, value] of values) insert.run(id, JSON.stringify(value));
+    });
   }
 
   createPairing(grants: DeviceGrants, ttlMs = 300_000): PairingOffer {

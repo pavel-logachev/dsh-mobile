@@ -6,6 +6,7 @@ import { HostError } from './errors.ts';
 import { presentUserText } from './message-presentation.ts';
 import type { ChatMessage, HostAdapter, HostSession, HostSnapshot, Preset, WorkspaceConfig } from './types.ts';
 
+import type { NotificationEvidence, NotificationSource, NotificationSources } from './notifications.ts';
 import { isCompatibleDshVersion } from './compatibility.ts';
 export { COMPATIBLE_DSH_VERSIONS } from './compatibility.ts';
 const MAX_MESSAGES = 100;
@@ -37,6 +38,7 @@ export type DshObservation = { type: 'event'; event: unknown } | { type: 'assist
 export interface DshEvents {
   /** Only this session's data may reach the listener. The disposer must remove all subscriptions. */
   subscribe(sessionId: string, listener: (observation: DshObservation) => void): () => void;
+  subscribeNotifications?(listener: (id: string, event: NotificationSource) => void): () => void;
 }
 export interface DshAdapterOptions {
   /** Explicit operator-declared version, NOT automatically discovered or inferred from method names. */
@@ -56,7 +58,7 @@ export interface DshAdapterOptions {
 }
 interface CanonicalWorkspace extends WorkspaceConfig { key: string }
 interface WireEvent { type: string; seq: number; time: number; data: unknown; ignorable?: true; surfaceOp?: unknown }
-interface SurfaceNode { seq: number; message?: ChatMessage }
+interface SurfaceNode { seq: number; message?: ChatMessage; answerTurn?: number }
 interface Provisional { id: string; turn: number; step: number; nextIndex: number; createdAt: number; blocks: Map<number, string> }
 const KNOWN_LOG_TYPES = new Set([
   'agent-preset/selected', 'agent/inbox/spliced', 'approval/asked', 'approval/decided', 'approval/policy',
@@ -108,7 +110,8 @@ const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'system/mess
 function applySurface(nodes: SurfaceNode[], event: WireEvent): boolean {
   if (!SURFACE_TYPES.has(event.type)) return true;
   const message = messageOf(event);
-  const node = { seq: event.seq, ...(message ? { message } : {}) };
+  const data = object(event.data);
+  const node = { seq: event.seq, ...(message ? { message } : {}), ...(event.type === 'assistant/message' && message && data?.interrupted !== true && Number.isSafeInteger(data?.turn) ? { answerTurn: data!.turn as number } : {}) };
   if (event.surfaceOp === 'append') { nodes.push(node); return true; }
   const op = object(event.surfaceOp);
   if (op?.op !== 'replace' || !Number.isSafeInteger(op.startSeq) || !Number.isSafeInteger(op.endSeq)) throw new HostError('unavailable');
@@ -139,6 +142,14 @@ class Transcript {
   private projectedQuestions = false;
   private attempt: Provisional | undefined;
   private revision = 0;
+  private terminals: { turn: number; sourceSeq: number }[] = [];
+  private openProjectedQuestions = false;
+  notificationEvidence(): NotificationEvidence {
+    const ambiguous = this.unsupported || this.historyCut || this.gap;
+    return { sessionId: this.session.id, workspaceId: this.session.workspaceId, cursor: this.cursor, valid: !ambiguous,
+      pending: !ambiguous && this.running && (this.approvals.size > 0 || this.questions.size > 0 || this.openProjectedQuestions),
+      completed: ambiguous ? [] : this.terminals.filter(t => this.nodes.some(n => n.answerTurn === t.turn)) };
+  }
   constructor(session: HostSession) { this.session = { ...session }; this.running = session.running; }
   open(frame: Record<string, unknown>): void {
     if (!Number.isSafeInteger(frame.cursor) || (frame.cursor as number) < -1 || !Array.isArray(frame.records)) throw new HostError('unavailable');
@@ -174,6 +185,11 @@ class Transcript {
         }
       }
     }
+    const activeQuestions = object(values?.userQuestions)?.active;
+    if (Array.isArray(activeQuestions)) {
+      this.openProjectedQuestions = activeQuestions.some(q => object(q)?.state === 'open');
+      for (const q of activeQuestions) if (object(q)?.state === 'continued' && typeof object(q)?.callId === 'string') this.questions.delete(object(q)!.callId as string);
+    }
     this.trim();
   }
   markGap(): void { this.gap = true; this.attempt = undefined; }
@@ -207,7 +223,10 @@ class Transcript {
       this.calls.clear();
       this.turn = Number.isSafeInteger(data?.turn) ? { number: data!.turn as number, startedAt: event.time } : undefined;
     }
-    if (event.type === 'turn/end') { this.turn = undefined; this.calls.clear(); }
+    if (event.type === 'turn/end') {
+      if (object(data?.reason)?.kind === 'completed' && Number.isSafeInteger(data?.turn)) this.terminals.push({ turn: data!.turn as number, sourceSeq: event.seq });
+      this.turn = undefined; this.calls.clear();
+    }
     if (event.type === 'tool/call' && this.turn?.number === data?.turn && typeof data?.callId === 'string' && typeof data.name === 'string' && /^[A-Za-z0-9_.:/-]{1,128}$/.test(data.name)) {
       if (this.calls.size < 1000) this.calls.set(data.callId, data.name);
       else { this.turn = undefined; this.calls.clear(); } // Never grow unbounded or report an unproven latest call.
@@ -316,6 +335,11 @@ export class DshAdapter implements HostAdapter {
   private readonly source: WorkspaceSource;
   private readonly lifetime = new AbortController();
   constructor(options: DshAdapterOptions, source: WorkspaceSource) { this.options = options; this.source = source; this.upstreamVersion = options.dshVersion; }
+  notifications(): NotificationSources | undefined {
+    const subscribe = this.options.events?.subscribeNotifications;
+    if (!subscribe) return undefined;
+    return { subscribe, list: signal => this.listSessions(signal), evidence: async (id, signal) => (await this.open(id, this.signal(signal))).transcript.notificationEvidence() };
+  }
   dispose(): void { this.lifetime.abort(); }
   private signal(signal: AbortSignal): AbortSignal { return AbortSignal.any([signal, this.lifetime.signal]); }
   private async workspaceMap(): Promise<{ workspaces: ReadonlyMap<string, CanonicalWorkspace>; view: readonly WorkspaceConfig[] }> {
