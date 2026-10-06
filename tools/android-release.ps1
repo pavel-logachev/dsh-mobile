@@ -216,7 +216,10 @@ try {
     }
     $permissions = @([regex]::Matches($badging, "(?m)^uses-permission: name='([^']+)'") | ForEach-Object { $_.Groups[1].Value })
     # CAMERA is optional and requested only for the local QR scan, never for pairing/import.
-    if ($permissions.Count -ne 3 -or @($permissions | Where-Object { $_ -cnotin @('android.permission.INTERNET', 'android.permission.CAMERA', "$package.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION") }).Count -ne 0) {
+    # Notification and special-use FGS permissions serve only the opt-in background notifications.
+    $allowedPermissions = @('android.permission.INTERNET', 'android.permission.CAMERA', 'android.permission.POST_NOTIFICATIONS',
+        'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_SPECIAL_USE', "$package.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION")
+    if ($permissions.Count -ne $allowedPermissions.Count -or @($permissions | Where-Object { $_ -cnotin $allowedPermissions }).Count -ne 0) {
         throw 'Unexpected release permission surface; review before signing.'
     }
     $version = $meta.Groups[2].Value

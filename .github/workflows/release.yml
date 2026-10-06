@@ -56,7 +56,7 @@ jobs:
           aapt2="$ANDROID_HOME/build-tools/36.0.0/aapt2"
           "$aapt2" dump permissions "$apk" > "$RUNNER_TEMP/apk-permissions.txt"
           sed -n "s/^uses-permission: name='\([^']*\)'$/\1/p" "$RUNNER_TEMP/apk-permissions.txt" | LC_ALL=C sort > "$RUNNER_TEMP/actual-permissions.txt"
-          printf '%s\n' android.permission.CAMERA android.permission.INTERNET dev.dshmobile.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION | LC_ALL=C sort > "$RUNNER_TEMP/expected-permissions.txt"
+          printf '%s\n' android.permission.CAMERA android.permission.FOREGROUND_SERVICE android.permission.FOREGROUND_SERVICE_SPECIAL_USE android.permission.INTERNET android.permission.POST_NOTIFICATIONS dev.dshmobile.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION | LC_ALL=C sort > "$RUNNER_TEMP/expected-permissions.txt"
           diff -u "$RUNNER_TEMP/expected-permissions.txt" "$RUNNER_TEMP/actual-permissions.txt"
           "$aapt2" dump xmltree "$apk" --file AndroidManifest.xml > "$RUNNER_TEMP/apk-manifest.txt"
           if grep -Eqi 'mlkit|datatransport|com\.google\.android\.gms|ACCESS_NETWORK_STATE' "$RUNNER_TEMP/apk-manifest.txt"; then
