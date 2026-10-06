@@ -54,6 +54,17 @@ test('reconciliation does not consume the terminal arriving during its cold read
   assert.equal(page.items.filter(e => e.kind === 'answer-finished').length, 1); assert.equal(page.coverage, 'ready');
 });
 
+test('restart invalidates changed pending cut in both downtime directions', async t => {
+  const f = await fixture(t); f.proof.pending = true; await f.event(0, 'approval/asked');
+  const cursor = (await f.feed.page(f.device.deviceId)).nextCursor;
+  await f.feed.close(); f.proof.pending = false;
+  const resolved = new NotificationFeed(f.state, f.source); await resolved.start();
+  const cleared = await resolved.page(f.device.deviceId, cursor); assert.equal(cleared.resetRequired, true); assert.equal(cleared.pending.length, 0);
+  await resolved.close(); f.proof.pending = true;
+  const waiting = new NotificationFeed(f.state, f.source); t.after(() => waiting.close()); await waiting.start();
+  const pending = await waiting.page(f.device.deviceId, cleared.nextCursor); assert.equal(pending.resetRequired, true); assert.equal(pending.pending.length, 1);
+});
+
 test('restart baselines history and keeps stable cursor/settings without completion storms', async t => {
   const f = await fixture(t); f.proof.completed = [{ turn: 1, sourceSeq: 0 }]; await f.event(0, 'turn/end', { turn: 1, completed: true });
   const cursor = (await f.feed.page(f.device.deviceId, f.head)).nextCursor;

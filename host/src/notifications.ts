@@ -55,6 +55,7 @@ export class NotificationFeed {
       if (this.started) this.schedule();
     });
     this.watermarks = this.state.readNotificationState<Record<string, SourceState>>('producer') ?? {};
+    const pendingBefore = this.pendingCut();
     try {
       const sessions = await this.source.list(this.signal());
       if (sessions.length > 10000) throw new HostError('unavailable');
@@ -65,6 +66,7 @@ export class NotificationFeed {
         if (evidence.valid === false) { this.coverage = 'degraded'; continue; }
         this.watermarks[session.id] = { seq: evidence.cursor, ...(evidence.pending ? { attentionId: this.watermarks[session.id]?.attentionId ?? randomUUID() } : {}) };
       }
+      if (pendingBefore !== this.pendingCut()) this.resetJournals();
       this.state.writeNotificationState('producer', this.watermarks);
       this.baselineReady = true;
       this.coverage = this.coverage === 'degraded' ? 'degraded' : 'ready';
@@ -76,6 +78,7 @@ export class NotificationFeed {
     }, 60_000);
     this.timer.unref();
   }
+  private pendingCut(): string { return JSON.stringify(Object.entries(this.watermarks).filter(([, s]) => s.attentionId).sort(([a], [b]) => a.localeCompare(b))); }
   private signal(): AbortSignal { return AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(10_000)]); }
   private schedule(): void {
     if (this.scheduled) return; this.scheduled = true;
