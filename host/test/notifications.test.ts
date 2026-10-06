@@ -30,6 +30,91 @@ async function fixture(t: any) {
   return { state, feed, device, head, event, proof, source, listed: (rows: typeof listed) => { listed = rows; } };
 }
 
+for (const failure of ['excluded', 'not_found', 'invalid', 'budget'] as const) test(`lazy idle recovery retries ${failure} and does not abandon unprobed peers`, async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-lazy-retry-')); const state = new HostState(join(dir, 'state.sqlite'));
+  const device = state.consumePairing(state.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Synthetic');
+  const sessions = Array.from({ length: 10 }, (_, i) => ({ id: 'idle-' + i, workspaceId: 'alpha', running: false }));
+  const calls = new Map<string, number>(); let pass = 0;
+  const source = {
+    subscribe() { return () => {}; },
+    async list() { return pass === 1 && failure === 'excluded' ? sessions.slice(1) : sessions; },
+    async evidence(id: string) {
+      calls.set(id, (calls.get(id) ?? 0) + 1);
+      if (id === 'idle-0' && pass === 1 && (failure === 'not_found' || failure === 'budget')) throw new Error(failure);
+      return { sessionId: id, workspaceId: 'alpha', cursor: -1, pending: true, valid: !(id === 'idle-0' && pass === 1 && failure === 'invalid'), completed: [] };
+    },
+  };
+  const feed = new NotificationFeed(state, source); t.after(async () => { await feed.close(); state.close(); rmSync(dir, { recursive: true, force: true }); });
+  await feed.start(); feed.putSettings(device.deviceId, { expectedRevision: 0, enabled: true, projects: [], chats: [] }); await feed.idle();
+  for (pass = 1; pass <= 5; pass++) { t.mock.timers.tick(60000); await feed.idle(); }
+  const page = await feed.page(device.deviceId);
+  assert.equal(page.pending.length, 10, 'failed, excluded and unprobed IDs must remain recoverable');
+  assert.ok((calls.get('idle-0') ?? 0) >= 1); assert.equal(new Set(page.pending.map(p => p.sessionId)).size, 10);
+});
+
+test('an exhausted lazy pass retains every unprobed ID for a later fair pass', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-lazy-timeout-')); const state = new HostState(join(dir, 'state.sqlite'));
+  const device = state.consumePairing(state.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Synthetic');
+  let first = true;
+  const source = { subscribe() { return () => {}; }, async list() { return Array.from({ length: 10 }, (_, i) => ({ id: 'idle-' + i, workspaceId: 'alpha' })); },
+    async evidence(id: string, signal: AbortSignal): Promise<NotificationEvidence> {
+      if (first) { first = false; return await new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })); }
+      return { sessionId: id, workspaceId: 'alpha', cursor: -1, pending: true, completed: [] };
+    } };
+  const feed = new NotificationFeed(state, source, 25); t.after(async () => { await feed.close(); state.close(); rmSync(dir, { recursive: true, force: true }); });
+  await feed.start(); feed.putSettings(device.deviceId, { expectedRevision: 0, enabled: true, projects: [], chats: [] }); await feed.idle();
+  t.mock.timers.tick(60000); await new Promise(r => setTimeout(r, 40)); await feed.idle();
+  for (let pass = 0; pass < 5; pass++) { t.mock.timers.tick(60000); await feed.idle(); }
+  assert.equal((await feed.page(device.deviceId)).pending.length, 10);
+});
+
+test('lazy probes rotate fairly past a persistently broken first session', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const f = await fixture(t); await f.feed.idle();
+  f.source.evidence = async () => { throw new Error('synthetic broken session'); };
+  f.listed([{ id: 'chat', workspaceId: 'alpha' }, { id: 'new-idle', workspaceId: 'alpha' }]);
+  // Reactivation must rebuild from the authoritative list, including new idle IDs.
+  f.feed.putSettings(f.device.deviceId, { expectedRevision: 1, enabled: false, projects: [], chats: [] });
+  f.feed.putSettings(f.device.deviceId, { expectedRevision: 2, enabled: true, projects: [], chats: [] }); await f.feed.idle();
+  const evidence = f.source as unknown as { evidence(id: string): Promise<NotificationEvidence> };
+  evidence.evidence = async id => { if (id === 'chat') throw new Error('synthetic broken session'); return { ...f.proof, sessionId: id, pending: true }; };
+  for (let pass = 0; pass < 5; pass++) { t.mock.timers.tick(60000); await f.feed.idle(); }
+  assert.deepEqual((await f.feed.page(f.device.deviceId)).pending.map(p => p.sessionId), ['new-idle']);
+});
+
+test('disable during a held baseline cannot overwrite the next opt-in recovery cut', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] }); const f = await fixture(t); await f.feed.idle();
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(r => { enter = r; }); const held = new Promise<void>(r => { release = r; });
+  let calls = 0;
+  f.source.evidence = async () => { if (++calls === 1) { enter(); await held; return { ...f.proof, pending: true }; } return { ...f.proof, pending: false }; };
+  f.listed([{ id: 'chat', workspaceId: 'alpha', running: true }]);
+  f.feed.putSettings(f.device.deviceId, { expectedRevision: 1, enabled: false, projects: [], chats: [] });
+  f.feed.putSettings(f.device.deviceId, { expectedRevision: 2, enabled: true, projects: [], chats: [] }); await entered;
+  f.feed.putSettings(f.device.deviceId, { expectedRevision: 3, enabled: false, projects: [], chats: [] });
+  f.feed.putSettings(f.device.deviceId, { expectedRevision: 4, enabled: true, projects: [], chats: [] });
+  const head = (await f.feed.page(f.device.deviceId)).nextCursor;
+  release(); await f.feed.idle();
+  const page = await f.feed.page(f.device.deviceId, head);
+  assert.equal(page.resetRequired, false, 'cancelled old baseline must not introduce a false episode/reset');
+  assert.equal(page.pending.length, 0); assert.equal(page.coverage, 'ready');
+});
+
+test('zero-to-one opt-in rebaselines new pending created while monitoring was off', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] }); const f = await fixture(t); await f.feed.idle();
+  t.mock.timers.tick(60000); await f.feed.idle();
+  f.feed.putSettings(f.device.deviceId, { expectedRevision: 1, enabled: false, projects: [], chats: [] });
+  f.proof.pending = true; f.listed([{ id: 'chat', workspaceId: 'alpha' }, { id: 'during-off', workspaceId: 'alpha' }]);
+  const evidence = f.source as unknown as { evidence(id: string): Promise<NotificationEvidence> };
+  evidence.evidence = async id => ({ ...f.proof, sessionId: id });
+  f.feed.putSettings(f.device.deviceId, { expectedRevision: 2, enabled: true, projects: [], chats: [] });
+  assert.equal(f.feed.coverage, 'initializing'); await f.feed.idle();
+  for (let pass = 0; pass < 5; pass++) { t.mock.timers.tick(60000); await f.feed.idle(); }
+  assert.deepEqual((await f.feed.page(f.device.deviceId)).pending.map(p => p.sessionId).sort(), ['chat', 'during-off']);
+});
+
 test('zero enabled devices do no baseline IO; first opt-in initializes in background and leaves idle history lazy', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-notifications-lazy-')); const state = new HostState(join(dir, 'state.sqlite'));
   const device = state.consumePairing(state.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Synthetic');

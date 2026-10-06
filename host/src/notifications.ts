@@ -39,6 +39,9 @@ export class NotificationFeed {
   private activated = false;
   private baselineAt = 0;
   private lazyIdle: string[] = [];
+  private readonly lazyRetry = new Map<string, { failures: number; after: number }>();
+  private recoveryPass = 0;
+  private activation: AbortController | undefined;
   private scheduled = false;
   private reconciling = false;
   private overflow = false;
@@ -72,22 +75,29 @@ export class NotificationFeed {
   private enabledDevices(): boolean { return this.state.listDevices().some(d => !!this.state.getDevice(d.deviceId) && this.state.readNotificationState<Journal>('device:' + d.deviceId)?.settings.enabled); }
   private activate(): void {
     if (this.activated || !this.started || !this.enabledDevices()) return;
-    this.activated = true; this.initializing = true; this.baselineAt = Date.now();
+    const activation = this.activation = new AbortController();
+    this.activated = true; this.initializing = true; this.baselineReady = false; this.baselineAt = Date.now();
+    this.lazyIdle = []; this.lazyRetry.clear(); this.recoveryPass = 0;
     this.coverage = 'initializing';
     this.work = this.work.then(async () => {
+      if (activation.signal.aborted) return;
       const pendingBefore = this.pendingCut();
-      const budget = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(this.baselineBudgetMs)]);
+      const budget = AbortSignal.any([this.lifetime.signal, activation.signal, AbortSignal.timeout(this.baselineBudgetMs)]);
       try {
         const sessions = await this.source.list(budget);
+        budget.throwIfAborted();
         if (sessions.length > 10000) throw new HostError('unavailable');
         const active = new Set(sessions.map(s => s.id));
         for (const id of Object.keys(this.watermarks)) if (!active.has(id)) delete this.watermarks[id];
+        // Keep the entire cut retryable even if this baseline exhausts its budget.
+        this.lazyIdle = sessions.map(s => s.id);
         for (const session of sessions) {
           budget.throwIfAborted();
           // Idle history is pre-baseline. Only running or previously pending
           // sessions need authoritative attention recovery on hot-upgrade.
-          if (!session.running && !this.watermarks[session.id]?.attentionId) { delete this.watermarks[session.id]; this.lazyIdle.push(session.id); continue; }
+          if (!session.running && !this.watermarks[session.id]?.attentionId) { delete this.watermarks[session.id]; continue; }
           const evidence = await this.source.evidence(session.id, budget, session);
+          budget.throwIfAborted();
           if (evidence.valid === false) { this.coverage = 'degraded'; continue; }
           const queued = this.queue.filter(e => e.id === session.id).map(e => e.event.seq);
           this.watermarks[session.id] = { seq: queued.length ? Math.min(...queued) - 1 : evidence.cursor, ...(evidence.pending ? { attentionId: this.watermarks[session.id]?.attentionId ?? randomUUID() } : {}) };
@@ -95,8 +105,8 @@ export class NotificationFeed {
         if (pendingBefore !== this.pendingCut()) this.resetJournals();
         this.state.writeNotificationState('producer', this.watermarks);
         this.coverage = this.coverage === 'degraded' ? 'degraded' : 'ready';
-      } catch { this.coverage = 'degraded'; this.resetJournals(); }
-      finally { this.baselineReady = true; this.initializing = false; this.schedule(); }
+      } catch { if (!activation.signal.aborted) { this.coverage = 'degraded'; this.resetJournals(); } }
+      finally { if (this.activation === activation && !activation.signal.aborted) { this.baselineReady = true; this.initializing = false; this.schedule(); } }
     });
   }
   private pendingCut(): string { return JSON.stringify(Object.entries(this.watermarks).filter(([, s]) => s.attentionId).map(([id, s]) => [id, s.attentionId]).sort(([a], [b]) => a!.localeCompare(b!))); }
@@ -145,19 +155,48 @@ export class NotificationFeed {
     } finally { this.batch = undefined; }
   }
   private async reconcile(): Promise<void> {
+    const activation = this.activation;
     const sessions = await this.source.list(this.signal());
+    if (activation !== this.activation || activation?.signal.aborted || this.lifetime.signal.aborted) return;
     if (sessions.length > 10000) { this.coverage = 'degraded'; return; }
     const visible = new Set(sessions.map(s => s.id));
     for (const id of Object.keys(this.watermarks)) if (!visible.has(id)) delete this.watermarks[id];
-    // Idle pending requests may report running:false; probe them gradually, never
-    // an N-history startup sweep or an N*10s reconciliation critical section.
-    const lazy = new Set(this.lazyIdle.splice(0, 8));
-    const budget = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(10_000)]);
-    for (const session of sessions) {
-      const old = this.watermarks[session.id];
-      if (!old?.attentionId && !session.running && !lazy.has(session.id)) continue;
-      const proof = await this.source.evidence(session.id, budget, session);
-      if (proof.valid === false) { this.coverage = 'degraded'; continue; }
+    // Rotate before I/O, retaining failures and unprobed entries. A bad first
+    // session cannot restart every pass at the head or consume everyone else's retry.
+    const pass = ++this.recoveryPass;
+    // Preserve temporarily excluded IDs unless current membership needs their
+    // bounded slot. Long-lived deleted IDs cannot grow this queue past 10,000.
+    if (new Set([...this.lazyIdle, ...visible]).size > 10000) {
+      this.lazyIdle = this.lazyIdle.filter(id => visible.has(id));
+      for (const id of this.lazyRetry.keys()) if (!visible.has(id)) this.lazyRetry.delete(id);
+    }
+    const known = new Set(this.lazyIdle);
+    for (const session of sessions) if (!known.has(session.id)) { this.lazyIdle.push(session.id); known.add(session.id); }
+    const lazy: string[] = [];
+    for (let left = this.lazyIdle.length; left > 0 && lazy.length < 8; left--) {
+      const id = this.lazyIdle.shift()!; this.lazyIdle.push(id);
+      if ((this.lazyRetry.get(id)?.after ?? 0) <= pass) lazy.push(id);
+    }
+    const budget = AbortSignal.any([this.lifetime.signal, ...(activation ? [activation.signal] : []), AbortSignal.timeout(10_000)]);
+    const byId = new Map(sessions.map(s => [s.id, s]));
+    const ids = new Set([...lazy, ...sessions.filter(s => s.running || this.watermarks[s.id]?.attentionId).map(s => s.id)]);
+    for (const id of ids) {
+      const session = byId.get(id);
+      if (!session) { this.retryLazy(id, pass); continue; }
+      const old = this.watermarks[id];
+      let proof: NotificationEvidence;
+      try {
+        budget.throwIfAborted();
+        proof = await this.source.evidence(id, budget, session);
+        budget.throwIfAborted();
+        if (proof.valid === false) throw new HostError('unavailable');
+      } catch {
+        if (activation?.signal.aborted || this.lifetime.signal.aborted) return;
+        this.coverage = 'degraded'; this.retryLazy(id, pass);
+        if (budget.aborted) break; // Unprobed IDs are still in the rotated queue.
+        continue;
+      }
+      this.lazyRetry.delete(id);
       const attentionId = proof.pending ? old?.attentionId ?? randomUUID() : undefined;
       if (proof.pending && !old?.attentionId) this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/call' }, 'attention-needed', attentionId);
       if (old?.attentionId && !proof.pending) this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/result' }, 'attention-cleared', old.attentionId);
@@ -169,6 +208,10 @@ export class NotificationFeed {
     }
     this.state.writeNotificationState('producer', this.watermarks);
     if (!this.baselineReady) { this.baselineReady = true; this.coverage = 'degraded'; }
+  }
+  private retryLazy(id: string, pass: number): void {
+    const failures = Math.min((this.lazyRetry.get(id)?.failures ?? 0) + 1, 4);
+    this.lazyRetry.set(id, { failures, after: pass + 2 ** failures }); // 2–16 minute passes, no permanent abandonment.
   }
   private journal(deviceId: string): Journal {
     if (!this.state.getDevice(deviceId)) throw new HostError('unauthorized');
@@ -190,6 +233,7 @@ export class NotificationFeed {
       const values = b[name];
       if (!Array.isArray(values) || values.length > max || values.some(v => !v || Object.keys(v).length !== 2 || !idValid(v[field]) || typeof v.enabled !== 'boolean') || new Set(values.map(v => v[field])).size !== values.length) throw new HostError('invalid_request');
     }
+    const hadEnabled = this.enabledDevices();
     const j = this.journal(deviceId);
     const policy = { enabled: b.enabled, projects: (b.projects as NotificationSettings['projects']).slice().sort((a,b) => a.workspaceId.localeCompare(b.workspaceId)), chats: (b.chats as NotificationSettings['chats']).slice().sort((a,b) => a.sessionId.localeCompare(b.sessionId)) };
     const same = JSON.stringify({ enabled: j.settings.enabled, projects: j.settings.projects, chats: j.settings.chats }) === JSON.stringify(policy);
@@ -199,7 +243,12 @@ export class NotificationFeed {
       j.settings = { revision: j.settings.revision + 1, ...policy };
       if (!policy.enabled) j.items = [];
     }
-    this.save(deviceId, j); this.activate(); return j.settings;
+    this.save(deviceId, j);
+    if (!this.enabledDevices() || !hadEnabled) {
+      this.activation?.abort(); this.activated = false; this.initializing = false; this.baselineReady = false;
+      this.queue = []; this.lazyIdle = []; this.lazyRetry.clear();
+    }
+    this.activate(); return j.settings;
   }
   private emissionAllowed(key: string, limit: number): boolean {
     const now = Date.now();
