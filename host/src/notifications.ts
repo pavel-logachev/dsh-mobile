@@ -158,13 +158,14 @@ export class NotificationFeed {
       if (!old?.attentionId && !session.running && !lazy.has(session.id)) continue;
       const proof = await this.source.evidence(session.id, budget, session);
       if (proof.valid === false) { this.coverage = 'degraded'; continue; }
-      if (proof.pending && old && !old.attentionId) { old.attentionId = randomUUID(); this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/call' }, 'attention-needed', old.attentionId); }
+      const attentionId = proof.pending ? old?.attentionId ?? randomUUID() : undefined;
+      if (proof.pending && !old?.attentionId) this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/call' }, 'attention-needed', attentionId);
       if (old?.attentionId && !proof.pending) this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/result' }, 'attention-cleared', old.attentionId);
       // Reconciliation owns pending state, not live event admission. In particular
       // its snapshot can already contain a terminal still waiting in our queue.
       const queued = this.queue.filter(e => e.id === session.id).map(e => e.event.seq);
       const seq = old?.seq ?? (queued.length ? Math.min(...queued) - 1 : proof.cursor);
-      this.watermarks[session.id] = { seq, ...(proof.pending ? { attentionId: old?.attentionId ?? randomUUID() } : {}) };
+      this.watermarks[session.id] = { seq, ...(attentionId ? { attentionId } : {}) };
     }
     this.state.writeNotificationState('producer', this.watermarks);
     if (!this.baselineReady) { this.baselineReady = true; this.coverage = 'degraded'; }

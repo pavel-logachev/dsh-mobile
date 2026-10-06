@@ -18,7 +18,7 @@ internal class NotificationResume(private val scope: CoroutineScope, private val
                 if (!active || generation != ticket) return@launch
                 if (enabled) start() // Main-thread non-suspending admission immediately after guard.
             } catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { failed() }
+            catch (_: Exception) { runCatching { failed() } }
             if (active && generation == ticket) runCatching { sync() }
         }
     }

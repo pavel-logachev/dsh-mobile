@@ -61,9 +61,9 @@ private fun PairedApp(state: MobileState, model: MobileViewModel) {
     val motion = LocalMotionEnabled.current
     val savedScreens = rememberSaveableStateHolder()
     fun goBack() { route = if (route == "settings") previousRoute else "home" }
-    LaunchedEffect(model.notificationChat, state.connection, state.lastSyncedAt) {
+    LaunchedEffect(model.notificationChat, state.connection, state.lastSyncedAt, state.busy, model.interactionBlocked, state.error) {
         val target = model.notificationChat
-        if (target != null && state.connection == dev.dshmobile.app.model.ConnectionState.ONLINE) model.selectNotificationChat(target)
+        if (target != null && !state.busy && !model.interactionBlocked && state.error == null && state.snapshot?.session?.id != target && state.connection == dev.dshmobile.app.model.ConnectionState.ONLINE) model.selectNotificationChat(target)
     }
     LaunchedEffect(model.notificationChat, state.snapshot?.session?.id, state.busy, state.error) {
         val target = model.notificationChat

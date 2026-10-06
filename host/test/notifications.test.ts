@@ -66,6 +66,7 @@ test('lazy idle reconciliation recovers pending without consuming a concurrently
   const page = await feed.page(f.device.deviceId, head);
   assert.equal(page.items.filter(e => e.kind === 'answer-finished').length, 1);
   assert.equal(feed.coverage, 'ready');
+  assert.equal(page.items.filter(e => e.kind === 'attention-needed').length, 1);
 });
 
 test('unchanged pending episode survives restart without epoch reset when only sequence moved', async t => {
