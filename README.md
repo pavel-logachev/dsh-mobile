@@ -24,6 +24,10 @@
 - **Все проекты DSH.** Телефон показывает тот же список проектов, что боковая панель DSH, в том же порядке. Новый проект появляется сам, без повторной привязки.
 - **Чаты и задачи.** Поиск, фильтр по проекту, группировка «Сегодня / Вчера / На неделе», создание чата в нужном проекте и с нужным пресетом, отправка текстовой задачи, остановка выполнения.
 - **Живой ответ.** Ответ агента обновляется в реальном времени и рендерится как Markdown: заголовки, списки, таблицы, блоки кода с копированием.
+- **Чистая переписка.** В чате только ваши сообщения и ответы агента. Служебные события DSH (результаты сабагентов, фоновые задачи, обновления контекста) свёрнуты в строку «Действия агента», полный текст доступен по нажатию.
+- **Сообщения во время работы.** Пока агент работает, можно отправить ещё сообщение: оно встанет в очередь DSH и уйдёт агенту на следующем шаге. Кнопка «Стоп» отдельная и спрашивает подтверждение.
+- **Уведомления (по желанию).** «Ответ готов» и «Агент ждёт вашего решения» с названием проекта и чата, без текста ответа. Включаются в настройках; пока включены, в шторке висит «DSH Mobile на связи». Без Google-сервисов.
+- **Поиск по переписке**, меню сообщения по долгому нажатию, черновик для каждого чата.
 - **Честная доставка.** Если сеть пропала в момент отправки, приложение не отправит задачу второй раз вслепую, а сверит её статус с компьютером.
 - **Привязка по QR-коду.** Компьютер показывает одноразовый QR, телефон сканирует. Камера запрашивается только на время сканирования, распознавание идёт без сети и без сервисов Google.
 - **Тёмная и светлая темы**, русский и английский интерфейс, крупный шрифт.
@@ -87,7 +91,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& ../tools/android-build
 
 ## Ограничения
 
-- Компьютер и DSH должны быть включены. Push-уведомлений и фоновой связи нет: откройте приложение, чтобы увидеть результат.
+- Компьютер и DSH должны быть включены. Уведомления работают через постоянное фоновое соединение: после перезагрузки телефона или принудительной остановки приложения его нужно открыть, а агрессивная экономия батареи (OnePlus, Xiaomi и др.) может задерживать доставку. Push через UnifiedPush — в планах.
 - Пока не поддерживаются вложения, ответы на вопросы агента и подтверждения действий: их нужно делать на компьютере.
 - Один привязанный компьютер на приложение. В списке до 100 проектов.
 - Поддерживаются только проверенные версии DSH. После обновления DSH плагин откажется запускаться, пока совместимость не проверят заново.
@@ -100,7 +104,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& ../tools/android-build
 
 ## English
 
-DSH Mobile is an independent, unofficial native Android companion for DeepSeek Harness. It lists the chats of every registered DSH project, lets you create chats, send text tasks, watch live Markdown replies and stop running work, while models, tools, subscriptions and history stay on your computer. A small companion plugin runs inside DSH and exposes a narrow, pinned-TLS API to paired phones. Pairing is a one-use QR invitation, and scanning works offline without Google Play services. Connect over the same Wi‑Fi, over Tailscale, or through your own optional relay. Supported DSH versions: `0.2.0-rc.2` and `0.2.1-alpha.1`. See the agent-ready [setup runbook](docs/SETUP.md). Project filtering is not a sandbox, and there are no push notifications, attachments or approvals yet.
+DSH Mobile is an independent, unofficial native Android companion for DeepSeek Harness. It lists the chats of every registered DSH project, lets you create chats, send text tasks, watch live Markdown replies and stop running work, while models, tools, subscriptions and history stay on your computer. A small companion plugin runs inside DSH and exposes a narrow, pinned-TLS API to paired phones. Pairing is a one-use QR invitation, and scanning works offline without Google Play services. Connect over the same Wi‑Fi, over Tailscale, or through your own optional relay. Supported DSH versions: `0.2.0-rc.2` and `0.2.1-alpha.1`. See the agent-ready [setup runbook](docs/SETUP.md). Project filtering is not a sandbox, and service events are folded into a collapsible "Agent activity" row, messages sent while the agent works are queued, and optional notifications ("answer ready", "agent needs your decision") use an opt-in foreground connection without Google services. There are no attachments or approvals from the phone yet.
 
 ## Лицензия
 
