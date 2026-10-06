@@ -48,6 +48,8 @@ type Session = {
 type Message = {
   id: string; role: 'user'|'assistant'|'system'; text: string;
   createdAt: number; requestId?: string; provisional?: boolean;
+  kind?: 'message'|'agent_event'|'context'; // absent means ordinary message
+  serviceText?: string; // exact removed suffix including separators; text + serviceText reconstructs original
 };
 type Snapshot = {
   session: Session;
@@ -56,10 +58,29 @@ type Snapshot = {
   hasMore: boolean;
   activity: 'idle'|'running'|'waiting'|'unknown';
   notice?: string;
+  activityDetail?: { turnStartedAt: number; tool?: string };
 };
 ```
 
 History must respect DSH surface replacements; do not expose discarded intermediate assistant attempts as final answers. Replacement endpoints refer to current surface order, not numeric sequence ranges. If a bounded history cut lacks an endpoint and the surface cannot be proven, fail closed with activity `unknown`, an empty message surface and a desktop notice rather than retain potentially discarded answers. Some compacted/replaced histories may therefore require the desktop until full history reconstruction/paging is implemented. Hidden/tool/unknown event types are not dumped as raw JSON. Known-but-not-yet-supported question/approval states must show a neutral notice to return to the desktop, not silently present an idle task.
+
+### Quiet transcript projection (additive v1 extension)
+
+The host classifies durable `user/message.data.source.kind`, not the user role alone. `agent-message`, `subagent-settled` and `tool-jobs` become `agent_event`; `compact-checkpoint`, `runtime-context`, `time-context`, `agent-instructions`, `skill-catalog` and `plugin:hindsight` become `context`. Known human `source.kind:user` wins over whole-message textual prefix heuristics. Ordinary user messages explicitly carry `kind:message`, so a newer client never second-guesses authoritative host classification. Assistant text and provisional responses are unchanged. Unknown sources stay ordinary unless a strict fallback below matches. Source metadata and tool arguments/results are never added to the wire. Existing context text is retained for on-demand reading, not treated as a security redaction boundary.
+
+With legacy/missing source attribution, the exact case-sensitive fallback rules are:
+
+- Start-of-text `Agent <id> sent a message: `; or `Background subagent <id> ` followed by an inspected completed/stopped/max-tokens/refusal/error sentence immediately followed by `Its closing message:` or `It left no closing message.` → `agent_event`. IDs contain only ASCII letters/digits and `._:-`.
+- A whole single-line `background job <id> (<detail>) finished <status>. Read its output with job_output.` → `agent_event`. This uses linear delimiter parsing, not overlapping detail/status regex quantifiers. Relay/settled ID regexes have one disjoint character class followed by literal separators; the time regex is anchored and only runs on a capped 4096-character candidate. [Shared adversarial vectors](<../fixtures/classifier-adversarial.json>) cover every classifier family at 2 MiB.
+- The complete installed checkpoint preamble followed by a blank line; the exact `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.` heading plus a blank line; or the exact cleared-runtime-context sentence → `context`.
+- Complete suffix blocks `<system-reminder>…</system-reminder>`, `<hindsight_knowledge>…</hindsight_knowledge>`, `<hindsight_knowledge_refresh>…</hindsight_knowledge_refresh>` only at text start or after a blank line. Remove them one suffix at a time, never an inline/prose/unfinished tag or content after a closing tag.
+- A suffix beginning `Time sampled while preparing turn <digits>, step <digits>: <ISO timestamp>[<zone>]`, alone or with the exact two runtime line headings (`Browser time zone for this request: …` and `Elapsed since the preceding model-visible message|step context: …`). This too must start the text or follow a blank line. Legacy time candidates are limited to three lines and 4096 characters; longer/unrecognized readings stay visible and unchanged.
+
+A known human `source.kind:user` is never stripped or reclassified: XML examples and exact service envelopes remain intact, with explicit `kind:message`. Only legacy/missing or non-user sources use suffix extraction. A monotonic linear scan identifies disjoint complete ranges and walks their suffix chain once, preserving every character (no trim/newline normalization). The removed suffix including its separating blank line is sent as optional `serviceText`, so `text + serviceText` reconstructs the original exactly. Entirely service-only text is retained in `text` as `context`. All fields, including `serviceText`, count toward the existing 2 MiB serialized ceiling; omit older whole messages or reject an oversized newest message, never truncate either part. The GET/SSE boundary validates and explicitly projects `kind`, `serviceText` and `activityDetail`. Human prose merely mentioning the tag name is untouched. The patterns and redacted shared test vectors are in [the fixture catalogue](<../fixtures/message-noise.json>); source evidence and limits are in [the architecture](<ARCHITECTURE.md#quiet-chat-evidence-and-ownership>).
+
+Android defaults to ordinary user/assistant messages and groups adjacent service messages into a collapsed activity disclosure without crossing an ordinary message boundary. Expansion lists compact tappable previews for agent events, context messages and extracted `serviceText`; tapping any item opens its full selectable/copyable text. Nothing hidden by presentation is irretrievably discarded. Classification runs off the composition thread. Results are tagged with their exact immutable message-list reference. While that reference does not match the current snapshot, show a loading indicator (not old copyable history or an empty-chat label); an authoritative empty surface hides prior messages immediately. Previous groups are retained only as identity bookkeeping, never as a render fallback. Group IDs use the preceding ordinary-message ID, or `history-start` for leading groups; overlapping updates retain an earlier group identity by surviving member IDs when the preceding message falls outside the window. With a host that omits `kind`, Android applies the same text rules in presentation only, never changing canonical receipt reconciliation. Unknown future `kind` values remain visible ordinary content. Legacy fallback can mistake deliberately pasted exact service envelopes for service text; explicit new-host human attribution avoids whole-message prefix false positives.
+
+`activityDetail` is ephemeral and included only for running/waiting, unambiguous snapshots with a proven `turn/start` in the bounded journal. `turnStartedAt` is that event's epoch milliseconds. `tool` is the latest current-turn `tool/call` without a matching `tool/result.message.toolCallId`; only a safe tool name (1–128 ASCII letters/digits or `_.:/-`) is sent. Completion, new turn and stopped status clear it; bounded cuts, gaps and unknown surfaces omit it. No extra upstream query or execution is performed. Multiple concurrent tools mean the latest unmatched tool, not an exclusive claim. All existing 100-message/2 MiB bounds remain unchanged. Older clients ignore both new fields; new APK alone hides recognized legacy noise but cannot recover authoritative turn time/tool names or reduce an old host's payload.
 
 ## Mutations and durable receipts
 

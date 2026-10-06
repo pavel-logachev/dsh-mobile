@@ -55,6 +55,42 @@ async function setup(t: TestContext, adapter: HostAdapter = new TestAdapter()) {
   return { host, hosts, config, adapter, baseUrl, request, pair };
 }
 
+test('quiet extensions survive GET and SSE and count toward the payload ceiling', async t => {
+  const adapter = new TestAdapter(), value = adapter.snapshots.get('s-alpha')!;
+  value.activity = 'running'; value.session.running = true;
+  value.activityDetail = { turnStartedAt: 123, tool: 'read' };
+  value.messages[0] = { ...value.messages[0]!, kind: 'agent_event', serviceText: '\n\n<system-reminder>Full detail</system-reminder>' } as typeof value.messages[number];
+  const { request, pair } = await setup(t, adapter); const { deviceToken } = await pair();
+  const get = await (await request('/sessions/s-alpha', deviceToken)).json();
+  assert.equal(get.messages[0].kind, 'agent_event'); assert.equal(get.messages[0].serviceText, value.messages[0].serviceText);
+  assert.deepEqual(get.activityDetail, value.activityDetail);
+  const sse = await request('/sessions/s-alpha/events', deviceToken); const reader = sse.body!.getReader();
+  try {
+    let text = ''; while (!text.includes('\n\n')) text += new TextDecoder().decode((await reader.read()).value);
+    const event = JSON.parse(text.split('\n').find(line => line.startsWith('data: '))!.slice(6));
+    assert.equal(event.messages[0].kind, 'agent_event'); assert.equal(event.messages[0].serviceText, value.messages[0].serviceText);
+    assert.deepEqual(event.activityDetail, value.activityDetail);
+  } finally { await reader.cancel(); }
+  value.messages[0].serviceText = 'x'.repeat(2 * 1024 * 1024);
+  assert.equal((await request('/sessions/s-alpha', deviceToken)).status, 413);
+  assert.equal((await request('/sessions/s-alpha/events', deviceToken)).status, 413);
+});
+
+test('quiet extensions reject invalid adapter values at GET and SSE boundaries', async t => {
+  const adapter = new TestAdapter(), value = adapter.snapshots.get('s-alpha')!;
+  const { request, pair } = await setup(t, adapter); const { deviceToken } = await pair();
+  for (const invalid of [{ kind: 'invalid' }, { serviceText: 42 }]) {
+    Object.assign(value.messages[0]!, invalid);
+    for (const suffix of ['', '/events']) assert.equal((await request('/sessions/s-alpha' + suffix, deviceToken)).status, 500);
+    delete value.messages[0]!.kind; delete value.messages[0]!.serviceText;
+  }
+  value.activity = 'running';
+  for (const detail of [{ turnStartedAt: -1 }, { turnStartedAt: 1, tool: 'unsafe\nargs' }]) {
+    value.activityDetail = detail;
+    for (const suffix of ['', '/events']) assert.equal((await request('/sessions/s-alpha' + suffix, deviceToken)).status, 500);
+  }
+});
+
 test('chunked body overflow returns the protocol envelope without command admission', { timeout: 5000 }, async t => {
   const { host, baseUrl, pair } = await setup(t);
   const { deviceId, deviceToken } = await pair();

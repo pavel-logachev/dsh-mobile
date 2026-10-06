@@ -1,0 +1,17 @@
+[
+  {"name":"relay-id", "prefix":"Agent ", "fragment":"Agent._:-", "ending":" sent a message!"},
+  {"name":"settled-id", "prefix":"Background subagent ", "fragment":"subagent._:-", "ending":" finished and will do no further work unless you send it more!"},
+  {"name":"settled-closing", "prefix":"Background subagent j ", "fragment":"finished and will do no further work unless you send it more.Its closing message", "ending":"!"},
+  {"name":"job-delimiters", "prefix":"background job j (", "fragment":") finished ", "ending":""},
+  {"name":"job-with-ending", "prefix":"background job j (", "fragment":") finished ", "ending":". Read its output with job_output."},
+  {"name":"runtime-heading", "prefix":"Current runtime context.", "fragment":"This snapshot supersedes earlier runtime-context snapshots.", "ending":"!"},
+  {"name":"checkpoint-heading", "prefix":"This is an automatically generated checkpoint", "fragment":"condensing an earlier span of the conversation", "ending":"!"},
+  {"name":"time-digits", "prefix":"Human\n\nTime sampled while preparing turn ", "fragment":"1234567890", "ending":", step !"},
+  {"name":"time-tokens", "prefix":"Human\n\n", "fragment":"Time sampled while preparing turn 1, step 1: 2026-10-06T00:00:00Z[UTC]\nBrowser time zone for this request: unavailable\nElapsed since the preceding step context: 1d 1h 1m 1s!\n\n", "ending":"!"},
+  {"name":"reminder-open", "prefix":"Human", "fragment":"\n\n<system-reminder>", "ending":""},
+  {"name":"reminder-complete", "prefix":"Human", "fragment":"\n\n<system-reminder>x</system-reminder>", "ending":""},
+  {"name":"hindsight-open", "prefix":"Human", "fragment":"\n\n<hindsight_knowledge>", "ending":""},
+  {"name":"hindsight-complete", "prefix":"Human", "fragment":"\n\n<hindsight_knowledge>x</hindsight_knowledge>", "ending":""},
+  {"name":"refresh-open", "prefix":"Human", "fragment":"\n\n<hindsight_knowledge_refresh>", "ending":""},
+  {"name":"refresh-complete", "prefix":"Human", "fragment":"\n\n<hindsight_knowledge_refresh>x</hindsight_knowledge_refresh>", "ending":""}
+]

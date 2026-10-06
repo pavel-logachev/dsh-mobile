@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="mobile_agent_activity_count">Действия агента · %1$d</string>
+    <string name="mobile_activity_expanded">Развёрнуто. Нажмите, чтобы свернуть действия агента.</string>
+    <string name="mobile_activity_collapsed">Свёрнуто. Нажмите, чтобы раскрыть действия агента.</string>
+    <string name="mobile_context_updated">Контекст обновлён</string>
+    <string name="mobile_activity_full_text">Полный текст действия</string>
+    <string name="mobile_activity_close">Закрыть</string>
+    <string name="mobile_activity_seconds">меньше минуты</string>
+    <string name="mobile_activity_minutes">≈%1$d мин</string>
+    <string name="mobile_activity_hours">≈%1$d ч %2$d мин</string>
+    <string name="mobile_activity_days">≈%1$d дн</string>
+</resources>

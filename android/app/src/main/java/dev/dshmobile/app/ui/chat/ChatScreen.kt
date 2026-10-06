@@ -79,10 +79,14 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
 
 @Composable
 private fun ActivityRow(snapshot: SessionSnapshot) {
-    // Protocol has no authoritative run-start timestamp. Only use a user-message time when present.
-    val started = snapshot.messages.lastOrNull { it.role == "user" }?.createdAt
+    val started by produceState<Long?>(snapshot.activityDetail?.turnStartedAt, snapshot.messages, snapshot.activityDetail) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { activityStartedAt(snapshot) }
+    }
     var now by remember(snapshot.session.id) { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(snapshot.activity, started) { while (snapshot.activity == "running") { delay(30_000); now = System.currentTimeMillis() } }
+    LaunchedEffect(snapshot.session.id, snapshot.activity, started) {
+        now = System.currentTimeMillis()
+        while (snapshot.activity == "running") { delay(30_000); now = System.currentTimeMillis() }
+    }
     val elapsed = activityElapsed(started, now)
     Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = MaterialTheme.shapes.medium,
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).testTag("activity_row")) {
@@ -90,12 +94,23 @@ private fun ActivityRow(snapshot: SessionSnapshot) {
             StatusDot(if (snapshot.activity == "running") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary, pulse = snapshot.activity == "running")
             Text(when {
                 snapshot.activity == "waiting" -> stringResource(R.string.mobile_waiting_desktop)
-                else -> when (elapsed) {
+                snapshot.activityDetail == null -> when (elapsed) {
                     null -> stringResource(R.string.mobile_agent_working)
                     ActivityElapsed.LessThanMinute -> stringResource(R.string.mobile_agent_seconds)
                     is ActivityElapsed.Minutes -> stringResource(R.string.mobile_agent_minutes, elapsed.value)
                     is ActivityElapsed.Hours -> stringResource(R.string.mobile_agent_hours, elapsed.hours, elapsed.minutes)
                     is ActivityElapsed.Days -> stringResource(R.string.mobile_agent_days, elapsed.value)
+                }
+                else -> {
+                    val base = stringResource(R.string.mobile_agent_working)
+                    val duration = when (elapsed) {
+                        null -> null
+                        ActivityElapsed.LessThanMinute -> stringResource(R.string.mobile_activity_seconds)
+                        is ActivityElapsed.Minutes -> stringResource(R.string.mobile_activity_minutes, elapsed.value)
+                        is ActivityElapsed.Hours -> stringResource(R.string.mobile_activity_hours, elapsed.hours, elapsed.minutes)
+                        is ActivityElapsed.Days -> stringResource(R.string.mobile_activity_days, elapsed.value)
+                    }
+                    listOfNotNull(base, snapshot.activityDetail?.tool, duration).joinToString(" · ")
                 }
             }, style = MaterialTheme.typography.labelMedium)
         }

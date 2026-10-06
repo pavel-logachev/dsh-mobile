@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="mobile_agent_activity_count">Agent activity · %1$d</string>
+    <string name="mobile_activity_expanded">Expanded. Tap to collapse agent activity.</string>
+    <string name="mobile_activity_collapsed">Collapsed. Tap to expand agent activity.</string>
+    <string name="mobile_context_updated">Context updated</string>
+    <string name="mobile_activity_full_text">Full activity text</string>
+    <string name="mobile_activity_close">Close</string>
+    <string name="mobile_activity_seconds">less than a minute</string>
+    <string name="mobile_activity_minutes">≈%1$d min</string>
+    <string name="mobile_activity_hours">≈%1$d h %2$d min</string>
+    <string name="mobile_activity_days">≈%1$d d</string>
+</resources>

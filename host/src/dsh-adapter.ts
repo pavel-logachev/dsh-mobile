@@ -3,6 +3,7 @@ import { isAbsolute } from 'node:path';
 import { createWorkspaceSource, workspacePathKey } from './workspace-source.ts';
 import type { WorkspaceSource } from './workspace-source.ts';
 import { HostError } from './errors.ts';
+import { presentUserText } from './message-presentation.ts';
 import type { ChatMessage, HostAdapter, HostSession, HostSnapshot, Preset, WorkspaceConfig } from './types.ts';
 
 import { isCompatibleDshVersion } from './compatibility.ts';
@@ -98,7 +99,8 @@ function messageOf(event: WireEvent): ChatMessage | undefined {
   if (!text) return undefined;
   const source = object(message.source);
   return {
-    id: message.id, role: event.type === 'user/message' ? 'user' : 'assistant', text, createdAt: event.time,
+    id: message.id, role: event.type === 'user/message' ? 'user' : 'assistant',
+    ...(event.type === 'user/message' ? presentUserText(text, typeof source?.kind === 'string' ? source.kind : undefined) : { text }), createdAt: event.time,
     ...(event.type === 'user/message' && source?.kind === 'user' && typeof source.rpcId === 'string' ? { requestId: source.rpcId } : {}),
   };
 }
@@ -127,6 +129,8 @@ class Transcript {
   hasMore = false;
   nodes: SurfaceNode[] = [];
   private running: boolean;
+  private turn: { number: number; startedAt: number } | undefined;
+  private readonly calls = new Map<string, string>();
   private unsupported = false;
   private historyCut = false;
   private gap = false;
@@ -175,7 +179,11 @@ class Transcript {
   markGap(): void { this.gap = true; this.attempt = undefined; }
   get needsResync(): boolean { return this.gap; }
   accept(observation: DshObservation): void {
-    if (observation.type === 'status') { this.running = observation.running; return; }
+    if (observation.type === 'status') {
+      this.running = observation.running;
+      if (!this.running) { this.turn = undefined; this.calls.clear(); }
+      return;
+    }
     if (observation.type === 'event') {
       const event = wireEvent(observation.event);
       if (event.seq <= this.cursor) return;
@@ -195,6 +203,19 @@ class Transcript {
     if (this.unsupported || this.gap || this.historyCut) return;
     if (!applySurface(this.nodes, event)) { this.historyCut = true; this.attempt = undefined; return; }
     const data = object(event.data);
+    if (event.type === 'turn/start') {
+      this.calls.clear();
+      this.turn = Number.isSafeInteger(data?.turn) ? { number: data!.turn as number, startedAt: event.time } : undefined;
+    }
+    if (event.type === 'turn/end') { this.turn = undefined; this.calls.clear(); }
+    if (event.type === 'tool/call' && this.turn?.number === data?.turn && typeof data?.callId === 'string' && typeof data.name === 'string' && /^[A-Za-z0-9_.:/-]{1,128}$/.test(data.name)) {
+      if (this.calls.size < 1000) this.calls.set(data.callId, data.name);
+      else { this.turn = undefined; this.calls.clear(); } // Never grow unbounded or report an unproven latest call.
+    }
+    if (event.type === 'tool/result') {
+      const message = object(data?.message);
+      if (typeof message?.toolCallId === 'string') this.calls.delete(message.toolCallId);
+    }
     if (event.type === 'session/title' && typeof data?.title === 'string') this.session.title = data.title;
     if (event.type === 'user/message') this.session.updatedAt = Math.max(this.session.updatedAt, event.time);
     if (live && event.type === 'turn/start') this.running = true;
@@ -264,6 +285,7 @@ class Transcript {
       session: { ...this.session, running: this.running }, messages: messages.slice(-MAX_MESSAGES), cursor: this.cursor,
       hasMore: this.hasMore || messages.length > MAX_MESSAGES,
       activity: ambiguous ? 'unknown' : waiting ? 'waiting' : this.running ? 'running' : 'idle',
+      ...(!ambiguous && this.running && this.turn ? { activityDetail: { turnStartedAt: this.turn.startedAt, ...([...this.calls.values()].at(-1) ? { tool: [...this.calls.values()].at(-1)! } : {}) } } : {}),
       ...(this.unsupported ? { notice: UNKNOWN_NOTICE } : this.historyCut ? { notice: HISTORY_CUT_NOTICE } : this.gap ? { notice: GAP_NOTICE } : waiting ? { notice: WAIT_NOTICE } : {}),
     };
   }

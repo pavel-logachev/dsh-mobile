@@ -1,0 +1,18 @@
+[
+  {"name":"relay","text":"Agent worker-1 sent a message: Synthetic result.","kind":"agent_event"},
+  {"name":"settled","text":"Background subagent worker-1 finished and will do no further work unless you send it more.Its closing message: Synthetic result.","kind":"agent_event"},
+  {"name":"checkpoint","text":"This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<summary>Synthetic checkpoint.</summary>","kind":"context"},
+  {"name":"runtime","text":"Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nSynthetic policy.","kind":"context"},
+  {"name":"mixed","text":"  Keep this human text exactly.  \n\n<system-reminder>Injected guidance.</system-reminder>\n\nTime sampled while preparing turn 2, step 1: 2026-01-02T03:04:05+00:00[UTC]\nBrowser time zone for this request: unavailable. Ask the user to clarify otherwise-unqualified dates and times.\nElapsed since the preceding model-visible message: unavailable.","kind":"message","cleanText":"  Keep this human text exactly.  "},
+  {"name":"prose","text":"Please explain system-reminder in prose.","kind":"message"},
+  {"name":"inline-tag","text":"Please explain <system-reminder>this example</system-reminder> without deleting it.","kind":"message"},
+  {"name":"quoted-relay","text":"The log says Agent worker-1 sent a message: Synthetic result.","kind":"message"},
+  {"name":"memory","text":"<hindsight_knowledge>Synthetic recall.</hindsight_knowledge>","kind":"context"},
+  {"name":"memory-refresh","text":"<hindsight_knowledge_refresh>Synthetic recall.</hindsight_knowledge_refresh>","kind":"context"},
+  {"name":"mixed-blocks","text":"Human question.\n\n<hindsight_knowledge>Recall.</hindsight_knowledge>\n\n<hindsight_knowledge_refresh>Update.</hindsight_knowledge_refresh>","kind":"message","cleanText":"Human question."},
+  {"name":"unfinished-tag","text":"Human question.\n\n<system-reminder>Unclosed example.","kind":"message"},
+  {"name":"stopped","text":"Background subagent worker-2 was stopped before it finished.It left no closing message.","kind":"agent_event"},
+  {"name":"retained-suffix","text":"Human.\n\n<system-reminder>Quoted example.</system-reminder>\n\nAnother human sentence.\n\n<system-reminder>Injected guidance.</system-reminder>","kind":"message","cleanText":"Human.\n\n<system-reminder>Quoted example.</system-reminder>\n\nAnother human sentence."},
+  {"name":"crlf","text":"Human with CRLF.  \r\n\r\n<system-reminder>Injected.</system-reminder>\r\n","kind":"message","cleanText":"Human with CRLF.  "},
+  {"name":"job","text":"background job job-1 (shell: synthetic check) finished succeeded. Read its output with job_output.","kind":"agent_event"}
+]

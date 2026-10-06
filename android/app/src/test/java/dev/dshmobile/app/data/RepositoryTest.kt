@@ -65,7 +65,7 @@ class RepositoryTest {
             "/v1/sessions/other" -> otherSnapshot?.invoke() ?: json(snapshot().replace("\"id\":\"chat\"", "\"id\":\"other\""))
             "/v1/sessions/chat" -> json(snapshotText)
             "/v1/sessions/chat/events" -> events()
-            "/v1/sessions/chat/messages" -> { mutations += request; message(request) }
+            "/v1/sessions/chat/messages", "/v1/sessions/other/messages" -> { mutations += request; message(request) }
             "/v1/sessions/chat/cancellations" -> { mutations += request; message(request) }
             else -> if (request.requestUrl?.encodedPath?.startsWith("/v1/commands/") == true)
                 receipt(request.requestUrl!!.pathSegments.last()) else json("{}", 404)
@@ -87,6 +87,242 @@ class RepositoryTest {
             assertNull(repo.state.value.pending)
             assertEquals("", repo.state.value.draft)
             assertEquals(listOf("user"), repo.state.value.snapshot!!.messages.map { it.id })
+            assertEquals(1, fixture.mutations.size)
+        }
+    }
+    @Test fun `accepted prompt during running releases admission and clears only its submitted draft`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repo.updateDraft("First queued prompt")
+            repo.sendMessage("First queued prompt")
+            assertNull("Accepted inbox prompt must not block admission", repo.state.value.pending)
+            assertEquals("", repo.state.value.draft)
+            assertEquals("queued", repo.state.value.acceptedPrompts.single().status)
+            assertEquals("First queued prompt", repo.state.value.acceptedPrompts.single().text)
+            repo.updateDraft("Second queued prompt")
+            repo.sendMessage("Second queued prompt")
+            assertEquals(2, fixture.mutations.size)
+            assertEquals(2, repo.state.value.acceptedPrompts.size)
+            val firstId = requestId(fixture.mutations.first())
+            fixture.snapshotText = snapshot("""[{"id":"canonical-first","role":"user","text":"First queued prompt","createdAt":30,"requestId":"$firstId"}]""", running = true)
+            repo.refresh()
+            assertEquals(listOf("Second queued prompt"), repo.state.value.acceptedPrompts.map { it.text })
+            assertEquals(listOf("canonical-first"), repo.state.value.snapshot!!.messages.map { it.id })
+            repo.refresh()
+            assertEquals(1, repo.state.value.acceptedPrompts.size)
+            assertEquals(2, fixture.mutations.size)
+        }
+    }
+    @Test fun `three admitted prompts persist across recreation and a fourth waits for canonical history`() = runBlocking {
+        withRepository { repo, store, fixture, scope ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repeat(3) { repo.sendMessage("Queued synthetic $it") }
+            assertEquals(3, store.value.acceptedPrompts.size)
+            assertNull(store.value.pending)
+            repo.close()
+            val recreated = NetworkMobileRepository(store, scope, true)
+            try {
+                recreated.restore()
+                assertEquals(listOf("queued", "queued", "queued"), recreated.state.value.acceptedPrompts.map { it.status })
+                assertNull(recreated.state.value.error)
+                recreated.setForeground(true)
+                recreated.sendMessage("Fourth must wait")
+                assertEquals("command_unresolved", recreated.state.value.error)
+                assertEquals(3, fixture.mutations.size)
+                val id = requestId(fixture.mutations.first())
+                fixture.snapshotText = snapshot("""[{"id":"first","role":"user","text":"Queued synthetic 0","createdAt":30,"requestId":"$id"}]""", running = true)
+                recreated.refresh()
+                recreated.sendMessage("Fourth now admitted")
+                assertEquals(4, fixture.mutations.size)
+                assertEquals(3, recreated.state.value.acceptedPrompts.size)
+            } finally { recreated.close() }
+        }
+    }
+    @Test fun `stop with three queued prompts expires after two idle snapshots across restart`() = runBlocking {
+        withRepository { repo, store, fixture, scope ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repeat(3) { repo.sendMessage("Followup $it") }
+            fixture.message = { request ->
+                fixture.snapshotText = snapshot(running = false)
+                json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""")
+            }
+            repo.cancelRun() // First authoritative idle observation.
+            assertEquals(listOf("queued", "queued", "queued"), repo.state.value.acceptedPrompts.map { it.status })
+            repo.close()
+            val restarted = NetworkMobileRepository(store, scope, true)
+            try {
+                restarted.setForeground(true) // Second fresh idle snapshot.
+                assertEquals(listOf("unconfirmed", "unconfirmed", "unconfirmed"), restarted.state.value.acceptedPrompts.map { it.status })
+                restarted.sendMessage("Wake retained inbox")
+                assertEquals(5, fixture.mutations.size)
+            } finally { restarted.close() }
+        }
+    }
+    @Test fun `a full queued chat does not block another chat`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true)
+            fixture.index = """{"items":[${session()},${session().replace("\"id\":\"chat\"", "\"id\":\"other\"")}],"nextCursor":null}"""
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repeat(3) { repo.sendMessage("Followup $it") }
+            repo.selectSession("other")
+            repo.sendMessage("Other chat must not be blocked")
+            assertTrue(fixture.requests.any { it.path == "/v1/sessions/other/messages" && it.method == "POST" })
+        }
+    }
+    @Test fun `dismiss queued and unconfirmed bubbles is local and persists without touching draft`() = runBlocking {
+        withRepository { repo, store, fixture, scope ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repo.sendMessage("Dismiss queued")
+            val queuedId = repo.state.value.acceptedPrompts.single().requestId
+            repo.updateDraft("Keep draft")
+            val before = fixture.requests.size
+            repo.state.value.localPromptActions!!.dismiss(queuedId)
+            assertEquals(before, fixture.requests.size)
+            assertEquals("Keep draft", repo.state.value.draft)
+            assertTrue(store.value.acceptedPrompts.isEmpty())
+            repo.sendMessage("Dismiss expired")
+            fixture.snapshotText = snapshot(running = false)
+            repo.refresh(); repo.refresh()
+            val local = repo.state.value.acceptedPrompts.single()
+            assertEquals("unconfirmed", local.status)
+            val afterExpiry = fixture.requests.size
+            repo.state.value.localPromptActions!!.dismiss(local.requestId)
+            assertEquals(afterExpiry, fixture.requests.size)
+            repo.close()
+            val restarted = NetworkMobileRepository(store, scope, true)
+            try { restarted.restore(); assertTrue(restarted.state.value.acceptedPrompts.isEmpty()) }
+            finally { restarted.close() }
+            assertEquals(2, fixture.mutations.size)
+        }
+    }
+    @Test fun `explicit resend creates new ID preserves original and survives restart without rePOST`() = runBlocking {
+        withRepository { repo, store, fixture, scope ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repo.sendMessage("Explicit repeat")
+            val originalId = repo.state.value.acceptedPrompts.single().requestId
+            fixture.snapshotText = snapshot(running = false)
+            repo.refresh(); repo.refresh()
+            assertEquals("unconfirmed", repo.state.value.acceptedPrompts.single().status)
+            repo.state.value.localPromptActions!!.resend(originalId)
+            assertEquals(2, fixture.mutations.size)
+            val newId = requestId(fixture.mutations.last())
+            assertNotEquals(originalId, newId)
+            assertEquals(listOf(originalId, newId), store.value.acceptedPrompts.map { it.requestId })
+            assertEquals(listOf("Explicit repeat", "Explicit repeat"), store.value.acceptedPrompts.map { it.text })
+            repo.close()
+            val restarted = NetworkMobileRepository(store, scope, true)
+            try {
+                restarted.restore()
+                assertEquals("unconfirmed", restarted.state.value.acceptedPrompts.first().status)
+                restarted.setForeground(true)
+                assertEquals(2, fixture.mutations.size)
+                fixture.snapshotText = snapshot("""[{"id":"old-canonical","role":"user","text":"Explicit repeat","createdAt":30,"requestId":"$originalId"}]""")
+                restarted.refresh()
+                assertEquals(listOf(newId), restarted.state.value.acceptedPrompts.map { it.requestId })
+            } finally { restarted.close() }
+        }
+    }
+    @Test fun `lost explicit resend response is uncertain and never automatically POSTed again`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repo.sendMessage("Explicit repeated lost response")
+            val original = repo.state.value.acceptedPrompts.single().requestId
+            fixture.snapshotText = snapshot(running = false)
+            repo.refresh(); repo.refresh()
+            fixture.message = { MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST) }
+            repo.state.value.localPromptActions!!.resend(original)
+            assertEquals("uncertain", repo.state.value.pending!!.status)
+            assertNotEquals(original, repo.state.value.pending!!.requestId)
+            repo.refresh(); repo.resolvePending()
+            assertEquals(2, fixture.mutations.size)
+        }
+    }
+    @Test fun `running snapshot resets idle expiry and later canonical message reconciles unconfirmed entry`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repo.sendMessage("Retained inbox")
+            val id = repo.state.value.acceptedPrompts.single().requestId
+            fixture.snapshotText = snapshot(running = false); repo.refresh()
+            fixture.snapshotText = snapshot(running = true); repo.refresh()
+            fixture.snapshotText = snapshot(running = false); repo.refresh()
+            assertEquals("queued", repo.state.value.acceptedPrompts.single().status)
+            repo.refresh()
+            assertEquals("unconfirmed", repo.state.value.acceptedPrompts.single().status)
+            fixture.snapshotText = snapshot("""[{"id":"canonical","role":"user","text":"Retained inbox","createdAt":30,"requestId":"$id"}]""")
+            repo.refresh()
+            assertTrue(repo.state.value.acceptedPrompts.isEmpty())
+            assertEquals(1, fixture.mutations.size)
+        }
+    }
+    @Test fun `accepted running entries expire at ten minutes only after a fresh snapshot`() = runBlocking {
+        var clock = 1_000L
+        withRepository(now = { clock }) { repo, _, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repo.sendMessage("Long retained inbox")
+            clock += 599_999L
+            repo.refresh()
+            assertEquals("queued", repo.state.value.acceptedPrompts.single().status)
+            clock++
+            assertEquals("queued", repo.state.value.acceptedPrompts.single().status)
+            repo.refresh()
+            assertEquals("unconfirmed", repo.state.value.acceptedPrompts.single().status)
+            assertEquals(1, fixture.mutations.size)
+        }
+    }
+    @Test fun `lost second running response stays uncertain beside queued prompt and resolves only by GET`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repo.sendMessage("Accepted first")
+            fixture.message = { MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST) }
+            repo.sendMessage("Lost second")
+            val id = repo.state.value.pending!!.requestId
+            assertEquals("uncertain", repo.state.value.pending!!.status)
+            assertEquals("queued", repo.state.value.acceptedPrompts.single().status)
+            repo.refresh()
+            repo.sendMessage("Must not send")
+            assertEquals(2, fixture.mutations.size)
+            fixture.receipt = { requested -> json("""{"requestId":"$requested","status":"accepted","updatedAt":30}""") }
+            repo.resolvePending()
+            assertNull(repo.state.value.pending)
+            assertEquals(listOf("queued", "queued"), repo.state.value.acceptedPrompts.map { it.status })
+            assertEquals(id, repo.state.value.acceptedPrompts.last().requestId)
+            assertEquals(2, fixture.mutations.size)
+        }
+    }
+    @Test fun `accepted inbox prompt remains queued when a later snapshot GET fails`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request ->
+                fixture.snapshotText = "{}"
+                json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""")
+            }
+            repo.sendMessage("Accepted before failed GET")
+            assertNull(store.value.pending)
+            assertEquals("queued", store.value.acceptedPrompts.single().status)
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            assertEquals("queued", repo.state.value.acceptedPrompts.single().status)
+            assertNull(repo.state.value.error)
             assertEquals(1, fixture.mutations.size)
         }
     }
@@ -334,14 +570,14 @@ class RepositoryTest {
             edit.await()
         }
     }
-    private suspend fun withRepository(block: suspend (NetworkMobileRepository, MemoryStore, Fixture, CoroutineScope) -> Unit) {
+    private suspend fun withRepository(now: () -> Long = System::currentTimeMillis, block: suspend (NetworkMobileRepository, MemoryStore, Fixture, CoroutineScope) -> Unit) {
         val scope = CoroutineScope(kotlin.coroutines.coroutineContext + SupervisorJob())
         val store = MemoryStore()
         val fixture = Fixture()
         MockWebServer().use { server ->
             server.dispatcher = fixture
             server.start()
-            val repo = NetworkMobileRepository(store, scope, debug = true)
+            val repo = NetworkMobileRepository(store, scope, debug = true, now = now)
             try {
                 repo.setForeground(true)
                 // Bind the URL to this fixture's IPv4 listener, not localhost's unrelated IPv6 route.

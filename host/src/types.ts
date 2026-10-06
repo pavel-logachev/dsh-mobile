@@ -5,11 +5,12 @@ export interface HostSession {
 }
 export interface ChatMessage {
   id: string; role: 'user' | 'assistant' | 'system'; text: string; createdAt: number;
-  requestId?: string; provisional?: boolean;
+  requestId?: string; provisional?: boolean; kind?: 'message' | 'agent_event' | 'context'; serviceText?: string;
 }
 export interface HostSnapshot {
   session: HostSession; messages: ChatMessage[]; cursor: number; hasMore: boolean;
   activity: 'idle' | 'running' | 'waiting' | 'unknown'; notice?: string;
+  activityDetail?: { turnStartedAt: number; tool?: string };
 }
 export interface HostAdapter {
   readonly upstreamVersion: string;

@@ -57,6 +57,14 @@
     <string name="mobile_unknown_activity">Состояние задачи не подтверждено. Проверьте его на компьютере; отправка отключена.</string>
     <string name="mobile_message">Сообщение компьютеру</string>
     <string name="mobile_send">Отправить сообщение</string>
+    <string name="mobile_message_queued_hint">Сообщение встанет в очередь</string>
+    <string name="mobile_delivery_queued">В очереди</string>
+    <string name="mobile_queue_full">Три сообщения этого чата ещё не появились в переписке. Обновите её или скройте локальную запись, чтобы отправить новое.</string>
+    <string name="mobile_delivery_unconfirmed">Не подтверждено в переписке</string>
+    <string name="mobile_local_prompt_notice">Скрытие удаляет только запись на телефоне. Оно ничего не отменяет и не удаляет на компьютере.</string>
+    <string name="mobile_dismiss_local_prompt">Скрыть на телефоне</string>
+    <string name="mobile_resend_prompt">Отправить снова</string>
+    <string name="mobile_resend_warning">Компьютер уже принял это сообщение и ещё может его обработать. Повторная отправка создаст новую команду и может продублировать сообщение. Всё равно отправить снова?</string>
     <string name="mobile_offline_draft">Черновик остаётся на телефоне. При восстановлении связи он не отправится автоматически.</string>
     <string name="mobile_delivery_pending">Ожидаем подтверждение отправки от компьютера.</string>
     <string name="mobile_delivery_accepted">Компьютер принял сообщение. Обновляем переписку.</string>

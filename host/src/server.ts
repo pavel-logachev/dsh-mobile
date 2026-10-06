@@ -166,9 +166,16 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     const session = sessionForDevice(snapshot.session, deviceId, ids);
     const messages = snapshot.messages.slice(-100).map(message => {
       if (!message || typeof message.id !== 'string' || typeof message.text !== 'string' || !['user', 'assistant', 'system'].includes(message.role) || !Number.isFinite(message.createdAt)) throw new HostError('internal_error');
-      return { id: message.id, role: message.role, text: message.text, createdAt: message.createdAt, ...(message.requestId && isRequestId(message.requestId) ? { requestId: message.requestId } : {}), ...(message.provisional === true ? { provisional: true } : {}) };
+      if ((message.kind !== undefined && !['message', 'agent_event', 'context'].includes(message.kind)) ||
+          (message.serviceText !== undefined && typeof message.serviceText !== 'string')) throw new HostError('internal_error');
+      return { ...(message.kind !== undefined ? { kind: message.kind } : {}), ...(message.serviceText !== undefined ? { serviceText: message.serviceText } : {}), id: message.id, role: message.role, text: message.text, createdAt: message.createdAt, ...(message.requestId && isRequestId(message.requestId) ? { requestId: message.requestId } : {}), ...(message.provisional === true ? { provisional: true } : {}) };
     });
-    const result = { session, messages, cursor: snapshot.cursor, hasMore: snapshot.hasMore === true || snapshot.messages.length > 100, activity: snapshot.activity, ...(snapshot.activity === 'waiting' || snapshot.activity === 'unknown' ? { notice: 'Return to the desktop to check this task.' } : {}) };
+    const detail = snapshot.activityDetail;
+    if (detail !== undefined && (!detail || !Number.isSafeInteger(detail.turnStartedAt) || detail.turnStartedAt < 0 ||
+        (detail.tool !== undefined && (typeof detail.tool !== 'string' || !/^[A-Za-z0-9_.:/-]{1,128}$/.test(detail.tool))))) throw new HostError('internal_error');
+    const activityDetail = detail && ['running', 'waiting'].includes(snapshot.activity)
+      ? { turnStartedAt: detail.turnStartedAt, ...(detail.tool !== undefined ? { tool: detail.tool } : {}) } : undefined;
+    const result = { ...(activityDetail ? { activityDetail } : {}), session, messages, cursor: snapshot.cursor, hasMore: snapshot.hasMore === true || snapshot.messages.length > 100, activity: snapshot.activity, ...(snapshot.activity === 'waiting' || snapshot.activity === 'unknown' ? { notice: 'Return to the desktop to check this task.' } : {}) };
     // Keep complete messages and Unicode intact. Observation is a bounded latest-history view.
     while (Buffer.byteLength(JSON.stringify(result), 'utf8') > 2 * 1024 * 1024) {
       if (result.messages.length <= 1) throw new HostError('payload_too_large');

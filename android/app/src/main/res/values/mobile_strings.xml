@@ -57,6 +57,14 @@
     <string name="mobile_unknown_activity">Task status could not be confirmed. Check it on your computer; sending is disabled.</string>
     <string name="mobile_message">Message your computer</string>
     <string name="mobile_send">Send message</string>
+    <string name="mobile_message_queued_hint">Message will be queued</string>
+    <string name="mobile_delivery_queued">Queued</string>
+    <string name="mobile_queue_full">Three messages in this chat are awaiting history. Refresh or dismiss a local entry to send another.</string>
+    <string name="mobile_delivery_unconfirmed">Not confirmed in history</string>
+    <string name="mobile_local_prompt_notice">Dismissing removes only this phone’s entry. It does not cancel or remove anything on the computer.</string>
+    <string name="mobile_dismiss_local_prompt">Dismiss locally</string>
+    <string name="mobile_resend_prompt">Send again</string>
+    <string name="mobile_resend_warning">The computer already accepted this message and may still process it. Sending again creates a new command and may duplicate the message. Send again anyway?</string>
     <string name="mobile_offline_draft">Draft stays on this phone. It will not send automatically when reconnected.</string>
     <string name="mobile_delivery_pending">Waiting for the computer to confirm delivery.</string>
     <string name="mobile_delivery_accepted">Accepted by the computer. Refreshing the conversation.</string>

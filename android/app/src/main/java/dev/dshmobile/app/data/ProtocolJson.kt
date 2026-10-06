@@ -67,6 +67,10 @@ internal fun SessionSnapshot.checked(expectedId: String): SessionSnapshot {
         messages = messages.map { if (it.role in setOf("user", "assistant", "system")) it else it.copy(role = "system", text = "") },
         activity = if (unknown) "unknown" else activity,
         notice = if (unknown) "unsupported" else notice,
+        activityDetail = activityDetail?.takeIf { !unknown && activity in setOf("running", "waiting") }?.copy(
+            turnStartedAt = activityDetail.turnStartedAt?.takeIf { it >= 0 },
+            tool = activityDetail.tool?.takeIf { Regex("[A-Za-z0-9_.:/-]{1,128}").matches(it) },
+        ),
     )
 }
 internal fun CommandReceipt.checked(expectedId: String): CommandReceipt {

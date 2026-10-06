@@ -18,6 +18,7 @@ internal data class StoredState(
     val selectedSessionId: String? = null,
     val drafts: Map<String, String> = emptyMap(),
     val pending: StoredCommand? = null,
+    val acceptedPrompts: List<StoredCommand> = emptyList(),
 )
 
 @Serializable
@@ -30,6 +31,9 @@ internal data class StoredCommand(
     val presetId: String? = null,
     val expectedCursor: Long? = null,
     val status: String = "sending",
+    val queuedWhileRunning: Boolean = false,
+    val acceptedAt: Long? = null,
+    val idleSnapshots: Int = 0,
 ) {
     fun presentation() = PendingCommand(requestId, kind, sessionId, text, status)
 }

@@ -212,7 +212,7 @@ class MobileAcceptanceTest {
         await(hasTestTag("message_input"))
     }
 
-    /** Opt-in multi-project fixture captures. Does not create, send, stop, forget or pair anything. */
+    /** Opt-in fixture captures; running-chat capture also explicitly sends one synthetic prompt. */
     private fun captureRedesign(config: AcceptanceConfig, name: String) {
         checkpoint = "redesign-capture-guard"
         require(config.mode == AcceptanceMode.FIXTURE)
@@ -253,7 +253,16 @@ class MobileAcceptanceTest {
                     compose.onNodeWithText(config.markdownAnchor, substring = true).assertIsDisplayed()
                     checkpoint = "redesign-markdown-running-controls"
                     compose.onNodeWithTag("activity_row").assertIsDisplayed()
-                    compose.onNodeWithTag("stop_run").assertIsDisplayed() // Never click a mutation during captures.
+                    compose.onNodeWithTag("stop_run").assertIsDisplayed()
+                    compose.onNodeWithTag("send_message").assertIsDisplayed().assertIsNotEnabled()
+                    checkpoint = "redesign-send-while-running"
+                    compose.onNodeWithTag("message_input").performTextReplacement(RUNNING_PROMPT)
+                    compose.onNodeWithTag("send_message").assertIsEnabled().performClick()
+                    await(hasTestTag("message_input") and
+                        SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
+                    compose.onNodeWithTag("send_message").assertIsDisplayed()
+                    // Send must not open the Stop confirmation; the turn may finish meanwhile.
+                    compose.onNodeWithTag("stop_run_confirm").assertDoesNotExist()
                 }
                 "new-chat-sheet" -> {
                     compose.onNodeWithTag("new_chat").performClick()
@@ -394,6 +403,7 @@ class MobileAcceptanceTest {
     companion object {
         const val PROMPT = "DSH_MOBILE_ACCEPTANCE_SYNTHETIC_PROMPT_V1"
         const val DRAFT = "DSH_MOBILE_UNSENT_DRAFT_V1"
+        const val RUNNING_PROMPT = "DSH_MOBILE_QUEUED_PROMPT_V1"
     }
 }
 

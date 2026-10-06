@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, realpath } from 'node:fs/promises';
-import { realpathSync } from 'node:fs';
+import { realpathSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -123,11 +123,60 @@ test('canonical case-distinct cwd results cannot authorize an unregistered path 
   assert.equal(h.calls().prompted, undefined);
 });
 
+test('noise fixtures project service input without changing human text or request correlation', async t => {
+  const h = await harness(t);
+  const vectors = JSON.parse(readFileSync(new URL('../../fixtures/message-noise.json', import.meta.url), 'utf8')) as {name: string; text: string; kind: string; cleanText?: string}[];
+  for (const vector of vectors) {
+    h.frame.records = [{ type: 'event', event: { seq: 0, time: 1700000000000, type: 'user/message', surfaceOp: 'append', data: { id: 'noise', role: 'user', source: { kind: 'legacy' }, content: [{ type: 'text', text: vector.text }] } } }] as typeof h.frame.records;
+    h.frame.cursor = 0;
+    const snapshot = await h.adapter.snapshot('session-fixture', new AbortController().signal);
+    assert.equal(snapshot.messages[0]?.kind ?? 'message', vector.kind, vector.name);
+    assert.equal(snapshot.messages[0]?.text, vector.cleanText ?? vector.text, vector.name);
+  }
+  const human = h.frame.records[0]!.event.data as { source: unknown; content: unknown };
+  human.source = { kind: 'user', rpcId: requestId };
+  human.content = [{ type: 'text', text: vectors.find(v => v.name === 'mixed')!.text }];
+  const mixed = (await h.adapter.snapshot('session-fixture', new AbortController().signal)).messages[0]!;
+  assert.equal(mixed.text, vectors.find(v => v.name === 'mixed')!.text, 'human attribution preserves the complete original');
+  assert.equal(mixed.requestId, requestId);
+  human.content = [{ type: 'text', text: vectors[0]!.text }];
+  assert.equal((await h.adapter.snapshot('session-fixture', new AbortController().signal)).messages[0]!.kind, 'message', 'explicit human origin wins');
+  for (const [source, kind] of Object.entries({ 'agent-message': 'agent_event', 'subagent-settled': 'agent_event', 'tool-jobs': 'agent_event', 'compact-checkpoint': 'context', 'runtime-context': 'context', 'time-context': 'context', 'agent-instructions': 'context', 'skill-catalog': 'context', 'plugin:hindsight': 'context' })) {
+    const data = h.frame.records[0]!.event.data as { source: unknown; content: unknown };
+    data.source = { kind: source }; data.content = [{ type: 'text', text: 'No text-pattern hint.' }];
+    assert.equal((await h.adapter.snapshot('session-fixture', new AbortController().signal)).messages[0]?.kind, kind, source);
+  }
+});
+
+test('activity detail tracks current turn and unmatched calls without tool payloads', async t => {
+  const h = await harness(t);
+  const signal = new AbortController().signal;
+  h.row.running = true;
+  h.frame.records.pop(); h.frame.cursor = 6;
+  assert.deepEqual((await h.adapter.snapshot('session-fixture', signal)).activityDetail, { turnStartedAt: 1700000000000 });
+  const append = (type: string, data: unknown) => {
+    const seq = ++h.frame.cursor;
+    h.frame.records.push({ type: 'event', event: { type, seq, time: 1700000000000 + seq, data, ...(type === 'tool/result' ? { surfaceOp: 'append' } : {}) } } as typeof h.frame.records[number]);
+  };
+  append('tool/call', { turn: 1, callId: 'a', name: 'read', arguments: 'PRIVATE' });
+  append('tool/call', { turn: 1, callId: 'b', name: 'grep', arguments: 'PRIVATE' });
+  assert.deepEqual((await h.adapter.snapshot('session-fixture', signal)).activityDetail, { turnStartedAt: 1700000000000, tool: 'grep' });
+  append('tool/result', { turn: 1, message: { toolCallId: 'b', content: [{ type: 'text', text: 'PRIVATE' }] } });
+  assert.equal((await h.adapter.snapshot('session-fixture', signal)).activityDetail?.tool, 'read');
+  append('turn/end', { turn: 1 });
+  assert.equal((await h.adapter.snapshot('session-fixture', signal)).activityDetail, undefined);
+  append('turn/start', { turn: 2 });
+  append('tool/call', { turn: 1, callId: 'old', name: 'old_turn' });
+  assert.deepEqual((await h.adapter.snapshot('session-fixture', signal)).activityDetail, { turnStartedAt: 1700000000011 });
+  h.frame.records = h.frame.records.slice(-1); // A bounded cut cannot establish the current turn.
+  assert.equal((await h.adapter.snapshot('session-fixture', signal)).activityDetail, undefined);
+});
+
 test('a cold snapshot returns the authoritative text surface without resuming an agent', async (t) => {
   const h = await harness(t);
   const result = await h.adapter.snapshot('session-fixture', new AbortController().signal);
   assert.deepEqual(result.messages, [
-    { id: 'user-1', role: 'user', text: 'A synthetic question.', createdAt: 1700000000002, requestId: '7b15f469-52f6-4f44-a0a1-c2b8575e3f90' },
+    { id: 'user-1', role: 'user', kind: 'message', text: 'A synthetic question.', createdAt: 1700000000002, requestId: '7b15f469-52f6-4f44-a0a1-c2b8575e3f90' },
     { id: 'assistant-2', role: 'assistant', text: 'The authoritative answer.', createdAt: 1700000000006 },
   ]);
   assert.equal(result.session.title, 'Synthetic example');

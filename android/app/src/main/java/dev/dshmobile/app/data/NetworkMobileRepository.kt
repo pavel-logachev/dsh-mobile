@@ -41,7 +41,12 @@ internal class NetworkMobileRepository(
     private val repositoryJob = SupervisorJob(ownerScope.coroutineContext[Job])
     private val scope = CoroutineScope(ownerScope.coroutineContext + repositoryJob)
     private val mutex = Mutex()
-    private val mutableState = MutableStateFlow(MobileState())
+    // An admitted command outlives the local bubble/composition that initiated it.
+    private val promptActions = dev.dshmobile.app.model.LocalPromptActions(
+        dismiss = { id -> scope.launch { dismissLocalPrompt(id) }.join() },
+        resend = { id -> scope.launch { resendLocalPrompt(id) }.join() },
+    )
+    private val mutableState = MutableStateFlow(MobileState(localPromptActions = promptActions))
     override val state: StateFlow<MobileState> = mutableState.asStateFlow()
     private var stored = StoredState()
     private var restored = false
@@ -87,7 +92,7 @@ internal class NetworkMobileRepository(
         catch (cancelled: CancellationException) { throw cancelled }
         catch (failure: Exception) { safeDebugDiagnostic("state.persist", failure); throw MobileFailure("storage_failed") }
         stored = value
-        mutableState.value = state.value.copy(pending = value.pending?.presentation())
+        mutableState.value = state.value.copy(pending = value.pending?.presentation(), acceptedPrompts = value.acceptedPrompts.map { it.presentation() })
     }
     private fun stopObserver() {
         generation++
@@ -123,11 +128,17 @@ internal class NetworkMobileRepository(
             val normalized = EndpointPolicy.validate(host.endpoint, debug)
             if (normalized != host.endpoint || !validId(host.deviceId) || !safeToken(host.deviceToken) || host.hostName.length > 512) throw MobileFailure("storage_failed")
             stored.pending?.let { validateStoredCommand(it) }
+            if (stored.acceptedPrompts.count { it.status == "unconfirmed" } > MAX_LOCAL_PROMPTS ||
+                stored.acceptedPrompts.filter { it.status in setOf("accepted", "queued") }.groupingBy { it.sessionId }.eachCount().values.any { it > MobileReducer.MAX_ACCEPTED_PROMPTS } ||
+                stored.acceptedPrompts.map { it.requestId }.distinct().size != stored.acceptedPrompts.size ||
+                stored.acceptedPrompts.any { it.requestId == stored.pending?.requestId || it.kind != "send" || it.status !in setOf("accepted", "queued", "unconfirmed") })
+                throw MobileFailure("storage_failed")
+            stored.acceptedPrompts.forEach { validateStoredCommand(it) }
             if (stored.drafts.size > 64 || stored.drafts.any { !validId(it.key) || it.value.toByteArray().size > 32 * 1024 }) throw MobileFailure("storage_failed")
             synchronized(lifecycle) {
                 if (foreground && desiredForeground && !closed) api = HostApi(host.endpoint, host.deviceToken)
             }
-        } else if (stored.pending != null || stored.drafts.isNotEmpty() || stored.selectedSessionId != null) {
+        } else if (stored.pending != null || stored.acceptedPrompts.isNotEmpty() || stored.drafts.isNotEmpty() || stored.selectedSessionId != null) {
             throw MobileFailure("storage_failed")
         }
         restored = true
@@ -140,6 +151,7 @@ internal class NetworkMobileRepository(
             remoteMode = host?.endpoint?.relay != null, relayHost = host?.endpoint?.relay?.let { safeRelayOrigin(it) },
             connection = if (host == null) ConnectionState.DISCONNECTED else ConnectionState.OFFLINE,
             draft = draftFor(stored.selectedSessionId), pending = stored.pending?.presentation(),
+            acceptedPrompts = stored.acceptedPrompts.map { it.presentation() }, localPromptActions = promptActions,
             error = if (stored.pending != null) "command_uncertain" else null,
         )
     }
@@ -186,7 +198,7 @@ internal class NetworkMobileRepository(
             synchronized(lifecycle) {
                 if (foreground && desiredForeground && !closed) api = HostApi(host.endpoint, host.deviceToken)
             }
-            mutableState.value = MobileState(paired = true, hostName = host.hostName,
+            mutableState.value = MobileState(paired = true, hostName = host.hostName, localPromptActions = promptActions,
                 remoteMode = host.endpoint.relay != null, relayHost = host.endpoint.relay?.let { safeRelayOrigin(it) },
                 connection = ConnectionState.SYNCING, busy = true)
             checkpoint = "pair.device-refresh"
@@ -280,7 +292,9 @@ internal class NetworkMobileRepository(
             if (state.value.capabilities?.textPrompt != true) throw MobileFailure("unsupported")
             if (text.isBlank() || text.toByteArray().size > 32 * 1024) throw MobileFailure("invalid_text")
             val snapshot = executableSnapshot()
-            val command = StoredCommand(UUID.randomUUID().toString(), "send", sessionId = snapshot.session.id, text = text)
+            if (MobileReducer.blockingPromptCount(state.value, snapshot.session.id) >= MobileReducer.MAX_ACCEPTED_PROMPTS) throw MobileFailure("command_unresolved")
+            val command = StoredCommand(UUID.randomUUID().toString(), "send", sessionId = snapshot.session.id, text = text,
+                queuedWhileRunning = snapshot.activity == "running")
             // Store draft and exact command in the SAME atomic encrypted write before dispatch.
             dispatch(command, stored.drafts + (snapshot.session.id to text))
         }
@@ -346,9 +360,13 @@ internal class NetworkMobileRepository(
                     val sessions = if (index.items.any { it.id == created }) index.items else listOf(snapshot.session) + index.items.take(999)
                     mutableState.value = state.value.copy(sessions = sessions, sessionsTruncated = index.truncated, snapshot = snapshot, pending = null, draft = draftFor(created), error = null)
                 } else if (command.kind == "send") {
-                    // Receipt proves admission; remove optimism only when canonical user record arrives.
-                    persist(stored.copy(pending = command.copy(status = "accepted")))
-                    mutableState.value = state.value.copy(pending = stored.pending?.presentation(), error = null)
+                    // Receipt proves admission, even if the DSH inbox has no canonical record yet.
+                    val admitted = command.copy(status = if (command.queuedWhileRunning) "queued" else "accepted", acceptedAt = now(), idleSnapshots = 0)
+                    val drafts = stored.drafts.toMutableMap()
+                    if (drafts[command.sessionId] == command.text) drafts.remove(command.sessionId)
+                    persist(stored.copy(pending = null, acceptedPrompts = boundedLocalPrompts(stored.acceptedPrompts + admitted), drafts = drafts))
+                    command.sessionId?.let { if (liveDrafts[it]?.text == command.text) liveDrafts.remove(it) }
+                    mutableState.value = state.value.copy(draft = draftFor(stored.selectedSessionId), error = null)
                 } else {
                     persist(stored.copy(pending = command.copy(status = "accepted")))
                     mutableState.value = state.value.copy(pending = stored.pending?.presentation(), error = null)
@@ -366,17 +384,53 @@ internal class NetworkMobileRepository(
         }
     }
     private suspend fun reconcileSnapshot(snapshot: SessionSnapshot?) {
-        val command = stored.pending ?: return
         if (snapshot == null) return
-        val prompt = MobileReducer.reconcilesPrompt(command.presentation(), snapshot)
-        val cancelled = command.kind == "cancel" && command.status == "accepted" && command.sessionId == snapshot.session.id &&
+        val observedAt = now()
+        val accepted = stored.acceptedPrompts.mapNotNull { local ->
+            if (MobileReducer.reconcilesPrompt(local.presentation(), snapshot)) return@mapNotNull null
+            if (local.sessionId != snapshot.session.id || local.status == "unconfirmed") return@mapNotNull local
+            val idle = if (snapshot.activity == "idle" && !snapshot.session.running) local.idleSnapshots + 1 else 0
+            val since = local.acceptedAt ?: observedAt // Migrate legacy accepted records without inventing admission time.
+            val expired = idle >= 2 || observedAt - since >= MobileReducer.ACCEPTED_PROMPT_TIMEOUT_MS
+            local.copy(status = if (expired) "unconfirmed" else local.status, acceptedAt = since, idleSnapshots = minOf(idle, 2))
+        }
+        val command = stored.pending
+        val prompt = command?.let { MobileReducer.reconcilesPrompt(it.presentation(), snapshot) } == true
+        val cancelled = command?.kind == "cancel" && command.status == "accepted" && command.sessionId == snapshot.session.id &&
             !snapshot.session.running && snapshot.activity == "idle"
-        if (!prompt && !cancelled) return
+        if (!prompt && !cancelled && accepted == stored.acceptedPrompts) return
         val drafts = stored.drafts.toMutableMap()
         if (prompt && drafts[command.sessionId] == command.text) drafts.remove(command.sessionId)
-        if (prompt && command.sessionId != null && liveDrafts[command.sessionId]?.text == command.text) liveDrafts.remove(command.sessionId)
-        persist(stored.copy(pending = null, drafts = drafts))
-        mutableState.value = state.value.copy(pending = null, draft = draftFor(stored.selectedSessionId), error = null)
+        persist(stored.copy(pending = if (prompt || cancelled) null else command, acceptedPrompts = boundedLocalPrompts(accepted), drafts = drafts))
+        if (prompt && command?.sessionId != null && liveDrafts[command.sessionId]?.text == command.text) liveDrafts.remove(command.sessionId)
+        mutableState.value = state.value.copy(draft = draftFor(stored.selectedSessionId), error = if (prompt || cancelled) null else state.value.error)
+    }
+    // Storage bound is independent of admission. Only old non-blocking notices may be trimmed.
+    private fun boundedLocalPrompts(prompts: List<StoredCommand>): List<StoredCommand> {
+        val excess = (prompts.count { it.status == "unconfirmed" } - MAX_LOCAL_PROMPTS).coerceAtLeast(0)
+        val discard = prompts.filter { it.status == "unconfirmed" }.take(excess).map { it.requestId }.toSet()
+        return prompts.filterNot { it.requestId in discard }
+    }
+    private suspend fun dismissLocalPrompt(requestId: String) = action {
+        restoreLocked()
+        val retained = stored.acceptedPrompts.filterNot { it.requestId == requestId }
+        if (retained.size != stored.acceptedPrompts.size) persist(stored.copy(acceptedPrompts = retained))
+        // No network call: dismissal never cancels, edits or re-POSTs anything on the host.
+    }
+    private suspend fun resendLocalPrompt(requestId: String) {
+        val origin = state.value.snapshot?.session?.id
+        val blocked = state.value.busy
+        action {
+            restoreLocked(); online()
+            val original = stored.acceptedPrompts.singleOrNull { it.requestId == requestId } ?: return@action
+            if (blocked || origin == null || original.sessionId != origin || stored.selectedSessionId != origin) throw MobileFailure("invalid_selection")
+            if (state.value.capabilities?.textPrompt != true) throw MobileFailure("unsupported")
+            val snapshot = executableSnapshot()
+            if (MobileReducer.blockingPromptCount(state.value, origin) >= MobileReducer.MAX_ACCEPTED_PROMPTS) throw MobileFailure("command_unresolved")
+            // Only the explicit, warned user action enters here. Preserve the old record for reconciliation.
+            dispatch(StoredCommand(UUID.randomUUID().toString(), "send", sessionId = snapshot.session.id,
+                text = original.text, queuedWhileRunning = snapshot.activity == "running"))
+        }
     }
     override suspend fun abandonPending() = action {
         restoreLocked()
@@ -467,7 +521,7 @@ internal class NetworkMobileRepository(
         store.clear() // If this fails, report storage_failed and never claim the device was forgotten.
         api?.close(); api = null
         stored = StoredState(); restored = true; liveDrafts.clear()
-        mutableState.value = MobileState()
+        mutableState.value = MobileState(localPromptActions = promptActions)
     }
     override fun close() {
         synchronized(lifecycle) {
@@ -478,9 +532,12 @@ internal class NetworkMobileRepository(
         }
         repositoryJob.cancel()
     }
+    private companion object { const val MAX_LOCAL_PROMPTS = 32 }
+
     private fun validateStoredCommand(command: StoredCommand) {
         if (!validRequestId(command.requestId) || command.kind !in setOf("send", "create", "cancel") ||
-            command.status !in setOf("sending", "pending", "accepted", "uncertain") ||
+            command.status !in setOf("sending", "pending", "accepted", "queued", "unconfirmed", "uncertain") ||
+            command.acceptedAt?.let { it < 0 } == true || command.idleSnapshots !in 0..2 ||
             (command.sessionId != null && !validId(command.sessionId)) || command.text.orEmpty().toByteArray().size > 32 * 1024 ||
             (command.kind == "send" && (command.text.isNullOrBlank() || command.sessionId == null)) ||
             (command.kind == "cancel" && (command.sessionId == null || command.expectedCursor == null || command.expectedCursor < -1)) ||

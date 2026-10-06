@@ -17,13 +17,20 @@ data class SessionSummary(
 @Serializable
 data class ChatMessage(
     val id: String, val role: String, val text: String, val createdAt: Long,
-    val requestId: String? = null, val provisional: Boolean = false,
+    val requestId: String? = null, val provisional: Boolean = false, val kind: String? = null,
+    val serviceText: String? = null,
 )
 @Serializable
 data class SessionSnapshot(
     val session: SessionSummary, val messages: List<ChatMessage>, val cursor: Long,
     val hasMore: Boolean, val activity: String, val notice: String? = null,
+    val activityDetail: ActivityDetail? = null,
 )
+@Serializable
+data class ActivityDetail(val turnStartedAt: Long? = null, val tool: String? = null)
+/** Explicit local-bubble actions, owned and serialized by the repository admission lock. */
+data class LocalPromptActions(val dismiss: suspend (String) -> Unit, val resend: suspend (String) -> Unit)
+
 data class PendingCommand(
     val requestId: String, val kind: String, val sessionId: String?, val text: String?, val status: String,
 )
@@ -47,6 +54,9 @@ data class MobileState(
     val snapshot: SessionSnapshot? = null,
     val draft: String = "",
     val pending: PendingCommand? = null,
+    /** Host-admitted prompts awaiting a canonical USER record; these are not unresolved mutations. */
+    val acceptedPrompts: List<PendingCommand> = emptyList(),
+    val localPromptActions: LocalPromptActions? = null,
     val busy: Boolean = false,
     val error: String? = null,
     val lastSyncedAt: Long? = null,

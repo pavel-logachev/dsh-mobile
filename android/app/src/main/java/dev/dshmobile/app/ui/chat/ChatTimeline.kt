@@ -22,14 +22,26 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 @Composable
-internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, onCopy: (String) -> Unit, modifier: Modifier = Modifier) {
+internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, onCopy: (String) -> Unit, modifier: Modifier = Modifier,
+    classify: suspend (List<ChatMessage>, List<ChatItem>) -> List<ChatItem> = { messages, previous ->
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { chatItems(messages, previous) }
+    }) {
     val list = rememberLazyListState()
     var following by rememberSaveable { mutableStateOf(list.firstVisibleItemIndex == 0 && list.firstVisibleItemScrollOffset == 0) }
     var unread by rememberSaveable { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val threshold = with(LocalDensity.current) { 96.dp.toPx() }
     val unconfirmed = pending?.takeIf { it.kind == "send" && it.sessionId == snapshot.session.id && !it.text.isNullOrBlank() && snapshot.messages.none { message -> message.requestId == it.requestId } }
-    val messageCount = snapshot.messages.size + if (unconfirmed != null) 1 else 0
+    // Classify off the composition thread; keep prior overlapping groups for stable identities.
+    val projection by produceState<TimelineProjection?>(null, TimelineInputKey(snapshot.messages)) {
+        val input = snapshot.messages
+        val previous = value?.items.orEmpty()
+        value = TimelineProjection(input, classify(input, previous))
+    }
+    val visible = visibleTimeline(snapshot.messages, projection)
+    val loading = visible == null
+    val timeline = visible.orEmpty()
+    val messageCount = timeline.size + if (unconfirmed != null) 1 else 0
     val totalItems = messageCount + if (snapshot.hasMore) 1 else 0
     LaunchedEffect(list, threshold) {
         snapshotFlow {
@@ -40,7 +52,8 @@ internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, o
             if (scrolling) { following = nearBottom; if (nearBottom) unread = false }
         }
     }
-    LaunchedEffect(messageCount, snapshot.messages.lastOrNull()?.text) {
+    LaunchedEffect(messageCount, timeline, loading) {
+        if (loading) return@LaunchedEffect
         if (following && totalItems > 0) { list.scrollToItem(totalItems - 1); list.scrollBy(Float.MAX_VALUE) }
         else if (messageCount > 0) unread = true
     }
@@ -50,10 +63,19 @@ internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, o
             if (snapshot.hasMore) item(key = LazyItemKeys.HISTORY_LIMIT) {
                 Text(stringResource(R.string.mobile_history_limit), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            if (snapshot.messages.isEmpty() && unconfirmed == null) item(key = LazyItemKeys.EMPTY_CONVERSATION) {
+            if (loading) item(key = "classification-loading") {
+                CircularProgressIndicator(Modifier.size(24.dp).testTag("chat_classification_loading"))
+            }
+            if (!loading && timeline.isEmpty() && unconfirmed == null) item(key = LazyItemKeys.EMPTY_CONVERSATION) {
                 Text(stringResource(R.string.mobile_empty_conversation), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            items(snapshot.messages, key = { LazyItemKeys.message(it.id) }, contentType = { it.role }) { message -> MessageItem(message, onCopy) }
+            items(timeline, key = { if (it is ChatItem.Activity) "activity:${it.id}" else LazyItemKeys.message(it.id) },
+                contentType = { if (it is ChatItem.Activity) "activity" else "message" }) { item ->
+                when (item) {
+                    is ChatItem.Message -> MessageItem(item.message, onCopy)
+                    is ChatItem.Activity -> AgentActivityGroup(item, onCopy)
+                }
+            }
             unconfirmed?.let { command -> item(key = LazyItemKeys.pending(command.requestId)) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(stringResource(R.string.mobile_unconfirmed_message), style = MaterialTheme.typography.labelMedium)
