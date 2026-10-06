@@ -144,7 +144,17 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             if (host != null && host.deviceId == device && chat != null && dev.dshmobile.app.data.validId(chat)) notificationChat = chat
         }
     }
-    fun consumeNotificationChat() { notificationChat = null }
+    fun selectNotificationChat(target: String) {
+        if (interactionBlocked || state.value.busy) return
+        interactionBlocked = true
+        viewModelScope.launch {
+            try { editorActions.withLock { repository.selectSession(target) } }
+            finally { interactionBlocked = false }
+        }
+    }
+    fun consumeNotificationChat(target: String) {
+        if (notificationChat == target && notificationTargetSelected(target, state.value.snapshot?.session?.id, state.value.busy, state.value.error)) notificationChat = null
+    }
     private val notificationResume = NotificationResume(viewModelScope, allowed = {
         val context = getApplication<Application>()
         val local = dev.dshmobile.app.data.NotificationStore(context).read()
