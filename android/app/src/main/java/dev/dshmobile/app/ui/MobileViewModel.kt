@@ -128,9 +128,35 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     fun abandonPending() { viewModelScope.launch { repository.abandonPending() } }
     fun forget() {
         pairingInput.edit("")
-        viewModelScope.launch { repository.forget() }
+        viewModelScope.launch {
+            val context = getApplication<Application>()
+            context.stopService(android.content.Intent(context, dev.dshmobile.app.data.NotificationService::class.java))
+            context.getSystemService(android.app.NotificationManager::class.java).cancelAll()
+            dev.dshmobile.app.data.NotificationStore(context).update { dev.dshmobile.app.data.NotificationLocal() }
+            repository.forget()
+        }
     }
-    fun foreground(active: Boolean) { viewModelScope.launch { repository.setForeground(active) } }
+    var notificationChat by mutableStateOf<String?>(null)
+        private set
+    fun openNotificationChat(device: String?, chat: String?) {
+        viewModelScope.launch {
+            val host = dev.dshmobile.app.data.EncryptedStateStore(getApplication()).read().host
+            if (host != null && host.deviceId == device && chat != null && dev.dshmobile.app.data.validId(chat)) notificationChat = chat
+        }
+    }
+    fun consumeNotificationChat() { notificationChat = null }
+    fun foreground(active: Boolean) { viewModelScope.launch {
+        repository.setForeground(active)
+        if (active) {
+            val context = getApplication<Application>()
+            runCatching {
+                val local = dev.dshmobile.app.data.syncNotificationPreferences(context)
+                val host = dev.dshmobile.app.data.EncryptedStateStore(context).read().host
+                if (local.enabled && host?.deviceId == local.deviceId && context.getSystemService(android.app.NotificationManager::class.java).areNotificationsEnabled())
+                    androidx.core.content.ContextCompat.startForegroundService(context, android.content.Intent(context, dev.dshmobile.app.data.NotificationService::class.java))
+            }
+        }
+    } }
     override fun onCleared() {
         repository.close() // Observation only. Never cancels a host task.
         super.onCleared()

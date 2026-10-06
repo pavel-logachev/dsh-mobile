@@ -1,0 +1,22 @@
+<resources>
+    <string name="notif_title">Уведомления</string>
+    <string name="notif_connected">DSH Mobile на связи</string>
+    <string name="notif_connection_channel">Связь с компьютером</string>
+    <string name="notif_answers_channel">Ответы агента</string>
+    <string name="notif_attention_channel">Нужно ваше решение</string>
+    <string name="notif_disable">Отключить</string>
+    <string name="notif_answer_ready">Ответ готов</string>
+    <string name="notif_needs_decision">Агент ждёт вашего решения</string>
+    <string name="notif_generic">Откройте чат на компьютере</string>
+    <string name="notif_rationale">Уведомления об ответах и запросах решения во всех доступных чатах, включая задачи с компьютера. Только названия проекта и чата, без текста ответа. Постоянное уведомление поддерживает связь и расходует заряд.</string>
+    <string name="notif_restart">После перезапуска откройте приложение для подключения. Автозапуска после загрузки нет. В Doze или при выключенном компьютере доставка может задерживаться.</string>
+    <string name="notif_unsupported">Этот хост пока не поддерживает уведомления. После обновления хоста обновите соединение.</string>
+    <string name="notif_blocked">Не удалось включить уведомления. Проверьте разрешение и системные ограничения, затем повторите попытку.</string>
+    <string name="notif_unsynced">Настройки сохранены на телефоне; ожидается синхронизация с хостом.</string>
+    <string name="notif_system">Системные настройки уведомлений</string>
+    <string name="notif_battery">Настройки оптимизации батареи</string>
+    <string name="notif_oneplus">OnePlus: разрешите работу в фоне и проверьте оптимизацию сна в системных настройках. Это не гарантирует доставку после принудительной остановки.</string>
+    <string name="notif_filters">Уведомления проектов и чатов</string>
+    <string name="notif_projects">Проекты</string>
+    <string name="notif_chats">Чаты (до 256 отдельных настроек)</string>
+</resources>

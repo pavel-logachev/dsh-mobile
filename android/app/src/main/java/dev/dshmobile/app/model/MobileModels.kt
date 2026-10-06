@@ -38,6 +38,7 @@ data class PendingCommand(
 data class MobileCapabilities(
     val sessions: Boolean, val textPrompt: Boolean, val cancel: Boolean, val liveSnapshots: Boolean,
     val attachments: Boolean, val questions: Boolean, val approvals: Boolean, val push: Boolean,
+    val notifications: Boolean = false,
 )
 
 data class MobileState(

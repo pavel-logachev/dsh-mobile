@@ -71,8 +71,7 @@ internal fun SettingsScreen(state: MobileState, model: MobileViewModel, onBack: 
                 }
             }
             SettingsGroup(stringResource(R.string.mobile_device_section)) {
-                Text(stringResource(R.string.mobile_notifications_title), style = MaterialTheme.typography.titleSmall)
-                Text(stringResource(R.string.mobile_notifications_body), style = MaterialTheme.typography.bodyMedium)
+                NotificationSettingsPanel(state)
                 Text(stringResource(R.string.mobile_phone_limits), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 HorizontalDivider()
                 Text(stringResource(R.string.mobile_forget_help), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

@@ -1,0 +1,22 @@
+<resources>
+    <string name="notif_title">Notifications</string>
+    <string name="notif_connected">DSH Mobile connected</string>
+    <string name="notif_connection_channel">Connection to computer</string>
+    <string name="notif_answers_channel">Agent answers</string>
+    <string name="notif_attention_channel">Your decision needed</string>
+    <string name="notif_disable">Disable</string>
+    <string name="notif_answer_ready">Answer ready</string>
+    <string name="notif_needs_decision">Agent needs your decision</string>
+    <string name="notif_generic">Open the chat on your computer</string>
+    <string name="notif_rationale">Receive answer and decision alerts for permitted chats, including work started on the computer. Only project and chat names are shown, never answer text. Monitoring uses a persistent notification and battery power.</string>
+    <string name="notif_restart">After a restart, open the app to reconnect. No automatic start at boot. Delivery may pause in Doze or when the computer is offline.</string>
+    <string name="notif_unsupported">This host does not support notifications yet. Refresh the connection after upgrading it.</string>
+    <string name="notif_blocked">Notifications could not be enabled. Check notification access and system restrictions, then try again.</string>
+    <string name="notif_unsynced">Local preferences saved; waiting for host synchronization.</string>
+    <string name="notif_system">System notification settings</string>
+    <string name="notif_battery">Battery optimization settings</string>
+    <string name="notif_oneplus">OnePlus: allow background activity and check sleep/standby optimization in system settings. These settings do not guarantee delivery after force stop.</string>
+    <string name="notif_filters">Project and chat notifications</string>
+    <string name="notif_projects">Projects</string>
+    <string name="notif_chats">Chats (up to 256 overrides)</string>
+</resources>

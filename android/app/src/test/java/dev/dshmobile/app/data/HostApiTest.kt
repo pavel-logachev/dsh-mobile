@@ -12,6 +12,34 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 class HostApiTest {
+    @Test fun `notification SSE authenticates explicit cursor and preserves bounded pages`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody("event: notification-page\ndata: {\"version\":1,\"epoch\":\"epoch\",\"items\":[],\"pending\":[],\"nextCursor\":\"head\",\"hasMore\":false,\"resetRequired\":true,\"coverage\":\"ready\"}\n\n"))
+            val api = api(server); val result = CompletableDeferred<NotificationPage>()
+            val source = api.observeNotifications("cursor", { result.complete(it) }, { _, _ -> })
+            try {
+                assertTrue(withTimeout(5000) { result.await() }.resetRequired)
+                val request = server.takeRequest(5, TimeUnit.SECONDS)!!
+                assertEquals("/v1/notification-events/stream?after=cursor", request.path)
+                assertEquals("Bearer synthetic-device-token-for-tests", request.getHeader("Authorization")); assertNull(request.getHeader("Last-Event-ID"))
+            } finally { source.cancel(); api.close() }
+        }
+    }
+    @Test fun `notification retry retains 429 delay and oversize unknown frame fails before parsing`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start(); server.enqueue(MockResponse().setResponseCode(429).setHeader("Retry-After", "120"))
+            val api = api(server); val failure = CompletableDeferred<Pair<String, Long>>()
+            val source = api.observeNotifications(null, {}, { key, delay -> failure.complete(key to delay) })
+            try { assertEquals("rate_limited" to 120000L, withTimeout(5000) { failure.await() }) } finally { source.cancel(); api.close() }
+        }
+        MockWebServer().use { server ->
+            server.start(); server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody("event: future\ndata: " + "a".repeat(128 * 1024 + 1)))
+            val api = api(server); val failure = CompletableDeferred<String>()
+            val source = api.observeNotifications(null, {}, { key, _ -> failure.complete(key) })
+            try { assertEquals("invalid_response", withTimeout(5000) { failure.await() }) } finally { source.cancel(); api.close() }
+        }
+    }
     @Test fun `oversized unterminated or unknown SSE event fails before parser accumulates it`() = runBlocking {
         for (prefix in listOf("event: snapshot\ndata: ", "event: unknown\ndata: ")) {
             MockWebServer().use { server ->

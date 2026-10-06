@@ -3,6 +3,9 @@
     xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- camera-view also brings video/Media3; Preview+ImageAnalysis do not use its network observer. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
@@ -19,6 +22,10 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.DshMobile"
         android:usesCleartextTraffic="false">
+        <service android:name=".data.NotificationService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-enabled continuous monitoring of a paired local AI desktop for answer completion and approval/question attention; no platform push service; persistent notification with Stop control." />
+        </service>
         <!-- The UI implementation supplies this Activity; no stub Kotlin is bundled. -->
         <activity
             android:name="dev.dshmobile.app.MainActivity"
