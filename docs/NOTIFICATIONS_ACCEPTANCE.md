@@ -22,9 +22,9 @@ The optional Cordis module is the inspected installed 4.0.4 module, read-only. I
 
 ## Final results
 
-- Host without optional Cordis: 104 tests, 100 pass, 4 intentional skips, 0 failures; build/check exit 0.
-- Host with installed Cordis: 104/104 pass, no skips/failures; build/check exit 0.
-- Android six wrapper tasks: BUILD SUCCESSFUL, exit 0; JVM XML totals 175 tests, zero failures/errors.
+- Host without optional Cordis: 111 tests, 107 pass, 4 intentional skips, 0 failures; build/check exit 0.
+- Host with installed Cordis: 111/111 pass, no skips/failures; build/check exit 0.
+- Android six wrapper tasks: BUILD SUCCESSFUL, exit 0; JVM XML totals 184 tests, zero failures/errors.
 - `lintDebug` and `lintRelease`: no errors; warnings remain (19 debug/21 release). These do not certify OS background delivery.
 - Both APK permission audits and `git diff --check`: pass.
 
@@ -43,10 +43,30 @@ Both APK variants contain existing INTERNET/CAMERA and AndroidX own-signature dy
 
 ## Self-review corrections
 
-Review of the changed host/Android/domain/UI scope found and corrected stale journal overwrite across async listing, unbounded producer promise scheduling, ambiguous cold proof, non-atomic live watermark/fan-out, post-decode-only SSE limits, queued-turn suppression, stale same-page attention display, pruned-cursor replay loop, offline inability to disable the master toggle, and unbounded Stop preference sync. Optional Cordis assertions were updated to account for the intentional extra baseline cold read/list, then strengthened with a new PC-session event bridge scenario. No external reviewer/subagent was used.
+Review of the changed host/Android/domain/UI scope found and corrected stale journal overwrite across async listing, unbounded producer promise scheduling, ambiguous cold proof, non-atomic live watermark/fan-out, post-decode-only SSE limits, queued-turn suppression, stale same-page attention display, pruned-cursor replay loop, offline inability to disable the master toggle, and unbounded Stop preference sync. Original Cordis assertions accounted for eager baseline cold reads; remediation now asserts the lazy baseline performs no idle cold read/no zero-opt-in discovery. The PC-session event bridge scenario still proves close-before-activation and no mutation. No external reviewer/subagent was used.
+
+## Independent-review remediation (2026-10-06)
+
+All nine assigned findings have implementation and regression coverage. Each finding's regression was written before its fix. Host failures reproduced behavior assertions. Android ownership/recovery/coverage/lifecycle seams initially failed compilation until introduced; the ownership test was additionally mutation-checked with the original per-instance mutex and failed the blocked-reader assertion, then restored green. Navigation first failed on missing-target selection; fixture `nextCursor:null` and query-path assertion were corrected before final green.
+
+| Finding | Cause and correction | Regression boundary | Commit |
+| --- | --- | --- | --- |
+| H1 | Different EncryptedStateStore instances had different locks: service openRead could roll back repository writes. Canonical file owner now serializes read/write/clear and all key operations. | EncryptedStateOwnershipTest: held atomic write + separate reader, drafts/pending survive, clear observed. | `7a68f6a` |
+| H2 | Excluded global session events touched gap/watermark before eligibility. Fresh ordinary-session membership now comes first; absent IDs do not reset coverage or journals. | excluded subagent event 0/1/2 preserves ordinary completion and head. | `203d6f3` |
+| H3 | Reconciliation snapshot could consume terminal cursor while terminal callback remained queued. It now owns pending state, not event admission sequence. | terminal delivered during held running/idle cold reads remains exactly one completion. | `b6b1e8e`, `1b1259e`, `f0ce9c5` |
+| M4 | Downtime pending changes were invisible to old device cuts. Changed episode cut resets journals in both directions; sequence-only changes do not reset. | restart needed→cleared, cleared→needed, unchanged episode. | `272e4f7`, `1b1259e` |
+| M5 | Page coverage was discarded and connection always claimed connected. Durable monitoring status drives live Settings and connection warnings in RU/EN. | NotificationPolicyTest serialization/degraded→ready; debug/release resource and lint gates. | `f2641e5` |
+| M6 | Missing index/offline target rejected; intent consumed before selection. Refresh index or read authorized snapshot beyond index, retain intent until selected, no mutation. | RepositoryTest new/cold/retry/bounded-index and NotificationNavigationTest success predicate. | `c772af5`, `f0ce9c5` |
+| M7 | Resume awaited network and could admit FGS after STOP. Main-thread generation owner cancels pending reads, checks immediately before start; sync comes afterward; failures persist blocked status. | NotificationResumeTest disk-held STOP, network-held start, platform exception. | `40d83a4`, `f0ce9c5` |
+| M8 | Base-file existence bypassed API26 backup recovery. openRead first; only FileNotFoundException means empty state. | NotificationStoreRecoveryTest backup-only cipher/cursor/opt-in and actual absence. | `10074a5` |
+| M9 | Startup opened all history serially and relisted N times. Zero opt-in has zero baseline IO, activation is background/global-budgeted, one list metadata reused with fresh opening header authorization; idle probes bounded/lazy. | 600 idle sessions, first enable, held startup/global timeout, lazy race; installed Cordis open-close/no-mutation checks. | `3bedc25`, `1b1259e`, `f0ce9c5` |
+
+Final focused self-review was read-only over the full revision scope from `efae41d`, including working-tree/new files; no delegation. Corrected idle attention emission, sequence-independent pending comparison, delayed-busy navigation trigger and safe failure reporting. No dependency, SDK, manifest permission, relay wire, release installation or runtime/profile changes. Changes overlapping UI-polish remain focused on notification effects/selection and the existing Settings notification panel.
+
+The lazy idle probe budget is eight sessions per minute, with ten seconds per pass; a previously unobserved idle pending request may therefore appear late in a very large workspace. This is explicit bounded recovery, not a startup scan or a claim of immediate idle-history coverage. Normal live pending events and known pending restarts are processed promptly. Real OS AtomicFile/KeyStore, FGS and Compose tap interaction still require the hardware gates below; JVM tests model the atomic race/backup boundary rather than running API26 framework code.
 
 ## Not accepted on hardware
 
 Emulator smoke deliberately skipped: Pora_API_36 had an existing owner process, and later inspection found an already running read-only AVD on port 5580. It was not reclaimed, installed into or stopped. No physical phone or live DSH session was used. Lock-screen redaction/tap, actual FGS Stop, API26/33/34 behavior, Doze, process death, relay background reconnection and OnePlus overnight battery/delivery remain manual acceptance gates. specialUse distribution approval remains a separate gate.
 
-Implementation limits are recorded in [Phase 1 as built](NOTIFICATIONS_DESIGN.md): best-effort foreground service, no boot resurrection/UnifiedPush, shared per-kind mute, inline pending cap, serial startup proof and lazy retention. Gap/downtime completion loss is surfaced as limited coverage; platform display can be lost after a persisted receipt.
+Implementation limits are recorded in [Phase 1 as built](NOTIFICATIONS_DESIGN.md): best-effort foreground service, no boot resurrection/UnifiedPush, shared per-kind mute, inline pending cap, bounded asynchronous/lazy baseline and lazy retention. Gap/downtime completion loss is surfaced as limited coverage; platform display can be lost after a persisted receipt.
