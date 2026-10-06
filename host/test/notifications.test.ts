@@ -13,7 +13,7 @@ async function fixture(t: any) {
   const device = state.consumePairing(state.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Synthetic phone');
   let listener: (id: string, event: NotificationSource) => void = () => {};
   let proof: NotificationEvidence = { sessionId: 'chat', workspaceId: 'alpha', cursor: -1, pending: false, completed: [] };
-  let listed = [{ id: 'chat', workspaceId: 'alpha' }];
+  let listed: { id: string; workspaceId: string; running?: boolean }[] = [{ id: 'chat', workspaceId: 'alpha' }];
   const source = {
     subscribe(fn: (id: string, event: NotificationSource) => void) { listener = fn; return () => { listener = () => {}; }; },
     async evidence() { return structuredClone(proof); },
@@ -36,6 +36,22 @@ test('excluded subagent events never invalidate an ordinary completion journal',
   await f.event(0, 'turn/start', {}, 'subagent'); await f.event(1, 'tool/call', {}, 'subagent'); await f.event(2, 'step/end', {}, 'subagent');
   const page = await f.feed.page(f.device.deviceId, f.head);
   assert.equal(page.resetRequired, false); assert.equal(page.coverage, 'ready'); assert.equal(page.items[0]?.kind, 'answer-finished');
+});
+
+test('reconciliation does not consume the terminal arriving during its cold read', async t => {
+  const f = await fixture(t); f.listed([{ id: 'chat', workspaceId: 'alpha', running: true }]);
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  // Restart installs the timer under the test clock.
+  await f.feed.close(); const feed = new NotificationFeed(f.state, f.source); t.after(() => feed.close()); await feed.start();
+  const head = (await feed.page(f.device.deviceId)).nextCursor;
+  let entered!: () => void, release!: () => void;
+  const reading = new Promise<void>(r => { entered = r; }); const held = new Promise<void>(r => { release = r; });
+  f.source.evidence = async () => { entered(); await held; return structuredClone(f.proof); };
+  t.mock.timers.tick(60000); await reading;
+  f.proof.completed = [{ turn: 1, sourceSeq: 0 }]; const terminal = f.event(0, 'turn/end', { turn: 1, completed: true });
+  release(); await terminal; await feed.idle();
+  const page = await feed.page(f.device.deviceId, head);
+  assert.equal(page.items.filter(e => e.kind === 'answer-finished').length, 1); assert.equal(page.coverage, 'ready');
 });
 
 test('restart baselines history and keeps stable cursor/settings without completion storms', async t => {
