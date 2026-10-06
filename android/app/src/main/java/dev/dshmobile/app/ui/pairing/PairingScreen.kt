@@ -22,6 +22,10 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import android.content.ClipData
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
+import kotlinx.coroutines.launch
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -95,7 +99,7 @@ internal fun PairingScreen(state: MobileState, model: MobileViewModel) {
                 listOf(R.string.mobile_pair_step_one, R.string.mobile_pair_step_two, R.string.mobile_pair_step_three).forEachIndexed { index, text ->
                     val stepLabel = stringResource(R.string.mobile_pair_step_number, index + 1)
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = MaterialTheme.shapes.small, modifier = Modifier.size(32.dp).semantics { contentDescription = stepLabel }) {
+                        Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = MaterialTheme.shapes.small, modifier = Modifier.sizeIn(minWidth = 32.dp, minHeight = 32.dp).padding(4.dp).semantics { contentDescription = stepLabel }) {
                             Box(contentAlignment = Alignment.Center) { Text("${index + 1}", style = MaterialTheme.typography.labelMedium) }
                         }
                         Text(stringResource(text), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
@@ -170,14 +174,34 @@ internal fun PairingScreen(state: MobileState, model: MobileViewModel) {
     }
     trust?.let { review ->
         val preview = review.preview
-        AlertDialog(onDismissRequest = { if (!state.busy) trust = null }, title = { Text(stringResource(R.string.mobile_trust_title)) }, text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        androidx.compose.ui.window.Dialog(onDismissRequest = { if (!state.busy) trust = null },
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
+            TrustReviewContent(preview, state.busy, onBack = { trust = null }, onConnect = { trust = null; model.pair(review, defaultName) })
+        }
+    }
+    if (reset) AlertDialog(onDismissRequest = { reset = false }, title = { Text(stringResource(R.string.mobile_forget_title)) }, text = { Text(stringResource(R.string.mobile_forget_confirmation)) },
+        confirmButton = { TextButton(onClick = { reset = false; trust = null; previewError = null; model.forget() }, enabled = !state.busy, modifier = Modifier.testTag("reset_connection_confirm")) { Text(stringResource(R.string.mobile_reset_connection)) } },
+        dismissButton = { TextButton(onClick = { reset = false }) { Text(stringResource(R.string.mobile_back)) } })
+}
+
+/** Review is memory-only. A bounded scroll keeps identity and both actions reachable at 2x/landscape. */
+@Composable
+internal fun TrustReviewContent(preview: TrustPreview, busy: Boolean, onBack: () -> Unit, onConnect: () -> Unit) {
+    Surface(Modifier.fillMaxSize().safeDrawingPadding(), color = MaterialTheme.colorScheme.background) {
+        Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+            TextButton(onClick = onBack, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp).testTag("trust_back")) {
+                Icon(MobileIcons.Back, null)
+                Spacer(Modifier.width(8.dp))
+                Text(stringResource(R.string.mobile_back))
+            }
+            Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(stringResource(R.string.mobile_trust_title), style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
                 Text(stringResource(R.string.mobile_trust_intro))
                 IdentityBlock(stringResource(R.string.mobile_invitation_host), URI(preview.endpoint).host.orEmpty())
                 Text(stringResource(R.string.mobile_host_name_before_pair), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 IdentityBlock(stringResource(R.string.mobile_endpoint), preview.endpoint)
                 if (preview.debugHttp) Text(stringResource(R.string.mobile_debug_http), color = MaterialTheme.colorScheme.error)
-                else IdentityBlock(stringResource(R.string.mobile_host_fingerprint), preview.pin)
+                else FingerprintBlock(preview.pin)
                 preview.relayOrigin?.let { origin ->
                     Text(stringResource(R.string.mobile_remote_mode), style = MaterialTheme.typography.titleSmall)
                     SelectionContainer { Text(stringResource(R.string.mobile_relay_host, origin), Modifier.testTag("pairing_relay"), fontFamily = FontFamily.Monospace) }
@@ -186,13 +210,31 @@ internal fun PairingScreen(state: MobileState, model: MobileViewModel) {
                 }
                 if (preview.customCertificate) Text(stringResource(R.string.mobile_custom_certificate))
                 Text(stringResource(R.string.mobile_trust_verify))
+                Button(onClick = onConnect, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("pairing_connect")) {
+                    Text(stringResource(R.string.mobile_trust_connect))
+                }
             }
-        }, confirmButton = { TextButton(onClick = { trust = null; model.pair(review, defaultName) }, enabled = !state.busy, modifier = Modifier.testTag("pairing_connect")) { Text(stringResource(R.string.mobile_trust_connect)) } },
-            dismissButton = { TextButton(onClick = { trust = null }, enabled = !state.busy) { Text(stringResource(R.string.mobile_back)) } })
+        }
     }
-    if (reset) AlertDialog(onDismissRequest = { reset = false }, title = { Text(stringResource(R.string.mobile_forget_title)) }, text = { Text(stringResource(R.string.mobile_forget_confirmation)) },
-        confirmButton = { TextButton(onClick = { reset = false; trust = null; previewError = null; model.forget() }, enabled = !state.busy, modifier = Modifier.testTag("reset_connection_confirm")) { Text(stringResource(R.string.mobile_reset_connection)) } },
-        dismissButton = { TextButton(onClick = { reset = false }) { Text(stringResource(R.string.mobile_back)) } })
+}
+
+@Composable
+internal fun FingerprintBlock(pin: String) {
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    val haptic = dev.dshmobile.app.ui.chat.rememberActionHaptic()
+    var copied by remember(pin) { mutableStateOf(false) }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        // Short chunks wrap even on narrow dialogs at 2x; clipboard retains the exact original pin.
+        IdentityBlock(stringResource(R.string.mobile_host_fingerprint), pin.chunked(8).joinToString(" "))
+        OutlinedButton(onClick = { scope.launch {
+            clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("SHA-256", pin)))
+            haptic()
+            copied = true
+        } }, modifier = Modifier.heightIn(min = 48.dp).testTag("copy_fingerprint")) {
+            Text(stringResource(if (copied) R.string.mobile_copied else R.string.mobile_copy_fingerprint))
+        }
+    }
 }
 
 private tailrec fun Context.activity(): Activity? = when (this) {

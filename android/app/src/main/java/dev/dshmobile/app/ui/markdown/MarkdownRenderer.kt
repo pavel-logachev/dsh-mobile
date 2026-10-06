@@ -27,7 +27,7 @@ import kotlinx.coroutines.withContext
 private const val SYNC_PARSE_LIMIT = 8_192
 
 @Composable
-internal fun MarkdownContent(text: String, onCopy: (String) -> Unit, modifier: Modifier = Modifier) {
+internal fun MarkdownContent(text: String, onCopy: (String) -> Unit, modifier: Modifier = Modifier, selectable: Boolean = true) {
     // Short messages parse synchronously (the parser is linear), so the first frame is never empty.
     // Long messages show the last completed result, or plain selectable text on first composition,
     // while a background parse runs; streaming updates cancel obsolete background parses.
@@ -39,32 +39,32 @@ internal fun MarkdownContent(text: String, onCopy: (String) -> Unit, modifier: M
     }
     val document = immediate ?: latest
     if (document == null) {
-        SelectionContainer(modifier.fillMaxWidth()) { Text(text, style = MaterialTheme.typography.bodyLarge) }
+        OptionalSelection(selectable, modifier.fillMaxWidth()) { Text(text, style = MaterialTheme.typography.bodyLarge) }
         return
     }
     Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         document.blocks.forEach { block ->
             when (block) {
-                is MarkdownBlock.Heading -> SelectionContainer {
+                is MarkdownBlock.Heading -> OptionalSelection(selectable) {
                     Text(inlineText(block.text), modifier = Modifier.padding(top = 8.dp).semantics { heading() }, style = when (block.level) {
                         1 -> MaterialTheme.typography.headlineSmall
                         2 -> MaterialTheme.typography.titleLarge
                         else -> MaterialTheme.typography.titleMedium
                     })
                 }
-                is MarkdownBlock.Paragraph -> SelectionContainer { Text(inlineText(block.text), style = MaterialTheme.typography.bodyLarge) }
+                is MarkdownBlock.Paragraph -> OptionalSelection(selectable) { Text(inlineText(block.text), style = MaterialTheme.typography.bodyLarge) }
                 is MarkdownBlock.ListEntry -> Row(Modifier.padding(start = if (block.depth == 1) 20.dp else 0.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(block.marker, Modifier.widthIn(min = 16.dp), style = MaterialTheme.typography.bodyLarge)
-                    SelectionContainer(Modifier.weight(1f)) { Text(inlineText(block.text), style = MaterialTheme.typography.bodyLarge) }
+                    OptionalSelection(selectable, Modifier.weight(1f)) { Text(inlineText(block.text), style = MaterialTheme.typography.bodyLarge) }
                 }
                 is MarkdownBlock.Quote -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Box(Modifier.width(1.dp).heightIn(min = 24.dp).background(MaterialTheme.colorScheme.outline))
-                    SelectionContainer(Modifier.weight(1f)) { Text(inlineText(block.text), style = MaterialTheme.typography.bodyLarge,
+                    OptionalSelection(selectable, Modifier.weight(1f)) { Text(inlineText(block.text), style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant, fontStyle = FontStyle.Italic) }
                 }
                 MarkdownBlock.Rule -> HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                is MarkdownBlock.Code -> CodeBlock(block, onCopy)
-                is MarkdownBlock.Table -> MarkdownTable(block)
+                is MarkdownBlock.Code -> CodeBlock(block, onCopy, selectable)
+                is MarkdownBlock.Table -> MarkdownTable(block, selectable)
             }
         }
         if (document.truncated) Text(stringResource(R.string.mobile_markdown_limit), style = MaterialTheme.typography.bodySmall,
@@ -95,7 +95,7 @@ private fun inlineText(text: String): AnnotatedString {
 }
 
 @Composable
-private fun CodeBlock(block: MarkdownBlock.Code, onCopy: (String) -> Unit) {
+private fun CodeBlock(block: MarkdownBlock.Code, onCopy: (String) -> Unit, selectable: Boolean) {
     Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = MaterialTheme.shapes.medium,
         border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
         Column {
@@ -104,7 +104,7 @@ private fun CodeBlock(block: MarkdownBlock.Code, onCopy: (String) -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 IconButton(onClick = { onCopy(block.copyText) }) { Icon(MobileIcons.Copy, stringResource(R.string.mobile_copy_code), Modifier.size(18.dp)) }
             }
-            SelectionContainer {
+            OptionalSelection(selectable) {
                 Text(block.text, Modifier.horizontalScroll(rememberScrollState()).padding(16.dp),
                     style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace, softWrap = false)
             }
@@ -115,14 +115,14 @@ private fun CodeBlock(block: MarkdownBlock.Code, onCopy: (String) -> Unit) {
 }
 
 @Composable
-private fun MarkdownTable(block: MarkdownBlock.Table) {
+private fun MarkdownTable(block: MarkdownBlock.Table, selectable: Boolean) {
     val widths = remember(block) { block.header.indices.map { column ->
         val chars = (listOf(block.header) + block.rows).maxOf { it.getOrNull(column).orEmpty().length }
         (chars.coerceIn(10, 32) * 8 + 24).dp
     } }
     Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = MaterialTheme.shapes.small,
         border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
-        SelectionContainer {
+        OptionalSelection(selectable) {
             Column(Modifier.horizontalScroll(rememberScrollState())) {
                 (listOf(block.header) + block.rows).forEachIndexed { rowIndex, row ->
                     Row(Modifier.background(if (rowIndex == 0) MaterialTheme.colorScheme.surfaceContainerHigh else MaterialTheme.colorScheme.surfaceContainer)) {
@@ -136,4 +136,9 @@ private fun MarkdownTable(block: MarkdownBlock.Table) {
             }
         }
     }
+}
+
+@Composable
+private fun OptionalSelection(enabled: Boolean, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    if (enabled) SelectionContainer(modifier, content = content) else Box(modifier) { content() }
 }

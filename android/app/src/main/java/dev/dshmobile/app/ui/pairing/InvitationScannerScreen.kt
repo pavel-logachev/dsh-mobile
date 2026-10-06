@@ -13,8 +13,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -41,7 +39,6 @@ internal fun InvitationScannerScreen(onBack: () -> Unit, onResult: (InvitationSc
     var flash by remember(context, owner, preview) { mutableStateOf(false) }
     var torch by remember(context, owner, preview) { mutableStateOf(false) }
     val currentResult by rememberUpdatedState(onResult)
-    val accents = dev.dshmobile.app.ui.theme.LocalMobileColors.current
     val session = remember(context, owner, preview) { CameraQrSession(context, owner, preview,
         onReady = { hasFlash -> ready = true; flash = hasFlash }, onTorch = { torch = it }, onResult = { currentResult(it) }) }
     DisposableEffect(session) {
@@ -50,26 +47,37 @@ internal fun InvitationScannerScreen(onBack: () -> Unit, onResult: (InvitationSc
     }
     val back = { session.close(); onBack() }
     BackHandler(onBack = back)
+    ScannerSurface(ready, flash, torch, back, { session.torch(!torch) }, { AndroidView(factory = { preview }, modifier = Modifier.fillMaxSize()) })
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun ScannerSurface(ready: Boolean, flash: Boolean, torch: Boolean, onBack: () -> Unit, onTorch: () -> Unit,
+    preview: @Composable () -> Unit) {
     Scaffold(containerColor = MaterialTheme.colorScheme.background, modifier = Modifier.testTag("pairing_scanner"), topBar = {
         TopAppBar(title = { Text(stringResource(R.string.mobile_scan_title), style = MaterialTheme.typography.titleMedium) },
-            navigationIcon = { IconButton(onClick = back, modifier = Modifier.testTag("pairing_scan_back")) {
+            navigationIcon = { IconButton(onClick = onBack, modifier = Modifier.testTag("pairing_scan_back")) {
                 Icon(MobileIcons.Back, stringResource(R.string.mobile_back))
             } }, colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background))
     }) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).verticalScroll(rememberScrollState()).padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Text(stringResource(R.string.mobile_scan_instructions), style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        ScannerContent(ready, flash, torch, onTorch, preview,
+            Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding))
+    }
+}
+
+/** Camera ownership stays above; constraints and scroll state belong to this previewable surface. */
+@Composable
+internal fun ScannerContent(ready: Boolean, flash: Boolean, torch: Boolean, onTorch: () -> Unit,
+    preview: @Composable () -> Unit, modifier: Modifier = Modifier) {
+    val accents = dev.dshmobile.app.ui.theme.LocalMobileColors.current
+    BoxWithConstraints(modifier.padding(20.dp)) {
+        val landscape = maxWidth > maxHeight
+        val side = if (landscape) minOf(maxWidth * 0.45f, maxHeight) else minOf(maxWidth, 320.dp)
+        val frame: @Composable () -> Unit = {
             val description = stringResource(R.string.mobile_scan_viewfinder)
-            // Square viewfinder sized by the shorter window side so landscape keeps the hint and controls visible.
-            val window = LocalWindowInfo.current.containerSize
-            val density = LocalDensity.current
-            val side = with(density) { minOf(window.width.toDp() - 40.dp, window.height.toDp() * 0.55f).coerceAtLeast(160.dp) }
-            Box(Modifier.align(Alignment.CenterHorizontally).size(side)
-                .clip(RoundedCornerShape(16.dp)).semantics { contentDescription = description },
-                contentAlignment = Alignment.Center) {
-                AndroidView(factory = { preview }, modifier = Modifier.fillMaxSize())
-                // The high-contrast frame is an aiming aid; the decoder still sees the full frame.
+            Box(Modifier.size(side).clip(RoundedCornerShape(16.dp)).testTag("pairing_scan_frame")
+                .semantics { contentDescription = description }, contentAlignment = Alignment.Center) {
+                preview()
                 Canvas(Modifier.fillMaxSize()) {
                     val side = size.minDimension * 0.78f
                     val left = (size.width - side) / 2
@@ -85,17 +93,25 @@ internal fun InvitationScannerScreen(onBack: () -> Unit, onResult: (InvitationSc
                         }
                     }
                 }
-                if (!ready) Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = MaterialTheme.shapes.medium) {
-                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        CircularProgressIndicator(Modifier.size(24.dp))
-                        Text(stringResource(R.string.mobile_scan_loading), style = MaterialTheme.typography.bodyMedium)
-                    }
-                }
             }
-            if (flash) OutlinedButton(onClick = { session.torch(!torch) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("pairing_scan_torch")) {
+        }
+        val hints: @Composable () -> Unit = {
+            Text(stringResource(R.string.mobile_scan_instructions), style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (!ready) {
+                CircularProgressIndicator(Modifier.size(24.dp))
+                Text(stringResource(R.string.mobile_scan_loading), style = MaterialTheme.typography.bodyMedium)
+            }
+            if (flash) OutlinedButton(onClick = onTorch, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("pairing_scan_torch")) {
                 Text(stringResource(if (torch) R.string.mobile_scan_torch_off else R.string.mobile_scan_torch_on))
             }
-            Text(stringResource(R.string.mobile_scan_hint), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(stringResource(R.string.mobile_scan_hint), Modifier.testTag("pairing_scan_hint"),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
+        if (landscape) Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+            frame()
+            Column(Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) { hints() }
+        } else Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)) { frame(); hints() }
     }
 }
