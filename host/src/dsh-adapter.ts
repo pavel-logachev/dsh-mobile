@@ -15,7 +15,9 @@ const MAX_HISTORY_PAGES = 16;
 const MAX_HISTORY_BYTES = 16 * 1024 * 1024;
 const MAX_HISTORY_CACHE_ENTRIES = 16;
 const MAX_HISTORY_CACHE_BYTES = 32 * 1024 * 1024;
-interface HistoryFlight { controller: AbortController; promise: Promise<void>; waiters: number; view: readonly WorkspaceConfig[] }
+const MAX_HISTORY_WAITERS = 64;
+type HistoryWaiter = (error?: { reason: unknown }) => void;
+interface HistoryFlight { controller: AbortController; waiters: Set<HistoryWaiter>; view: readonly WorkspaceConfig[] }
 interface HistoryCacheEntry {
   view: readonly WorkspaceConfig[]; scope: string; firstSeq: number; throughSeq: number;
   json: string; bytes: number; hasMore: boolean; pages: number; exhausted: boolean;
@@ -388,6 +390,11 @@ export class DshAdapter implements HostAdapter {
     const entry = this.history.get(id);
     if (entry) { this.historyBytes -= entry.bytes; this.history.delete(id); }
   }
+  private detachHistory(id: string, flight: HistoryFlight): void {
+    if (this.historyFlights.get(id) === flight) this.historyFlights.delete(id);
+    flight.controller.abort(); // Late upstream settlement cannot admit cache or remove a replacement flight.
+    for (const waiter of [...flight.waiters]) waiter({ reason: flight.controller.signal.reason });
+  }
   private cacheHistory(id: string, entry: HistoryCacheEntry): void {
     this.evictHistory(id);
     while (this.history.size >= MAX_HISTORY_CACHE_ENTRIES || this.historyBytes + entry.bytes > MAX_HISTORY_CACHE_BYTES) this.evictHistory(this.history.keys().next().value!);
@@ -395,7 +402,7 @@ export class DshAdapter implements HostAdapter {
   }
   constructor(options: DshAdapterOptions, source: WorkspaceSource) {
     this.options = options; this.source = source; this.upstreamVersion = options.dshVersion;
-    this.disposeHistory = options.events?.subscribeDisposed?.(id => { this.evidenceRevision++; this.evictHistory(id); this.historyFlights.get(id)?.controller.abort(); });
+    this.disposeHistory = options.events?.subscribeDisposed?.(id => { this.evidenceRevision++; this.evictHistory(id); const flight = this.historyFlights.get(id); if (flight) this.detachHistory(id, flight); });
   }
   notifications(): NotificationSources | undefined {
     const subscribe = this.options.events?.subscribeNotifications;
@@ -408,18 +415,22 @@ export class DshAdapter implements HostAdapter {
       return !!binding && !this.lifetime.signal.aborted && binding.revision === this.evidenceRevision && (!this.source.isCurrent || this.source.isCurrent(binding.view)) && JSON.stringify(binding.view) === this.historyScope && !this.source.archivedSessionIds().has(proof.sessionId);
     } };
   }
-  dispose(): void { this.lifetime.abort(); this.disposeHistory?.(); this.history.clear(); this.historyBytes = 0; }
+  dispose(): void {
+    this.lifetime.abort(); this.disposeHistory?.();
+    for (const [id, flight] of this.historyFlights) this.detachHistory(id, flight);
+    this.history.clear(); this.historyBytes = 0;
+  }
   private signal(signal: AbortSignal): AbortSignal { return AbortSignal.any([signal, this.lifetime.signal]); }
   private async workspaceMap(): Promise<{ workspaces: ReadonlyMap<string, CanonicalWorkspace>; view: readonly WorkspaceConfig[] }> {
     const view = await this.source.list();
     const signature = JSON.stringify(view);
     if (signature !== this.historyScope) {
       this.history.clear(); this.historyBytes = 0; this.historyScope = signature; this.evidenceRevision++;
-      for (const flight of this.historyFlights.values()) flight.controller.abort();
+      for (const [id, flight] of this.historyFlights) this.detachHistory(id, flight);
     }
     const archived = this.source.archivedSessionIds();
     for (const [id, entry] of this.history) if ((this.source.isCurrent && !this.source.isCurrent(entry.view)) || archived.has(id)) this.evictHistory(id);
-    for (const [id, flight] of this.historyFlights) if ((this.source.isCurrent && !this.source.isCurrent(flight.view)) || archived.has(id)) flight.controller.abort();
+    for (const [id, flight] of this.historyFlights) if ((this.source.isCurrent && !this.source.isCurrent(flight.view)) || archived.has(id)) this.detachHistory(id, flight);
     return { view, workspaces: new Map(view.map(item => [workspacePathKey(item.path), { ...item, key: workspacePathKey(item.path) }])) };
   }
   private checkCurrent(view: readonly WorkspaceConfig[], sessionId?: string): void {
@@ -484,7 +495,7 @@ export class DshAdapter implements HostAdapter {
     this.checkCurrent(view);
     const visible = new Set(sessions.map(session => session.id));
     for (const id of this.history.keys()) if (!visible.has(id)) this.evictHistory(id);
-    for (const [id, flight] of this.historyFlights) if (!visible.has(id)) flight.controller.abort();
+    for (const [id, flight] of this.historyFlights) if (!visible.has(id)) this.detachHistory(id, flight);
     return sessions.sort((a, b) => b.updatedAt - a.updatedAt);
   }
   async snapshot(sessionId: string, signal: AbortSignal): Promise<HostSnapshot> {
@@ -527,26 +538,44 @@ export class DshAdapter implements HostAdapter {
     active.throwIfAborted(); this.checkCurrent(view, sessionId);
     return { transcript, view };
   }
-  private async joinHistory(flight: HistoryFlight, active: AbortSignal): Promise<void> {
-    active.throwIfAborted(); flight.waiters++;
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const aborted = () => reject(active.reason);
-        active.addEventListener('abort', aborted, { once: true });
-        void flight.promise.then(resolve, reject).finally(() => active.removeEventListener('abort', aborted));
-      });
-    } finally { if (--flight.waiters === 0) flight.controller.abort(); }
+  private joinHistory(id: string, flight: HistoryFlight, active: AbortSignal): Promise<void> {
+    active.throwIfAborted();
+    if (flight.controller.signal.aborted || this.historyFlights.get(id) !== flight) throw new HostError('unavailable');
+    if (flight.waiters.size >= MAX_HISTORY_WAITERS) throw new HostError('unavailable');
+    return new Promise<void>((resolve, reject) => {
+      const finish: HistoryWaiter = error => {
+        if (!flight.waiters.delete(finish)) return;
+        active.removeEventListener('abort', aborted);
+        if (error) reject(error.reason); else resolve();
+        if (flight.waiters.size === 0 && this.historyFlights.get(id) === flight) this.detachHistory(id, flight);
+      };
+      const aborted = () => finish({ reason: active.reason });
+      flight.waiters.add(finish);
+      active.addEventListener('abort', aborted, { once: true });
+    });
   }
   private async recoverShared(session: HostSession, frame: Record<string, unknown>, view: readonly WorkspaceConfig[], active: AbortSignal): Promise<Transcript> {
     // Callers keep their own opening/projections. Only immutable ancestry work is shared.
-    while (this.historyFlights.has(session.id)) { await this.joinHistory(this.historyFlights.get(session.id)!, active); active.throwIfAborted(); this.checkCurrent(view, session.id); }
+    for (;;) {
+      const current = this.historyFlights.get(session.id);
+      if (!current) break;
+      if (current.controller.signal.aborted) { this.detachHistory(session.id, current); continue; }
+      await this.joinHistory(session.id, current, active); active.throwIfAborted(); this.checkCurrent(view, session.id);
+    }
     active.throwIfAborted(); this.checkCurrent(view, session.id);
     if (this.historyFlights.size >= MAX_HISTORY_CACHE_ENTRIES) throw new HostError('unavailable');
-    const flight: HistoryFlight = { controller: new AbortController(), promise: Promise.resolve(), waiters: 0, view };
+    const flight: HistoryFlight = { controller: new AbortController(), waiters: new Set(), view };
     this.historyFlights.set(session.id, flight);
+    const waiting = this.joinHistory(session.id, flight, active);
     let transcript!: Transcript;
-    flight.promise = this.recoverHistory(session, frame, view, this.signal(flight.controller.signal)).then(value => { transcript = value; }).finally(() => { if (this.historyFlights.get(session.id) === flight) this.historyFlights.delete(session.id); });
-    await this.joinHistory(flight, active);
+    const finish = (error?: { reason: unknown }) => {
+      if (this.historyFlights.get(session.id) !== flight) return;
+      this.historyFlights.delete(session.id);
+      for (const waiter of [...flight.waiters]) waiter(error);
+    };
+    // One completion handler per flight, not per waiter; aborted waiters release registrations immediately.
+    void this.recoverHistory(session, frame, view, this.signal(flight.controller.signal)).then(value => { transcript = value; finish(); }, reason => finish({ reason }));
+    await waiting;
     return transcript;
   }
   private async recoverHistory(session: HostSession, frame: Record<string, unknown>, view: readonly WorkspaceConfig[], active: AbortSignal): Promise<Transcript> {
@@ -559,7 +588,8 @@ export class DshAdapter implements HostAdapter {
     let exhausted = false;
     const scope = JSON.stringify([session.workspaceId, object(frame.header)?.cwd, view]);
     const cached = this.history.get(sessionId);
-    if (cached && cached.scope === scope && cached.throughSeq <= transcript.cursor) {
+    // Exhaustion is proved only for the exact cut and recovery budget attempted.
+    if (cached && cached.scope === scope && cached.throughSeq <= transcript.cursor && (!cached.exhausted || cached.throughSeq === transcript.cursor)) {
       const prefix = JSON.parse(cached.json) as unknown[];
       const firstSeq = wireEvent(object(records[0])?.event).seq;
       // Immutable raw-log overlap validates both the scope binding and the cut.
@@ -573,7 +603,7 @@ export class DshAdapter implements HostAdapter {
           records = combined; bytes = combinedBytes; hasMore = cached.hasMore; pages = cached.pages; exhausted = cached.exhausted;
           transcript = new Transcript(session); transcript.open({ ...frame, records, hasMore });
           this.history.delete(sessionId); this.history.set(sessionId, cached);
-        } else exhausted = true; // Reusing this prefix would exceed retention; no futile full reread.
+        } else this.evictHistory(sessionId); // An oversized candidate says nothing about recovery from this smaller opening.
       } else this.evictHistory(sessionId);
     } else if (cached) this.evictHistory(sessionId);
     while (transcript.needsHistory && !exhausted && hasMore && pages < MAX_HISTORY_PAGES && bytes <= MAX_HISTORY_BYTES) {

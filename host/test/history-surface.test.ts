@@ -133,7 +133,9 @@ test('cancelling one recovery waiter does not cancel another reader of the same 
   h.controller.follow = async function* (request, signal) { try { yield* follow(request, signal); } finally { if (h.cleanup().closed === 2) opened(); } };
   const first = new AbortController(), other = new AbortController();
   const abandoned = h.adapter.snapshot('synthetic-session', first.signal), wanted = h.adapter.snapshot('synthetic-session', other.signal);
-  await reading; await openings; first.abort();
+  await reading; await openings;
+  await new Promise<void>(resolve => setImmediate(resolve)); // Cold iterator cleanup must finish before the second recovery join.
+  first.abort();
   await assert.rejects(abandoned, { name: 'AbortError' }); release();
   assert.equal((await wanted).messages.length, 64); assert.equal(h.reads.length, 3);
 });
@@ -159,6 +161,46 @@ for (const budget of ['entries', 'bytes'] as const) test(`recovery cache evicts 
   } finally { adapter.dispose(); }
 });
 
+test('an eleven MiB cached prefix falls back to a recoverable six MiB opening instead of exhausting it', async t => {
+  const records: HistoryRecord[] = Array.from({ length: 200 }, (_, seq) => ({ type: 'event', event: { seq, time: 1700000000000 + seq, type: 'user/message', surfaceOp: 'append', data: { id: `message-${seq}`, content: [{ type: 'text', text: seq === 5 ? 'x'.repeat(11 * 1024 * 1024) : 'Synthetic' }] } } }));
+  records.push({ type: 'event', event: { seq: 200, time: 1700000000200, type: 'user/message', surfaceOp: { op: 'replace', startSeq: 50, endSeq: 50 }, data: { id: 'message-200', content: [{ type: 'text', text: 'Synthetic' }] } } });
+  const h = await recovered(t, records, 100), follow = h.controller.follow;
+  h.controller.follow = async function* (request, signal) {
+    for await (const frame of follow(request, signal)) yield { ...frame, ...historyPage(records, frame.cursor, frame.cursor + 1, 100) };
+  };
+  assert.equal((await h.adapter.snapshot('synthetic-session', new AbortController().signal)).messages.length, 100);
+  assert.equal(h.reads.length, 1);
+  for (let seq = 201; seq <= 206; seq++) records.push({ type: 'event', event: { seq, time: 1700000000000 + seq, type: 'user/message', surfaceOp: 'append', data: { id: `message-${seq}`, content: [{ type: 'text', text: 'Synthetic' }] } } });
+  records.push({ type: 'event', event: { seq: 207, time: 1700000000207, type: 'system/message', surfaceOp: 'append', data: { text: 'y'.repeat(6 * 1024 * 1024) } } },
+    { type: 'event', event: { seq: 208, time: 1700000000208, type: 'user/message', surfaceOp: { op: 'replace', startSeq: 100, endSeq: 100 }, data: { id: 'message-208', content: [{ type: 'text', text: 'Synthetic' }] } } });
+  const expected = [...Array.from({ length: 94 }, (_, n) => `message-${106 + n}`), ...Array.from({ length: 6 }, (_, n) => `message-${201 + n}`)];
+  const fresh = await createDshAdapter({ dshVersion: '0.2.0-rc.2', sessionController: h.controller, workspaces: [{ id: 'synthetic-workspace', path: h.dir, name: 'Synthetic' }] });
+  try { assert.deepEqual((await fresh.snapshot('synthetic-session', new AbortController().signal)).messages.map(m => m.id), expected); }
+  finally { fresh.dispose(); }
+  assert.equal(h.reads.length, 2, 'the identical fresh cut recovers in one message-aligned page');
+  const warm = await h.adapter.snapshot('synthetic-session', new AbortController().signal);
+  assert.deepEqual(warm.messages.map(m => m.id), expected, 'a failed cache merge is not proof of an exhausted recovery');
+  assert.equal(warm.notice, undefined); assert.equal(h.reads.length, 3, 'discard the oversized candidate and attempt one backward page');
+  assert.deepEqual((await h.adapter.snapshot('synthetic-session', new AbortController().signal)).messages.map(m => m.id), expected);
+  assert.equal(h.reads.length, 3, 'the now-healthy cut is reused without additional reads');
+});
+
+test('a byte-exhausted cut is retried when newer paging drops its oversized dependency', async t => {
+  const records: HistoryRecord[] = Array.from({ length: 302 }, (_, seq) => ({ type: 'event', event: { seq, time: 1700000000000 + seq, type: 'user/message', surfaceOp: 'append', data: { id: `message-${seq}`, content: [{ type: 'text', text: 'Synthetic' }] } } }));
+  records[199]!.event.data = { id: 'message-199', content: [{ type: 'text', text: 'x'.repeat(16 * 1024 * 1024) }] };
+  records[301]!.event.surfaceOp = { op: 'replace', startSeq: 200, endSeq: 200 };
+  const h = await recovered(t, records, 201), follow = h.controller.follow;
+  h.controller.follow = async function* (request, signal) { for await (const frame of follow(request, signal)) yield { ...frame, ...historyPage(records, frame.cursor, frame.cursor + 1, 100) }; };
+  assert.deepEqual((await h.adapter.snapshot('synthetic-session', new AbortController().signal)).messages, []);
+  assert.equal(h.reads.length, 1);
+  await h.adapter.snapshot('synthetic-session', new AbortController().signal); assert.equal(h.reads.length, 1, 'unchanged genuinely exhausted cut does not retry');
+  for (let seq = 302; seq <= 400; seq++) records.push({ type: 'event', event: { seq, time: 1700000000000 + seq, type: 'user/message', surfaceOp: 'append', data: { id: `message-${seq}`, content: [{ type: 'text', text: 'Synthetic' }] } } });
+  records.push({ type: 'event', event: { seq: 401, time: 1700000000401, type: 'user/message', surfaceOp: { op: 'replace', startSeq: 300, endSeq: 300 }, data: { id: 'message-401', content: [{ type: 'text', text: 'Synthetic' }] } } });
+  const warm = await h.adapter.snapshot('synthetic-session', new AbortController().signal);
+  assert.deepEqual(warm.messages.map(m => m.id), ['message-401', ...Array.from({ length: 99 }, (_, n) => `message-${302 + n}`)]);
+  assert.equal(warm.notice, undefined); assert.equal(h.reads.length, 2, 'exhaustion is evidence about the old attempted cut, not the newer cut');
+});
+
 test('removing a listed session evicts ancestry and cancelling the last waiter releases recovery', async t => {
   const fixture = historyCases[2]!, h = await recovered(t, historyRecords(fixture), fixture.firstSeq);
   await h.adapter.snapshot('synthetic-session', new AbortController().signal);
@@ -174,6 +216,105 @@ test('removing a listed session evicts ancestry and cancelling the last waiter r
   await reading; active.abort(); await assert.rejects(opening, { name: 'AbortError' }); await stopped;
   h.controller.page = page;
   await h.adapter.snapshot('synthetic-session', new AbortController().signal); assert.equal(h.reads.length, 9, 'cancelled cut was not cached');
+});
+
+test('an upstream page that never settles after the last waiter aborts cannot block a new opening', { timeout: 4000 }, async t => {
+  const fixture = historyCases[2]!, h = await recovered(t, historyRecords(fixture), fixture.firstSeq);
+  let entered!: () => void, pendingSignal!: AbortSignal, pages = 0;
+  const reading = new Promise<void>(resolve => { entered = resolve; }), page = h.controller.page;
+  h.controller.page = async (request, signal) => {
+    if (++pages === 1) { pendingSignal = signal; entered(); return await new Promise<never>(() => {}); }
+    return await page(request, signal);
+  };
+  const abandoned = new AbortController(), opening = h.adapter.snapshot('synthetic-session', abandoned.signal);
+  await reading; abandoned.abort(); await assert.rejects(opening, { name: 'AbortError' });
+  assert.equal(pendingSignal.aborted, true);
+  const snapshot = await h.adapter.snapshot('synthetic-session', AbortSignal.timeout(1500));
+  assert.equal(snapshot.messages.length, 64, 'a later reader must start fresh rather than join the dead flight');
+  assert.equal(h.reads.length, 3); assert.equal(pages, 4);
+});
+
+test('late settlement of an abandoned page cannot replace or delete a fresh same-session recovery', { timeout: 4000 }, async t => {
+  const fixture = historyCases[2]!, h = await recovered(t, historyRecords(fixture), fixture.firstSeq);
+  let enteredOld!: () => void, enteredNew!: () => void, settleOld!: () => void, releaseNew!: () => void, pages = 0;
+  const oldReading = new Promise<void>(resolve => { enteredOld = resolve; }), newReading = new Promise<void>(resolve => { enteredNew = resolve; });
+  const oldHeld = new Promise<void>(resolve => { settleOld = resolve; }), newHeld = new Promise<void>(resolve => { releaseNew = resolve; }), page = h.controller.page;
+  h.controller.page = async (request, signal) => {
+    const value = await page(request, signal);
+    if (++pages === 1) { enteredOld(); await oldHeld; }
+    else if (pages === 2) { enteredNew(); await newHeld; }
+    return value; // Deliberately ignores an abort until the upstream operation settles.
+  };
+  const cancelled = new AbortController(), abandoned = h.adapter.snapshot('synthetic-session', cancelled.signal);
+  await oldReading; cancelled.abort(); await assert.rejects(abandoned, { name: 'AbortError' });
+  const wanted = h.adapter.snapshot('synthetic-session', AbortSignal.timeout(2000));
+  try {
+    await newReading; settleOld(); await new Promise<void>(resolve => setImmediate(resolve));
+    const other = h.adapter.snapshot('synthetic-session', AbortSignal.timeout(2000));
+    await new Promise<void>(resolve => setImmediate(resolve)); releaseNew();
+    const snapshots = await Promise.all([wanted, other]);
+    assert.ok(snapshots.every(snapshot => snapshot.messages.length === 64));
+    assert.equal(h.reads.length, 4, 'only the abandoned first page plus one shared three-page recovery');
+    await h.adapter.snapshot('synthetic-session', new AbortController().signal); assert.equal(h.reads.length, 4, 'late work did not publish a stale cache entry');
+  } finally { settleOld(); releaseNew(); }
+});
+
+for (const cancelBy of ['last waiter', 'lifecycle', 'scope', 'membership'] as const) test(`${cancelBy} abandons sixteen pending flights without retaining recovery admission slots`, { timeout: 5000 }, async t => {
+  const records: HistoryRecord[] = [
+    { type: 'event', event: { seq: 0, time: 1700000000000, type: 'system/message', surfaceOp: 'append', data: {} } },
+    { type: 'event', event: { seq: 1, time: 1700000000001, type: 'user/message', surfaceOp: { op: 'replace', startSeq: 0, endSeq: 0 }, data: { id: 'bounded-message', content: [{ type: 'text', text: 'Synthetic' }] } } },
+  ];
+  const h = await recovered(t, records, 1);
+  let rows = Array.from({ length: 17 }, (_, n) => ({ sessionId: `abandoned-${n}`, cwd: h.dir, updatedAt: 1700000000000, running: false, agentAvailable: false }));
+  let entered!: () => void, disposed: (id: string) => void = () => {}, pages = 0;
+  const pending = new Promise<void>(resolve => { entered = resolve; }), signals: AbortSignal[] = [];
+  const scope = { id: 'synthetic-workspace', path: h.dir, name: 'Synthetic' };
+  const controller = { ...h.controller, async list() { return { items: rows }; }, async *follow(request: { address: { sessionId: string } }, signal: AbortSignal) { for await (const frame of h.controller.follow(request, signal)) yield { ...frame, header: { ...frame.header, id: request.address.sessionId } }; }, async page(_request: unknown, signal: AbortSignal) { if (++pages <= 16) { signals.push(signal); if (pages === 16) entered(); return await new Promise<never>(() => {}); } signal.throwIfAborted(); return { records: [records[0]], hasMore: false }; } };
+  const source = { kind: 'explicit' as const, async list() { return [{ ...scope }]; }, archivedSessionIds() { return new Set<string>(); } };
+  const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', sessionController: controller, workspaceSource: source, events: { subscribe() { return () => {}; }, subscribeDisposed(listener) { disposed = listener; return () => {}; } } });
+  const cancellations = rows.slice(0, 16).map(() => new AbortController());
+  const openings = rows.slice(0, 16).map((row, n) => adapter.snapshot(row.sessionId, cancellations[n]!.signal));
+  const rejected = openings.map(opening => assert.rejects(opening, { name: 'AbortError' }));
+  try {
+    await pending;
+    if (cancelBy === 'last waiter') cancellations.forEach(cancel => cancel.abort());
+    else if (cancelBy === 'lifecycle') rows.slice(0, 16).forEach(row => disposed(row.sessionId));
+    else { if (cancelBy === 'scope') scope.name = 'Changed'; else rows = rows.slice(16); await adapter.listSessions(new AbortController().signal); }
+    await Promise.all(rejected); assert.ok(signals.every(signal => signal.aborted));
+    const snapshot = await adapter.snapshot(rows.at(-1)!.sessionId, AbortSignal.timeout(1500));
+    assert.equal(snapshot.messages.length, 1); assert.equal(pages, 17, 'abandoned flights no longer count toward the sixteen-session cap');
+  } finally { cancellations.forEach(cancel => cancel.abort()); adapter.dispose(); }
+});
+
+test('adapter disposal releases all recovery waiters even while upstream never settles', { timeout: 3000 }, async t => {
+  const fixture = historyCases[2]!, h = await recovered(t, historyRecords(fixture), fixture.firstSeq);
+  let entered!: () => void, pendingSignal!: AbortSignal;
+  const pending = new Promise<void>(resolve => { entered = resolve; });
+  h.controller.page = async (_request, signal) => { pendingSignal = signal; entered(); return await new Promise<never>(() => {}); };
+  const first = h.adapter.snapshot('synthetic-session', new AbortController().signal), second = h.adapter.snapshot('synthetic-session', new AbortController().signal);
+  const rejected = [assert.rejects(first, { name: 'AbortError' }), assert.rejects(second, { name: 'AbortError' })];
+  await pending; await new Promise<void>(resolve => setImmediate(resolve)); h.adapter.dispose();
+  await Promise.all(rejected); assert.equal(pendingSignal.aborted, true);
+  await assert.rejects(h.adapter.snapshot('synthetic-session', new AbortController().signal), { name: 'AbortError' });
+});
+
+test('recovery admits at most sixty-four waiters and immediately reuses an aborted registration', { timeout: 6000 }, async t => {
+  const fixture = historyCases[2]!, h = await recovered(t, historyRecords(fixture), fixture.firstSeq);
+  let entered!: () => void, release!: () => void;
+  const reading = new Promise<void>(resolve => { entered = resolve; }), held = new Promise<void>(resolve => { release = resolve; }), page = h.controller.page;
+  h.controller.page = async (request, signal) => { const value = await page(request, signal); if (request.beforeSeq === fixture.firstSeq) { entered(); await held; } return value; };
+  const cancelled = new AbortController(), first = h.adapter.snapshot('synthetic-session', cancelled.signal);
+  await reading;
+  const admitted = Array.from({ length: 63 }, () => h.adapter.snapshot('synthetic-session', AbortSignal.timeout(3000)));
+  await new Promise<void>(resolve => setImmediate(resolve));
+  try {
+    await assert.rejects(h.adapter.snapshot('synthetic-session', AbortSignal.timeout(1000)), { code: 'unavailable' });
+    cancelled.abort(); await assert.rejects(first, { name: 'AbortError' });
+    admitted.push(h.adapter.snapshot('synthetic-session', AbortSignal.timeout(3000)));
+    await new Promise<void>(resolve => setImmediate(resolve)); release();
+    assert.ok((await Promise.all(admitted)).every(snapshot => snapshot.messages.length === 64));
+    assert.equal(h.reads.length, 3, 'waiter admission/abort must not duplicate or cancel the shared recovery');
+  } finally { cancelled.abort(); release(); }
 });
 
 test('oversized stream/title metadata cannot bypass opening retention admission', async t => {
