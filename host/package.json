@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-host",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Native mobile companion host plugin for an existing DeepSeek Harness runtime",
   "private": true,
   "type": "module",

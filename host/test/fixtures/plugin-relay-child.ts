@@ -13,7 +13,7 @@ const state = new RelayState(join(root, 'relay.sqlite'));
 const relay = createRelayServer({ state, port: 0, tls: { cert: readFileSync(join(root, 'outer.pem'), 'utf8'), key: readFileSync(join(root, 'outer.key'), 'utf8') } });
 const url = (await relay.start()).baseUrl;
 let lists = 0, presets = 0, mutations = 0;
-const controller = { async list() { lists++; return { items: [] }; }, async *follow() {}, async projections() { return {}; }, async create() { mutations++; return { sessionId: 'none' }; }, async prompt() { mutations++; }, cancel() { mutations++; } };
+const controller = { async list() { lists++; return { items: [] }; }, async *follow() {}, async page() { throw new Error('No history expected'); }, async projections() { return {}; }, async create() { mutations++; return { sessionId: 'none' }; }, async prompt() { mutations++; }, cancel() { mutations++; } };
 const ctx = new Context(); ctx.provide('sessionController', controller); ctx.provide('agentPresets', { async remoteExportList() { presets++; return { presets: [{ id: 'safe', name: 'Harmless preset' }] }; } });
 const config = { hostName: 'Isolated plugin fixture', bind: '127.0.0.1', port, statePath: join(root, 'host.sqlite'), workspaces: [{ id: 'alpha', name: 'Alpha', path: root }], publicUrl: `https://h-${routeId}.dsh.invalid`, tls: { certPath: join(root, 'inner.pem'), keyPath: join(root, 'inner.key') }, relay: { url, routeId, connectorToken } };
 const configPath = join(root, 'private.json'); writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });

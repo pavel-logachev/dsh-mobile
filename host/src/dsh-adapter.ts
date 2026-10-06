@@ -10,6 +10,16 @@ import type { NotificationEvidence, NotificationSource, NotificationSources } fr
 import { isCompatibleDshVersion } from './compatibility.ts';
 export { COMPATIBLE_DSH_VERSIONS } from './compatibility.ts';
 const MAX_MESSAGES = 100;
+// Includes the opening page. page() is message-aligned, so event/byte counts vary.
+const MAX_HISTORY_PAGES = 16;
+const MAX_HISTORY_BYTES = 16 * 1024 * 1024;
+const MAX_HISTORY_CACHE_ENTRIES = 16;
+const MAX_HISTORY_CACHE_BYTES = 32 * 1024 * 1024;
+interface HistoryFlight { controller: AbortController; promise: Promise<void>; waiters: number; view: readonly WorkspaceConfig[] }
+interface HistoryCacheEntry {
+  view: readonly WorkspaceConfig[]; scope: string; firstSeq: number; throughSeq: number;
+  json: string; bytes: number; hasMore: boolean; pages: number; exhausted: boolean;
+}
 const isUuid = (value: string): boolean => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 
 /** Narrow in-process seams, derived from inspected rc.2 declarations, not an RPC proxy. */
@@ -26,6 +36,8 @@ export interface DshSessionSummary {
 export interface DshSessionController {
   list(request: Record<string, never>, signal: AbortSignal): Promise<{ readonly items: readonly DshSessionSummary[] }>;
   follow(request: { address: { kind: 'session'; sessionId: string }; assistantStream: true; maxMessages: number }, signal: AbortSignal): AsyncIterable<unknown>;
+  /** Cold-safe rc.2 backward page, pinned to the corresponding follow cursor. */
+  page(request: { address: { kind: 'session'; sessionId: string }; throughSeq: number; beforeSeq: number; maxMessages: number }, signal: AbortSignal): Promise<unknown>;
   projections(request: { sessionId: string }, signal: AbortSignal): Promise<unknown>;
   create(request: ({ cwd: string; workspaceId?: never } | { workspaceId: string; cwd?: never }) & { sessionId: string; agentPreset?: string }): Promise<{ sessionId: string }>;
   prompt(request: { requestId: string; sessionId: string; mode: 'queue'; content: readonly { type: 'text'; text: string }[] }, signal: AbortSignal): Promise<unknown>;
@@ -39,6 +51,8 @@ export interface DshEvents {
   /** Only this session's data may reach the listener. The disposer must remove all subscriptions. */
   subscribe(sessionId: string, listener: (observation: DshObservation) => void): () => void;
   subscribeNotifications?(listener: (id: string, event: NotificationSource) => void): () => void;
+  /** Inspected session/disposed lifecycle, separate from cold follow cleanup. */
+  subscribeDisposed?(listener: (id: string) => void): () => void;
 }
 export interface DshAdapterOptions {
   /** Explicit operator-declared version, NOT automatically discovered or inferred from method names. */
@@ -76,7 +90,7 @@ const KNOWN_LOG_TYPES = new Set([
 const WAIT_NOTICE = 'A question or approval needs attention in DSH on the desktop. Mobile answers are not supported.';
 const UNKNOWN_NOTICE = 'This DSH history contains an unsupported event. Open the desktop to view the authoritative conversation.';
 const GAP_NOTICE = 'Live observation was interrupted. Refreshing the authoritative DSH snapshot.';
-const HISTORY_CUT_NOTICE = 'This bounded history crosses a DSH surface replacement. Open the desktop to view the authoritative conversation.';
+export const HISTORY_CUT_NOTICE = 'This bounded history crosses a DSH surface replacement. Open the desktop to view the authoritative conversation.';
 
 function object(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -93,6 +107,7 @@ function wireEvent(value: unknown): WireEvent {
   if (!event || typeof event.type !== 'string' || !Number.isSafeInteger(event.seq) || (event.seq as number) < 0 || !Number.isSafeInteger(event.time) || (event.time as number) < 0) throw new HostError('unavailable');
   return event as unknown as WireEvent;
 }
+function boundedTitle(value: string): string { return Buffer.from(value.slice(0, 256), 'utf8').toString('utf8'); }
 function messageOf(event: WireEvent): ChatMessage | undefined {
   const data = object(event.data);
   const message = event.type === 'user/message' ? data : event.type === 'assistant/message' ? object(data?.message) : undefined;
@@ -146,6 +161,8 @@ class Transcript {
   private openProjectedQuestions = false;
   private questionProjectionPresent = false;
   private attentionStopped = false;
+  private activityEstablished = false;
+  private retentionCut = false;
   notificationEvidence(): NotificationEvidence {
     const ambiguous = this.unsupported || this.historyCut || this.gap;
     return { sessionId: this.session.id, workspaceId: this.session.workspaceId, cursor: this.cursor, valid: !ambiguous,
@@ -153,12 +170,17 @@ class Transcript {
       completed: ambiguous ? [] : this.terminals.filter(t => this.nodes.some(n => n.answerTurn === t.turn)) };
   }
   constructor(session: HostSession) { this.session = { ...session }; this.running = session.running; }
-  open(frame: Record<string, unknown>): void {
+  open(frame: Record<string, unknown>, retentionCut = false): void {
     if (!Number.isSafeInteger(frame.cursor) || (frame.cursor as number) < -1 || !Array.isArray(frame.records)) throw new HostError('unavailable');
     this.cursor = frame.cursor as number;
     this.hasMore = frame.hasMore === true;
+    // A complete log starts with no pending turn. An unresolved bounded surface
+    // must still prove a newer control boundary before enabling the composer.
+    this.activityEstablished = !this.hasMore;
+    this.retentionCut = retentionCut;
+    if (retentionCut) { this.historyCut = true; this.hasMore = true; }
     const values = object(object(frame.projections)?.values);
-    if (typeof values?.title === 'string') this.session.title = values.title;
+    if (typeof values?.title === 'string') this.session.title = retentionCut ? boundedTitle(values.title) : values.title;
     this.projectedQuestions = Array.isArray(object(values?.userQuestions)?.active) && (object(values?.userQuestions)!.active as unknown[]).length > 0;
     let previous: number | undefined;
     for (const record of frame.records) {
@@ -176,7 +198,7 @@ class Transcript {
     const baseline = object(frame.assistantStream);
     this.revision = typeof baseline?.revision === 'number' ? baseline.revision : 0;
     const active = object(baseline?.activeAttempt);
-    if (active && typeof active.attemptId === 'string' && Number.isSafeInteger(active.nextIndex)) {
+    if (!retentionCut && active && typeof active.attemptId === 'string' && Number.isSafeInteger(active.nextIndex)) {
       this.attempt = { id: active.attemptId, turn: active.turn as number, step: active.step as number, nextIndex: active.nextIndex as number, createdAt: this.session.updatedAt, blocks: new Map() };
       if (Array.isArray(active.stream)) {
         for (const value of active.stream) {
@@ -199,6 +221,7 @@ class Transcript {
   }
   markGap(): void { this.gap = true; this.attempt = undefined; }
   get needsResync(): boolean { return this.gap; }
+  get needsHistory(): boolean { return this.historyCut && !this.unsupported && !this.gap; }
   accept(observation: DshObservation): void {
     if (observation.type === 'status') {
       this.running = observation.running;
@@ -221,37 +244,47 @@ class Transcript {
       if (event.ignorable !== true) this.unsupported = true;
       return;
     }
-    if (this.unsupported || this.gap || this.historyCut) return;
-    if (!applySurface(this.nodes, event)) { this.historyCut = true; this.attempt = undefined; return; }
+    if (this.unsupported || this.gap) return;
+    if (!this.historyCut && !applySurface(this.nodes, event)) { this.historyCut = true; this.attempt = undefined; }
+    // Surface ancestry is independent of newest control events. Continue folding
+    // turn/approval/question state even when an old replacement exceeds budget.
     const data = object(event.data);
     if (event.type === 'turn/start') {
+      this.activityEstablished = true;
       this.attentionStopped = false; this.approvals.clear(); this.questions.clear(); this.openProjectedQuestions = false;
       this.calls.clear();
       this.turn = Number.isSafeInteger(data?.turn) ? { number: data!.turn as number, startedAt: event.time } : undefined;
     }
     if (event.type === 'turn/end') {
-      if (object(data?.reason)?.kind === 'completed' && Number.isSafeInteger(data?.turn)) this.terminals.push({ turn: data!.turn as number, sourceSeq: event.seq });
+      if (!this.retentionCut && object(data?.reason)?.kind === 'completed' && Number.isSafeInteger(data?.turn)) this.terminals.push({ turn: data!.turn as number, sourceSeq: event.seq });
+      this.activityEstablished = true;
       this.attentionStopped = true; this.approvals.clear(); this.questions.clear(); this.openProjectedQuestions = false;
       this.turn = undefined; this.calls.clear();
     }
     if (event.type === 'tool/call' && this.turn?.number === data?.turn && typeof data?.callId === 'string' && typeof data.name === 'string' && /^[A-Za-z0-9_.:/-]{1,128}$/.test(data.name)) {
-      if (this.calls.size < 1000) this.calls.set(data.callId, data.name);
+      if (this.calls.size < 1000 && (!this.retentionCut || Buffer.byteLength(data.callId) <= 256)) this.calls.set(data.callId, data.name);
       else { this.turn = undefined; this.calls.clear(); } // Never grow unbounded or report an unproven latest call.
     }
     if (event.type === 'tool/result') {
       const message = object(data?.message);
       if (typeof message?.toolCallId === 'string') this.calls.delete(message.toolCallId);
     }
-    if (event.type === 'session/title' && typeof data?.title === 'string') this.session.title = data.title;
+    if (event.type === 'session/title' && typeof data?.title === 'string') this.session.title = this.historyCut ? boundedTitle(data.title) : data.title;
     if (event.type === 'user/message') this.session.updatedAt = Math.max(this.session.updatedAt, event.time);
     if (live && event.type === 'turn/start') this.running = true;
     if (live && event.type === 'turn/end') { this.running = false; this.attempt = undefined; }
     if ((event.type === 'assistant/message' || event.type === 'assistant/attempt') && this.attempt?.turn === data?.turn && this.attempt?.step === data?.step) this.attempt = undefined;
     // Keep the desktop historical notice; notification evidence additionally
     // requires an open turn for the runtime's turn-enclosed approval audit pair.
-    if (event.type === 'approval/asked' && typeof data?.id === 'string') this.approvals.add(data.id);
+    if (event.type === 'approval/asked' && typeof data?.id === 'string') {
+      if (this.retentionCut && (this.approvals.size >= 1000 || Buffer.byteLength(data.id) > 256)) this.unsupported = true;
+      else this.approvals.add(data.id);
+    }
     if (event.type === 'approval/decided' && typeof data?.id === 'string') this.approvals.delete(data.id);
-    if (event.type === 'tool/call' && data?.name === 'ask_user_question' && typeof data.callId === 'string') this.questions.add(data.callId);
+    if (event.type === 'tool/call' && data?.name === 'ask_user_question' && typeof data.callId === 'string') {
+      if (this.retentionCut && (this.questions.size >= 1000 || Buffer.byteLength(data.callId) > 256)) this.unsupported = true;
+      else this.questions.add(data.callId);
+    }
     if (event.type === 'tool/result') {
       const message = object(data?.message);
       if (typeof message?.toolCallId === 'string') this.questions.delete(message.toolCallId);
@@ -309,11 +342,12 @@ class Transcript {
     const provisionalText = this.attempt ? [...this.attempt.blocks].sort(([a], [b]) => a - b).map(([, text]) => text).join('') : '';
     if (this.attempt && provisionalText && !ambiguous) messages.push({ id: `provisional:${this.attempt.id}`, role: 'assistant', text: provisionalText, createdAt: this.attempt.createdAt, provisional: true });
     const waiting = this.approvals.size > 0 || this.questions.size > 0 || this.projectedQuestions;
+    const knownActivity = !this.unsupported && !this.gap && (!this.historyCut || this.activityEstablished);
     return {
       session: { ...this.session, running: this.running }, messages: messages.slice(-MAX_MESSAGES), cursor: this.cursor,
       hasMore: this.hasMore || messages.length > MAX_MESSAGES,
-      activity: ambiguous ? 'unknown' : waiting ? 'waiting' : this.running ? 'running' : 'idle',
-      ...(!ambiguous && this.running && this.turn ? { activityDetail: { turnStartedAt: this.turn.startedAt, ...([...this.calls.values()].at(-1) ? { tool: [...this.calls.values()].at(-1)! } : {}) } } : {}),
+      activity: !knownActivity ? 'unknown' : waiting ? 'waiting' : this.running ? 'running' : 'idle',
+      ...(knownActivity && this.running && this.turn ? { activityDetail: { turnStartedAt: this.turn.startedAt, ...([...this.calls.values()].at(-1) ? { tool: [...this.calls.values()].at(-1)! } : {}) } } : {}),
       ...(this.unsupported ? { notice: UNKNOWN_NOTICE } : this.historyCut ? { notice: HISTORY_CUT_NOTICE } : this.gap ? { notice: GAP_NOTICE } : waiting ? { notice: WAIT_NOTICE } : {}),
     };
   }
@@ -343,21 +377,56 @@ export class DshAdapter implements HostAdapter {
   private readonly options: DshAdapterOptions;
   private readonly source: WorkspaceSource;
   private readonly lifetime = new AbortController();
-  constructor(options: DshAdapterOptions, source: WorkspaceSource) { this.options = options; this.source = source; this.upstreamVersion = options.dshVersion; }
+  private readonly history = new Map<string, HistoryCacheEntry>();
+  private historyBytes = 0;
+  private historyScope = '';
+  private readonly historyFlights = new Map<string, HistoryFlight>();
+  private readonly disposeHistory: (() => void) | undefined;
+  private readonly evidenceScopes = new WeakMap<NotificationEvidence, { view: readonly WorkspaceConfig[]; revision: number }>();
+  private evidenceRevision = 0;
+  private evictHistory(id: string): void {
+    const entry = this.history.get(id);
+    if (entry) { this.historyBytes -= entry.bytes; this.history.delete(id); }
+  }
+  private cacheHistory(id: string, entry: HistoryCacheEntry): void {
+    this.evictHistory(id);
+    while (this.history.size >= MAX_HISTORY_CACHE_ENTRIES || this.historyBytes + entry.bytes > MAX_HISTORY_CACHE_BYTES) this.evictHistory(this.history.keys().next().value!);
+    this.history.set(id, entry); this.historyBytes += entry.bytes;
+  }
+  constructor(options: DshAdapterOptions, source: WorkspaceSource) {
+    this.options = options; this.source = source; this.upstreamVersion = options.dshVersion;
+    this.disposeHistory = options.events?.subscribeDisposed?.(id => { this.evidenceRevision++; this.evictHistory(id); this.historyFlights.get(id)?.controller.abort(); });
+  }
   notifications(): NotificationSources | undefined {
     const subscribe = this.options.events?.subscribeNotifications;
     if (!subscribe) return undefined;
-    return { subscribe, list: signal => this.listSessions(signal), evidence: async (id, signal, listed) => (await this.open(id, this.signal(signal), undefined, listed ? { ...listed, running: listed.running ?? false, title: '', updatedAt: 0 } : undefined)).transcript.notificationEvidence() };
+    return { subscribe, list: signal => this.listSessions(signal), evidence: async (id, signal, listed) => {
+      const { transcript, view } = await this.open(id, this.signal(signal), undefined, listed ? { ...listed, running: listed.running ?? false, title: '', updatedAt: 0 } : undefined);
+      const proof = transcript.notificationEvidence(); this.evidenceScopes.set(proof, { view, revision: this.evidenceRevision }); return proof;
+    }, evidenceCurrent: proof => {
+      const binding = this.evidenceScopes.get(proof);
+      return !!binding && !this.lifetime.signal.aborted && binding.revision === this.evidenceRevision && (!this.source.isCurrent || this.source.isCurrent(binding.view)) && JSON.stringify(binding.view) === this.historyScope && !this.source.archivedSessionIds().has(proof.sessionId);
+    } };
   }
-  dispose(): void { this.lifetime.abort(); }
+  dispose(): void { this.lifetime.abort(); this.disposeHistory?.(); this.history.clear(); this.historyBytes = 0; }
   private signal(signal: AbortSignal): AbortSignal { return AbortSignal.any([signal, this.lifetime.signal]); }
   private async workspaceMap(): Promise<{ workspaces: ReadonlyMap<string, CanonicalWorkspace>; view: readonly WorkspaceConfig[] }> {
     const view = await this.source.list();
+    const signature = JSON.stringify(view);
+    if (signature !== this.historyScope) {
+      this.history.clear(); this.historyBytes = 0; this.historyScope = signature; this.evidenceRevision++;
+      for (const flight of this.historyFlights.values()) flight.controller.abort();
+    }
+    const archived = this.source.archivedSessionIds();
+    for (const [id, entry] of this.history) if ((this.source.isCurrent && !this.source.isCurrent(entry.view)) || archived.has(id)) this.evictHistory(id);
+    for (const [id, flight] of this.historyFlights) if ((this.source.isCurrent && !this.source.isCurrent(flight.view)) || archived.has(id)) flight.controller.abort();
     return { view, workspaces: new Map(view.map(item => [workspacePathKey(item.path), { ...item, key: workspacePathKey(item.path) }])) };
   }
   private checkCurrent(view: readonly WorkspaceConfig[], sessionId?: string): void {
-    if (this.source.isCurrent && !this.source.isCurrent(view)) throw new HostError('not_found');
-    if (sessionId && this.source.archivedSessionIds().has(sessionId)) throw new HostError('not_found');
+    if ((this.source.isCurrent && !this.source.isCurrent(view)) || (sessionId && this.source.archivedSessionIds().has(sessionId))) {
+      if (sessionId) this.evictHistory(sessionId);
+      throw new HostError('not_found');
+    }
   }
   private canonical(cwd: unknown, paths?: Map<string, Promise<string | undefined>>): Promise<string | undefined> {
     if (typeof cwd !== 'string' || !isAbsolute(cwd)) return Promise.resolve(undefined);
@@ -386,7 +455,7 @@ export class DshAdapter implements HostAdapter {
     const workspace = row && !this.source.archivedSessionIds().has(sessionId) && await this.workspace(row.cwd, workspaces);
     signal.throwIfAborted();
     this.checkCurrent(view, sessionId);
-    if (!row || !workspace || (expectedWorkspaceId !== undefined && workspace.id !== expectedWorkspaceId)) throw new HostError('not_found');
+    if (!row || !workspace || (expectedWorkspaceId !== undefined && workspace.id !== expectedWorkspaceId)) { this.evictHistory(sessionId); throw new HostError('not_found'); }
     return { row, session: this.toSession(row, workspace), view };
   }
   async listPresets(signal: AbortSignal): Promise<Preset[]> {
@@ -413,6 +482,9 @@ export class DshAdapter implements HostAdapter {
     }
     active.throwIfAborted();
     this.checkCurrent(view);
+    const visible = new Set(sessions.map(session => session.id));
+    for (const id of this.history.keys()) if (!visible.has(id)) this.evictHistory(id);
+    for (const [id, flight] of this.historyFlights) if (!visible.has(id)) flight.controller.abort();
     return sessions.sort((a, b) => b.updatedAt - a.updatedAt);
   }
   async snapshot(sessionId: string, signal: AbortSignal): Promise<HostSnapshot> {
@@ -425,19 +497,23 @@ export class DshAdapter implements HostAdapter {
     const cleanup = new AbortController();
     const readSignal = AbortSignal.any([active, cleanup.signal]);
     const iterator = this.options.sessionController.follow({ address: { kind: 'session', sessionId }, assistantStream: true, maxMessages: MAX_MESSAGES }, readSignal)[Symbol.asyncIterator]();
-    let transcript: Transcript | undefined, view: readonly WorkspaceConfig[] | undefined;
+    let transcript: Transcript | undefined, view: readonly WorkspaceConfig[] | undefined, frame: Record<string, unknown> | undefined;
+    let retentionCut = false;
     try {
       const first = await iterator.next();
       active.throwIfAborted();
-      const frame = object(first.value);
+      frame = object(first.value);
       const header = object(frame?.header);
       if (first.done || frame?.type !== 'snapshot' || header?.id !== sessionId || header.origin === 'subagent') throw new HostError('unavailable');
       const scope = await this.workspaceMap(); view = scope.view;
       const workspace = await this.workspace(header.cwd, scope.workspaces);
       this.checkCurrent(view, sessionId);
-      if (!workspace || workspace.id !== session.workspaceId) throw new HostError('not_found');
+      if (!workspace || workspace.id !== session.workspaceId) { this.evictHistory(sessionId); throw new HostError('not_found'); }
+      if (!Array.isArray(frame.records)) throw new HostError('unavailable');
+      retentionCut = Buffer.byteLength(JSON.stringify(frame), 'utf8') > MAX_HISTORY_BYTES;
+      if (retentionCut) this.evictHistory(sessionId);
       transcript = new Transcript(session);
-      transcript.open(frame);
+      transcript.open(frame, retentionCut); // Oversized input folds control only, never surface text/stream.
     } finally {
       // rc.2 promotes a prepared cold session only AFTER the first yield. Never
       // request a second frame, even when list() previously showed a live Agent.
@@ -445,9 +521,94 @@ export class DshAdapter implements HostAdapter {
       await iterator.return?.();
     }
     active.throwIfAborted();
-    if (!transcript || !view) throw new HostError('unavailable');
+    if (!transcript || !view || !frame) throw new HostError('unavailable');
     this.checkCurrent(view, sessionId); // Iterator cleanup itself may yield.
+    if (transcript.needsHistory && !retentionCut) transcript = await this.recoverShared(session, frame, view, active);
+    active.throwIfAborted(); this.checkCurrent(view, sessionId);
     return { transcript, view };
+  }
+  private async joinHistory(flight: HistoryFlight, active: AbortSignal): Promise<void> {
+    active.throwIfAborted(); flight.waiters++;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const aborted = () => reject(active.reason);
+        active.addEventListener('abort', aborted, { once: true });
+        void flight.promise.then(resolve, reject).finally(() => active.removeEventListener('abort', aborted));
+      });
+    } finally { if (--flight.waiters === 0) flight.controller.abort(); }
+  }
+  private async recoverShared(session: HostSession, frame: Record<string, unknown>, view: readonly WorkspaceConfig[], active: AbortSignal): Promise<Transcript> {
+    // Callers keep their own opening/projections. Only immutable ancestry work is shared.
+    while (this.historyFlights.has(session.id)) { await this.joinHistory(this.historyFlights.get(session.id)!, active); active.throwIfAborted(); this.checkCurrent(view, session.id); }
+    active.throwIfAborted(); this.checkCurrent(view, session.id);
+    if (this.historyFlights.size >= MAX_HISTORY_CACHE_ENTRIES) throw new HostError('unavailable');
+    const flight: HistoryFlight = { controller: new AbortController(), promise: Promise.resolve(), waiters: 0, view };
+    this.historyFlights.set(session.id, flight);
+    let transcript!: Transcript;
+    flight.promise = this.recoverHistory(session, frame, view, this.signal(flight.controller.signal)).then(value => { transcript = value; }).finally(() => { if (this.historyFlights.get(session.id) === flight) this.historyFlights.delete(session.id); });
+    await this.joinHistory(flight, active);
+    return transcript;
+  }
+  private async recoverHistory(session: HostSession, frame: Record<string, unknown>, view: readonly WorkspaceConfig[], active: AbortSignal): Promise<Transcript> {
+    const sessionId = session.id;
+    let transcript = new Transcript(session); transcript.open(frame);
+    let records = frame.records as unknown[];
+    let hasMore = frame.hasMore === true;
+    let bytes = Buffer.byteLength(JSON.stringify(records), 'utf8');
+    let pages = 1;
+    let exhausted = false;
+    const scope = JSON.stringify([session.workspaceId, object(frame.header)?.cwd, view]);
+    const cached = this.history.get(sessionId);
+    if (cached && cached.scope === scope && cached.throughSeq <= transcript.cursor) {
+      const prefix = JSON.parse(cached.json) as unknown[];
+      const firstSeq = wireEvent(object(records[0])?.event).seq;
+      // Immutable raw-log overlap validates both the scope binding and the cut.
+      if (firstSeq >= cached.firstSeq && firstSeq <= cached.throughSeq && records.filter(r => wireEvent(object(r)?.event).seq <= cached.throughSeq).every(r => {
+        const seq = wireEvent(object(r)?.event).seq;
+        return JSON.stringify(r) === JSON.stringify(prefix[seq - cached.firstSeq]);
+      })) {
+        const combined = [...prefix.filter(r => wireEvent(object(r)?.event).seq < firstSeq), ...records];
+        const combinedBytes = Buffer.byteLength(JSON.stringify(combined), 'utf8');
+        if (combinedBytes <= MAX_HISTORY_BYTES) {
+          records = combined; bytes = combinedBytes; hasMore = cached.hasMore; pages = cached.pages; exhausted = cached.exhausted;
+          transcript = new Transcript(session); transcript.open({ ...frame, records, hasMore });
+          this.history.delete(sessionId); this.history.set(sessionId, cached);
+        } else exhausted = true; // Reusing this prefix would exceed retention; no futile full reread.
+      } else this.evictHistory(sessionId);
+    } else if (cached) this.evictHistory(sessionId);
+    while (transcript.needsHistory && !exhausted && hasMore && pages < MAX_HISTORY_PAGES && bytes <= MAX_HISTORY_BYTES) {
+      active.throwIfAborted();
+      const beforeSeq = wireEvent(object(records[0])?.event).seq;
+      if (beforeSeq === 0) throw new HostError('unavailable');
+      const page = object(await this.options.sessionController.page({ address: { kind: 'session', sessionId }, throughSeq: transcript.cursor, beforeSeq, maxMessages: MAX_MESSAGES }, active));
+      active.throwIfAborted();
+      this.checkCurrent(view, sessionId);
+      if (!page || !Array.isArray(page.records) || page.records.length === 0) throw new HostError('unavailable');
+      // Never merge overlapping, skipped or forward records into this exact cut.
+      let expected: number | undefined;
+      for (const record of page.records) {
+        const entry = object(record);
+        if (entry?.type !== 'event') throw new HostError('unavailable');
+        const event = wireEvent(entry.event);
+        if (event.seq >= beforeSeq || (expected !== undefined && event.seq !== expected)) throw new HostError('unavailable');
+        expected = event.seq + 1;
+      }
+      const firstSeq = wireEvent(object(page.records[0])?.event).seq;
+      if (expected !== beforeSeq || typeof page.hasMore !== 'boolean' || page.hasMore !== (firstSeq > 0)) throw new HostError('unavailable');
+      bytes += Buffer.byteLength(JSON.stringify(page.records), 'utf8');
+      if (bytes > MAX_HISTORY_BYTES) { exhausted = true; break; } // Keep the last bounded, honest cut.
+      pages++;
+      records = [...page.records, ...records];
+      hasMore = page.hasMore;
+      transcript = new Transcript(session);
+      transcript.open({ ...frame, records, hasMore });
+    }
+    if (transcript.needsHistory && !hasMore) throw new HostError('unavailable'); // Complete ancestry must resolve every replacement.
+    active.throwIfAborted(); this.checkCurrent(view, sessionId);
+    const json = JSON.stringify(records);
+    const retainedBytes = Buffer.byteLength(json, 'utf8');
+    if (retainedBytes <= MAX_HISTORY_BYTES && !transcript.needsResync) this.cacheHistory(sessionId, { view, scope, firstSeq: wireEvent(object(records[0])?.event).seq, throughSeq: transcript.cursor, json, bytes: retainedBytes, hasMore, pages, exhausted: exhausted || (transcript.needsHistory && pages >= MAX_HISTORY_PAGES) });
+    return transcript;
   }
   async *watch(sessionId: string, signal: AbortSignal): AsyncIterable<HostSnapshot> {
     const active = this.signal(signal);

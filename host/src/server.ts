@@ -1,4 +1,5 @@
 import { NotificationFeed } from './notifications.ts';
+import { HISTORY_CUT_NOTICE } from './dsh-adapter.ts';
 import { randomBytes } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http';
@@ -178,7 +179,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         (detail.tool !== undefined && (typeof detail.tool !== 'string' || !/^[A-Za-z0-9_.:/-]{1,128}$/.test(detail.tool))))) throw new HostError('internal_error');
     const activityDetail = detail && ['running', 'waiting'].includes(snapshot.activity)
       ? { turnStartedAt: detail.turnStartedAt, ...(detail.tool !== undefined ? { tool: detail.tool } : {}) } : undefined;
-    const result = { ...(activityDetail ? { activityDetail } : {}), session, messages, cursor: snapshot.cursor, hasMore: snapshot.hasMore === true || snapshot.messages.length > 100, activity: snapshot.activity, ...(snapshot.activity === 'waiting' || snapshot.activity === 'unknown' ? { notice: 'Return to the desktop to check this task.' } : {}) };
+    const result = { ...(activityDetail ? { activityDetail } : {}), session, messages, cursor: snapshot.cursor, hasMore: snapshot.hasMore === true || snapshot.messages.length > 100, activity: snapshot.activity, ...(snapshot.notice === HISTORY_CUT_NOTICE ? { notice: HISTORY_CUT_NOTICE } : snapshot.activity === 'waiting' || snapshot.activity === 'unknown' ? { notice: 'Return to the desktop to check this task.' } : {}) };
     // Keep complete messages and Unicode intact. Observation is a bounded latest-history view.
     while (Buffer.byteLength(JSON.stringify(result), 'utf8') > 2 * 1024 * 1024) {
       if (result.messages.length <= 1) throw new HostError('payload_too_large');
@@ -187,13 +188,17 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     }
     return result;
   }
-  async function sessionSnapshot(sessionId: string, deviceId: string, signal: AbortSignal): Promise<HostSnapshot> {
+  async function permittedSession(sessionId: string, deviceId: string, signal: AbortSignal): Promise<HostSession> {
     const list = await adapter.listSessions(signal);
     signal.throwIfAborted();
     const session = list.find(item => item.id === sessionId);
     if (!session) throw new HostError('not_found');
     if (workspaceSource.archivedSessionIds().has(sessionId)) throw new HostError('not_found');
     await checkScope(deviceId, session.workspaceId, false, true);
+    return session;
+  }
+  async function sessionSnapshot(sessionId: string, deviceId: string, signal: AbortSignal): Promise<HostSnapshot> {
+    const session = await permittedSession(sessionId, deviceId, signal);
     const snapshot = await adapter.snapshot(sessionId, signal);
     signal.throwIfAborted();
     if (snapshot.session.workspaceId !== session.workspaceId) throw new HostError('not_found');
@@ -210,6 +215,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     streamCounts.set(deviceId, (streamCounts.get(deviceId) ?? 0) + 1);
     const controller = new AbortController();
     let timer: ReturnType<typeof setInterval> | undefined, closed = false;
+    let iterator: AsyncIterator<HostSnapshot> | undefined;
     const stop = () => {
       if (closed) return;
       closed = true; controller.abort();
@@ -253,8 +259,13 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       }
     }
     try {
-      const first = await sessionSnapshot(sessionId, deviceId, controller.signal);
+      const session = await permittedSession(sessionId, deviceId, controller.signal);
+      iterator = adapter.watch(sessionId, controller.signal)[Symbol.asyncIterator]();
+      const opening = await iterator.next();
+      if (opening.done) throw new HostError('unavailable');
+      const first = opening.value;
       controller.signal.throwIfAborted();
+      if (first.session.workspaceId !== session.workspaceId) throw new HostError('not_found');
       await checkScope(deviceId, first.session.workspaceId, false, true);
       await snapshotForDevice(first, deviceId, sessionId);
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Accel-Buffering': 'no' });
@@ -285,15 +296,17 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       timer.unref();
       void (async () => {
         try {
-          for await (const snapshot of adapter.watch(sessionId, controller.signal)) {
-            if (closed) break;
+          while (!closed) {
+            const next = await iterator!.next();
+            if (next.done || closed) break;
+            const snapshot = next.value;
             if (snapshot.session.workspaceId !== first.session.workspaceId) throw new HostError('not_found');
             await frame(snapshot);
           }
         } catch { /* Never stream raw upstream errors, stacks, tokens, or host paths. */ }
-        finally { stop(); }
+        finally { stop(); try { await iterator?.return?.(); } catch { /* Observation cleanup cannot leak upstream errors. */ } }
       })();
-    } catch (error) { stop(); throw error; }
+    } catch (error) { stop(); try { await iterator?.return?.(); } catch { /* Preserve the safe admission error. */ } throw error; }
   }
 
   async function streamNotifications(deviceId: string, after: string | undefined, res: ServerResponse, signal: AbortSignal) {

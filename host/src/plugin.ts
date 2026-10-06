@@ -27,6 +27,9 @@ export const inject = ['sessionController', 'agentPresets'];
 
 function eventBridge(ctx: CompanionContext): DshEvents {
   return {
+    subscribeDisposed(listener) {
+      return ctx.on('session/disposed', (session: { id?: string }) => { if (typeof session.id === 'string') listener(session.id); }, { global: true });
+    },
     subscribeNotifications(listener) {
       return ctx.on('session/event', (session: { id?: string }, value: unknown) => {
         if (typeof session.id !== 'string' || !value || typeof value !== 'object') return;

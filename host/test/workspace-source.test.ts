@@ -118,7 +118,7 @@ test('registry API lists new/renamed projects and all-scope sessions live, omits
   let rows = [{ ...summary, cwd: alpha }];
   const controller = { async list() { return { items: rows }; }, async *follow(request: { address: { sessionId: string } }) {
     const frame = structuredClone(opening); frame.header.id = request.address.sessionId; frame.header.cwd = rows.find(row => row.sessionId === request.address.sessionId)!.cwd; yield frame;
-  }, async projections() { return {}; }, async create(input: { sessionId: string }) { return { sessionId: input.sessionId }; }, async prompt() {}, cancel() { return { accepted: true }; } };
+  }, async page() { throw new Error('No older history expected'); }, async projections() { return {}; }, async create(input: { sessionId: string }) { return { sessionId: input.sessionId }; }, async prompt() {}, cancel() { return { accepted: true }; } };
   const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', sessionController: controller, workspaceSource: source });
   const host = await startHostServer({ config, adapter, workspaceSource: source });
   t.after(async () => { adapter.dispose(); await host.close(); await rm(dir, { recursive: true, force: true }); });
@@ -156,7 +156,7 @@ test('listed metadata cannot cross alpha-only grants when a junction cwd retarge
   const registry = { list: () => [workspace(ALPHA, alphaPath, 'Alpha'), workspace(BETA, betaPath, 'Beta')], archivedSessionIds: [] };
   const source = await createWorkspaceSource(config, () => registry);
   let row = { ...structuredClone(summary), cwd };
-  const controller = { async list() { return { items: [row] }; }, async *follow() { throw new Error('Listing must never open transcript'); }, async projections() {}, async create() { throw new Error('No mutation expected'); }, async prompt() {}, cancel() {} };
+  const controller = { async list() { return { items: [row] }; }, async *follow() { throw new Error('Listing must never open transcript'); }, async page() { throw new Error('No older history expected'); }, async projections() {}, async create() { throw new Error('No mutation expected'); }, async prompt() {}, cancel() {} };
   const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', sessionController: controller, workspaceSource: source });
   const host = await startHostServer({ config, adapter, workspaceSource: source });
   t.after(async () => { adapter.dispose(); await host.close(); await rm(dir, { recursive: true, force: true }); });
@@ -186,7 +186,7 @@ test('mutations reject a registry workspace remap at the server-to-adapter admis
   let prompts = 0, cancels = 0, creates = 0;
   const controller = { async list() { return { items: [{ ...summary, cwd: path, running: true }] }; }, async *follow() {
     const frame = structuredClone(opening); frame.header.cwd = path; yield frame;
-  }, async projections() {}, async create(input: { sessionId: string }) { creates++; return { sessionId: input.sessionId }; }, async prompt() { prompts++; }, cancel() { cancels++; return { accepted: true }; } };
+  }, async page() { throw new Error('No older history expected'); }, async projections() {}, async create(input: { sessionId: string }) { creates++; return { sessionId: input.sessionId }; }, async prompt() { prompts++; }, cancel() { cancels++; return { accepted: true }; } };
   const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', sessionController: controller, workspaceSource: source });
   // Deterministically replace the external registry exactly after server checks,
   // at the public HostAdapter call boundary, then run the real adapter logic.
@@ -215,7 +215,7 @@ test('registry create with a preset attaches once and duplicate requestId return
   const registry = { list: () => [workspace(ALPHA, path, 'Synthetic project')], archivedSessionIds: [] };
   const source = await createWorkspaceSource(config, () => registry);
   const creates: unknown[] = [];
-  const controller = { async list() { return { items: [] }; }, async *follow() {}, async projections() {}, async create(input: { sessionId: string }) { creates.push(input); return { sessionId: input.sessionId }; }, async prompt() {}, cancel() {} };
+  const controller = { async list() { return { items: [] }; }, async *follow() {}, async page() { throw new Error('No older history expected'); }, async projections() {}, async create(input: { sessionId: string }) { creates.push(input); return { sessionId: input.sessionId }; }, async prompt() {}, cancel() {} };
   const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', sessionController: controller, workspaceSource: source, agentPresets: { async remoteExportList() { return { presets: [{ id: 'synthetic-preset', name: 'Synthetic preset' }] }; } } });
   const host = await startHostServer({ config, adapter, workspaceSource: source });
   t.after(async () => { adapter.dispose(); await host.close(); await rm(dir, { recursive: true, force: true }); });

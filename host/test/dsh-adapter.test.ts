@@ -36,6 +36,7 @@ async function harness(t: { after: (fn: () => Promise<void>) => void }, pollInte
       try { yield structuredClone(frame); resumed++; throw new Error('A read must not activate DSH'); }
       finally { assert.equal(signal.aborted, true); closed++; }
     },
+    async page() { return { records: [], hasMore: false }; },
     async projections() { return structuredClone(frame.projections); },
     async create(input: { sessionId: string }) { created = input; return { sessionId: input.sessionId }; },
     async prompt(input: unknown) { prompted = input; return { accepted: true as const }; },
@@ -621,10 +622,8 @@ test('a replacement crossing a bounded cut cannot leave an obsolete assistant an
     { type: 'event', event: { seq: 4, time: 1700000000004, type: 'user/message', surfaceOp: { op: 'replace', startSeq: 0, endSeq: 2 }, sourceEventSeqs: [0, 3, 2], data: { id: 'summary', role: 'user', source: { kind: 'fixture-summary' }, content: [{ type: 'text', text: 'Replacement summary' }] } } },
   ] as any;
   h.frame.cursor = 4; h.frame.hasMore = true;
-  const current = await h.adapter.snapshot('session-fixture', new AbortController().signal);
-  assert.equal(current.activity, 'unknown');
-  assert.deepEqual(current.messages, []);
-  assert.match(current.notice!, /desktop/);
+  await assert.rejects(h.adapter.snapshot('session-fixture', new AbortController().signal), { code: 'unavailable' }, 'an empty backwards page cannot resolve the declared older history or publish obsolete answers');
+  assert.equal(h.cleanup().resumed, 0);
 });
 
 test('the normal committed assistant stream end does not trigger a false gap or cold refresh', async (t) => {

@@ -76,6 +76,34 @@ test('notification routes authenticate, stream real pages, enforce policy revisi
   assert.equal((await request('/notification-events?limit=1&limit=2', deviceToken)).status, 400);
 });
 
+test('SSE admission validates and publishes the first watch snapshot without a separate reconstruction', async t => {
+  const adapter = new TestAdapter(); let snapshots = 0, watches = 0;
+  const get = adapter.snapshot.bind(adapter);
+  adapter.snapshot = async id => { snapshots++; return get(id); };
+  adapter.watch = async function* (id, signal) { watches++; yield await get(id); await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener('abort', () => resolve(), { once: true }); }); };
+  const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
+  const sse = await request('/sessions/s-alpha/events', deviceToken), reader = sse.body!.getReader();
+  try { assert.equal(sse.status, 200); assert.match(new TextDecoder().decode((await reader.read()).value), /Fixture only/); assert.equal(watches, 1); assert.equal(snapshots, 0, 'SSE must not open the same chat once before watch'); }
+  finally { await reader.cancel(); }
+});
+
+test('a partial history notice survives GET and SSE even when newest activity is known', async t => {
+  const adapter = new TestAdapter(), value = adapter.snapshots.get('s-alpha')!;
+  value.messages = []; value.hasMore = true;
+  value.notice = 'This bounded history crosses a DSH surface replacement. Open the desktop to view the authoritative conversation.';
+  const { request, pair } = await setup(t, adapter); const { deviceToken } = await pair();
+  const get = await (await request('/sessions/s-alpha', deviceToken)).json();
+  assert.equal(get.activity, 'idle'); assert.equal(get.notice, value.notice);
+  const sse = await request('/sessions/s-alpha/events', deviceToken); const reader = sse.body!.getReader();
+  try {
+    let text = ''; while (!text.includes('\n\n')) text += new TextDecoder().decode((await reader.read()).value);
+    const event = JSON.parse(text.split('\n').find(line => line.startsWith('data: '))!.slice(6));
+    assert.equal(event.activity, 'idle'); assert.equal(event.notice, value.notice);
+  } finally { await reader.cancel(); }
+  value.notice = 'PRIVATE ADAPTER DIAGNOSTIC';
+  assert.equal((await (await request('/sessions/s-alpha', deviceToken)).json()).notice, undefined, 'never export arbitrary adapter diagnostics');
+});
+
 test('quiet extensions survive GET and SSE and count toward the payload ceiling', async t => {
   const adapter = new TestAdapter(), value = adapter.snapshots.get('s-alpha')!;
   value.activity = 'running'; value.session.running = true;
@@ -419,6 +447,7 @@ test('idle permission rechecks cannot republish obsolete history across an async
   const current = structuredClone(snapshot);
   current.messages = [{ id: 'new', role: 'assistant', text: 'NEW AUTHORITATIVE TEXT', createdAt: 2 }]; current.cursor = 2;
   adapter.watch = async function* (_id, signal) {
+    yield structuredClone(snapshot); // Admission now consumes this same watch opening.
     watchOpen = true; watchStarted();
     await publishUpdate;
     if (!signal.aborted) yield current;

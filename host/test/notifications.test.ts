@@ -170,6 +170,35 @@ test('excluded subagent events never invalidate an ordinary completion journal',
   assert.equal(page.resetRequired, false); assert.equal(page.coverage, 'ready'); assert.equal(page.items[0]?.kind, 'answer-finished');
 });
 
+test('queued events share evidence through its cut but retain every terminal completion check', async t => {
+  const f = await fixture(t); await f.feed.idle();
+  let reads = 0; f.proof.cursor = 3; f.proof.completed = [{ turn: 1, sourceSeq: 1 }, { turn: 2, sourceSeq: 3 }];
+  f.source.evidence = async () => { reads++; return structuredClone(f.proof); };
+  await Promise.all([f.event(0, 'tool/call'), f.event(1, 'turn/end', { turn: 1, completed: true }), f.event(2, 'tool/call'), f.event(3, 'turn/end', { turn: 2, completed: true })]);
+  const page = await f.feed.page(f.device.deviceId, f.head);
+  assert.deepEqual(page.items.filter(e => e.kind === 'answer-finished').map(e => e.sourceSeq), [1, 3]);
+  assert.equal(reads, 1, 'one authoritative cut covers all queued event checks');
+});
+
+test('an invalid authoritative cut is coalesced without consuming queued completion evidence', async t => {
+  const f = await fixture(t); await f.feed.idle(); let reads = 0;
+  f.proof.valid = false; f.proof.completed = [{ turn: 1, sourceSeq: 1 }];
+  f.source.evidence = async () => { reads++; return structuredClone(f.proof); };
+  await Promise.all([f.event(0, 'tool/call'), f.event(1, 'turn/end', { turn: 1, completed: true }), f.event(2, 'tool/call')]);
+  assert.equal(reads, 1); assert.equal(f.feed.coverage, 'degraded'); assert.deepEqual(f.state.readNotificationState('producer'), {});
+  assert.deepEqual((await f.feed.page(f.device.deviceId, f.head)).items, []);
+});
+
+test('coalesced proof is refreshed when its source scope changes even under the same workspace ID', async t => {
+  const f = await fixture(t); await f.feed.idle(); let reads = 0, lists = 0, current = true;
+  const source = f.source as typeof f.source & { evidenceCurrent?: (proof: NotificationEvidence) => boolean };
+  source.evidenceCurrent = () => current;
+  source.list = async () => { if (++lists === 2) current = false; return [{ id: 'chat', workspaceId: 'alpha' }]; };
+  source.evidence = async () => { reads++; current = true; return structuredClone(f.proof); };
+  await Promise.all([f.event(0, 'tool/call'), f.event(1, 'tool/call')]);
+  assert.equal(reads, 2, 'scope revision change invalidates evidence, even with a covering cursor');
+});
+
 test('reconciliation does not consume the terminal arriving during its cold read', async t => {
   const f = await fixture(t); f.listed([{ id: 'chat', workspaceId: 'alpha', running: true }]);
   t.mock.timers.enable({ apis: ['setInterval'] });

@@ -9,6 +9,8 @@ export interface NotificationSources {
   subscribe(listener: (id: string, event: NotificationSource) => void): () => void;
   list(signal: AbortSignal): Promise<{ id: string; workspaceId: string; running?: boolean }[]>;
   evidence(id: string, signal: AbortSignal, listed?: { id: string; workspaceId: string; running?: boolean }): Promise<NotificationEvidence>;
+  /** Revalidate a coalesced proof against the currently active source scope. */
+  evidenceCurrent?(proof: NotificationEvidence): boolean;
 }
 export interface NotificationEvent {
   version: 1; eventId: string; sequence: number; occurredAt: number; expiresAt: number;
@@ -114,9 +116,10 @@ export class NotificationFeed {
   private schedule(): void {
     if (this.scheduled) return; this.scheduled = true;
     this.work = this.work.then(async () => {
+    const proofs = new Map<string, NotificationEvidence>(); // Drain-local, bounded by the queued session set; no stale cross-drain authority.
     while (this.queue.length && !this.lifetime.signal.aborted) {
       const next = this.queue.shift()!;
-      try { await this.accept(next.id, next.event); } catch { this.coverage = 'degraded'; }
+      try { await this.accept(next.id, next.event, proofs); } catch { this.coverage = 'degraded'; }
     }
     if (!this.lifetime.signal.aborted) {
       if (this.overflow) { this.resetJournals(); this.overflow = false; await this.reconcile(); }
@@ -126,20 +129,28 @@ export class NotificationFeed {
   async idle(): Promise<void> {
     do { await this.work; } while ((this.scheduled || this.queue.length) && !this.lifetime.signal.aborted);
   }
-  private async accept(id: string, event: NotificationSource): Promise<void> {
+  private async accept(id: string, event: NotificationSource, proofs: Map<string, NotificationEvidence>): Promise<void> {
     // Global events include excluded subagents. Establish current membership before
     // sequence bookkeeping; absence is not source failure or a feed gap.
     const sessions = await this.source.list(this.signal());
-    if (!sessions.some(s => s.id === id)) return;
+    const listed = sessions.find(s => s.id === id);
+    if (!listed) { proofs.delete(id); return; }
     const old = this.watermarks[id];
     if (event.time < this.baselineAt || (old && event.seq <= old.seq)) return;
     const gap = !!old && event.seq !== old.seq + 1;
     if (gap) { this.coverage = 'degraded'; this.resetJournals(); }
     if (!old && Object.keys(this.watermarks).length >= 10000) { this.coverage = 'degraded'; return; }
     if (!relevant.has(event.type)) { this.watermarks[id] = { ...old, seq: event.seq }; return; }
-    const proof = await this.source.evidence(id, this.signal(), sessions.find(s => s.id === id));
+    let proof = proofs.get(id);
+    if (!proof || proof.workspaceId !== listed.workspaceId || proof.cursor < event.seq || (this.source.evidenceCurrent && !this.source.evidenceCurrent(proof))) {
+      proof = await this.source.evidence(id, this.signal(), listed);
+      if (proof.sessionId === id && proof.workspaceId === listed.workspaceId && proof.cursor >= event.seq) {
+        if (proofs.size >= 256 && !proofs.has(id)) proofs.delete(proofs.keys().next().value!);
+        proofs.set(id, proof);
+      } else proofs.delete(id);
+    }
     this.lifetime.signal.throwIfAborted();
-    if (proof.valid === false) { this.coverage = 'degraded'; return; }
+    if (proof.valid === false || proof.sessionId !== id || proof.workspaceId !== listed.workspaceId || proof.cursor < event.seq || (this.source.evidenceCurrent && !this.source.evidenceCurrent(proof))) { this.coverage = 'degraded'; return; }
     this.batch = new Map();
     try {
     // Unknown newly-created sessions are eligible by a fresh cold opening, not phone pagination.
