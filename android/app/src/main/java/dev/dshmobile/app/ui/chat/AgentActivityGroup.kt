@@ -8,6 +8,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.semantics
@@ -31,7 +33,11 @@ internal fun AgentActivityGroup(group: ChatItem.Activity, onCopy: (String) -> Un
             Text(label, style = MaterialTheme.typography.labelMedium)
         }
         if (expanded) {
-            Column(Modifier.fillMaxWidth().padding(start = 12.dp).testTag("agent_activity_details"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            val rail = MaterialTheme.colorScheme.outlineVariant
+            // A thin rail keeps expanded service items visually separate from the conversation.
+            Column(Modifier.fillMaxWidth().padding(start = 12.dp)
+                .drawBehind { drawRect(rail, size = Size(2.dp.toPx(), size.height)) }
+                .padding(start = 8.dp).testTag("agent_activity_details"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 group.messages.forEach { message ->
                     TextButton(onClick = { selected = message }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("agent_activity_item:${message.id}"),
                         colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurfaceVariant)) {

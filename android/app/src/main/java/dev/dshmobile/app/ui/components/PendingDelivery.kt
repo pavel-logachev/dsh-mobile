@@ -41,8 +41,11 @@ internal fun PendingDelivery(state: MobileState, model: MobileViewModel, modifie
                     }),
                         color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium,
                         modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
-                    Text(command.text.orEmpty(), style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    Text(stringResource(R.string.mobile_local_prompt_notice), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    val queued = command.status == "queued"
+                    Text(command.text.orEmpty(), style = MaterialTheme.typography.bodyMedium, maxLines = if (queued) 1 else 2, overflow = TextOverflow.Ellipsis)
+                    // The local-only warning matters when the user is deciding about an unconfirmed prompt;
+                    // on an ordinary queued item it doubled the card height.
+                    if (!queued) Text(stringResource(R.string.mobile_local_prompt_notice), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         TextButton(onClick = {
                             acting = true
