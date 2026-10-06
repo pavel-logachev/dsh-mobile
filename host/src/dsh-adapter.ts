@@ -144,10 +144,12 @@ class Transcript {
   private revision = 0;
   private terminals: { turn: number; sourceSeq: number }[] = [];
   private openProjectedQuestions = false;
+  private questionProjectionPresent = false;
+  private attentionStopped = false;
   notificationEvidence(): NotificationEvidence {
     const ambiguous = this.unsupported || this.historyCut || this.gap;
     return { sessionId: this.session.id, workspaceId: this.session.workspaceId, cursor: this.cursor, valid: !ambiguous,
-      pending: !ambiguous && this.running && (this.approvals.size > 0 || this.questions.size > 0 || this.openProjectedQuestions),
+      pending: !ambiguous && !this.attentionStopped && ((!!this.turn && this.approvals.size > 0) || (this.questionProjectionPresent ? this.openProjectedQuestions : this.questions.size > 0)),
       completed: ambiguous ? [] : this.terminals.filter(t => this.nodes.some(n => n.answerTurn === t.turn)) };
   }
   constructor(session: HostSession) { this.session = { ...session }; this.running = session.running; }
@@ -187,7 +189,10 @@ class Transcript {
     }
     const activeQuestions = object(values?.userQuestions)?.active;
     if (Array.isArray(activeQuestions)) {
-      this.openProjectedQuestions = activeQuestions.some(q => object(q)?.state === 'open');
+      // The runtime fold is authoritative for timed open/continued/settled calls;
+      // an unmatched historic tool call cannot override its empty/continued view.
+      this.questionProjectionPresent = true;
+      this.openProjectedQuestions = !this.attentionStopped && activeQuestions.some(q => object(q)?.state === 'open');
       for (const q of activeQuestions) if (object(q)?.state === 'continued' && typeof object(q)?.callId === 'string') this.questions.delete(object(q)!.callId as string);
     }
     this.trim();
@@ -220,11 +225,13 @@ class Transcript {
     if (!applySurface(this.nodes, event)) { this.historyCut = true; this.attempt = undefined; return; }
     const data = object(event.data);
     if (event.type === 'turn/start') {
+      this.attentionStopped = false; this.approvals.clear(); this.questions.clear(); this.openProjectedQuestions = false;
       this.calls.clear();
       this.turn = Number.isSafeInteger(data?.turn) ? { number: data!.turn as number, startedAt: event.time } : undefined;
     }
     if (event.type === 'turn/end') {
       if (object(data?.reason)?.kind === 'completed' && Number.isSafeInteger(data?.turn)) this.terminals.push({ turn: data!.turn as number, sourceSeq: event.seq });
+      this.attentionStopped = true; this.approvals.clear(); this.questions.clear(); this.openProjectedQuestions = false;
       this.turn = undefined; this.calls.clear();
     }
     if (event.type === 'tool/call' && this.turn?.number === data?.turn && typeof data?.callId === 'string' && typeof data.name === 'string' && /^[A-Za-z0-9_.:/-]{1,128}$/.test(data.name)) {
@@ -240,6 +247,8 @@ class Transcript {
     if (live && event.type === 'turn/start') this.running = true;
     if (live && event.type === 'turn/end') { this.running = false; this.attempt = undefined; }
     if ((event.type === 'assistant/message' || event.type === 'assistant/attempt') && this.attempt?.turn === data?.turn && this.attempt?.step === data?.step) this.attempt = undefined;
+    // Keep the desktop historical notice; notification evidence additionally
+    // requires an open turn for the runtime's turn-enclosed approval audit pair.
     if (event.type === 'approval/asked' && typeof data?.id === 'string') this.approvals.add(data.id);
     if (event.type === 'approval/decided' && typeof data?.id === 'string') this.approvals.delete(data.id);
     if (event.type === 'tool/call' && data?.name === 'ask_user_question' && typeof data.callId === 'string') this.questions.add(data.callId);
