@@ -37,7 +37,7 @@ try {
   const paired = await call('/pairings', undefined, { pairingToken: offer.pairingToken, deviceName: 'Plugin fixture phone' }); assert.equal(paired.status, 201);
   assert.equal((await call('/sessions', paired.body.deviceToken)).status, 200);
   assert.equal((await call('/presets', paired.body.deviceToken)).body.items[0].id, 'safe');
-  assert.equal(lists, 2, 'one producer baseline plus one client session index read'); assert.equal(presets, 1); assert.equal(mutations, 0);
+  assert.equal(lists, 1, 'no producer baseline without opt-in; one client session index read'); assert.equal(presets, 1); assert.equal(mutations, 0);
   await fiber.dispose();
   await assert.rejects(call('/capabilities'), { code: 'ECONNREFUSED' });
   const end = Date.now() + 1000; while (relay.stats().controls && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 25));

@@ -338,7 +338,7 @@ export class DshAdapter implements HostAdapter {
   notifications(): NotificationSources | undefined {
     const subscribe = this.options.events?.subscribeNotifications;
     if (!subscribe) return undefined;
-    return { subscribe, list: signal => this.listSessions(signal), evidence: async (id, signal) => (await this.open(id, this.signal(signal))).transcript.notificationEvidence() };
+    return { subscribe, list: signal => this.listSessions(signal), evidence: async (id, signal, listed) => (await this.open(id, this.signal(signal), undefined, listed ? { ...listed, running: listed.running ?? false, title: '', updatedAt: 0 } : undefined)).transcript.notificationEvidence() };
   }
   dispose(): void { this.lifetime.abort(); }
   private signal(signal: AbortSignal): AbortSignal { return AbortSignal.any([signal, this.lifetime.signal]); }
@@ -411,8 +411,8 @@ export class DshAdapter implements HostAdapter {
     this.checkCurrent(view, sessionId);
     return transcript.snapshot();
   }
-  private async open(sessionId: string, active: AbortSignal, expectedWorkspaceId?: string): Promise<{ transcript: Transcript; view: readonly WorkspaceConfig[] }> {
-    const { session } = await this.permitted(sessionId, active, expectedWorkspaceId);
+  private async open(sessionId: string, active: AbortSignal, expectedWorkspaceId?: string, listed?: HostSession): Promise<{ transcript: Transcript; view: readonly WorkspaceConfig[] }> {
+    const session = listed ?? (await this.permitted(sessionId, active, expectedWorkspaceId)).session;
     const cleanup = new AbortController();
     const readSignal = AbortSignal.any([active, cleanup.signal]);
     const iterator = this.options.sessionController.follow({ address: { kind: 'session', sessionId }, assistantStream: true, maxMessages: MAX_MESSAGES }, readSignal)[Symbol.asyncIterator]();

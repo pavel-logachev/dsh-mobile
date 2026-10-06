@@ -8,7 +8,7 @@ export interface NotificationEvidence { sessionId: string; workspaceId: string; 
 export interface NotificationSources {
   subscribe(listener: (id: string, event: NotificationSource) => void): () => void;
   list(signal: AbortSignal): Promise<{ id: string; workspaceId: string; running?: boolean }[]>;
-  evidence(id: string, signal: AbortSignal): Promise<NotificationEvidence>;
+  evidence(id: string, signal: AbortSignal, listed?: { id: string; workspaceId: string; running?: boolean }): Promise<NotificationEvidence>;
 }
 export interface NotificationEvent {
   version: 1; eventId: string; sequence: number; occurredAt: number; expiresAt: number;
@@ -35,48 +35,68 @@ export class NotificationFeed {
   private dispose: (() => void) | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
   private started = false;
+  private initializing = false;
+  private activated = false;
+  private baselineAt = 0;
   private scheduled = false;
   private reconciling = false;
   private overflow = false;
   baselineReady = false;
   private batch: Map<string, Journal> | undefined;
   private readonly emissions = new Map<string, { count: number; until: number }>();
-  constructor(state: HostState, source: NotificationSources) {
+  private readonly baselineBudgetMs: number;
+  constructor(state: HostState, source: NotificationSources, baselineBudgetMs = 10_000) {
+    this.baselineBudgetMs = baselineBudgetMs;
     this.state = state; this.source = source;
     this.key = state.readNotificationState<string>('cursor-key') ?? randomBytes(32).toString('base64url');
     state.writeNotificationState('cursor-key', this.key);
   }
   async start(): Promise<void> {
     this.dispose = this.source.subscribe((id, event) => {
-      if (this.lifetime.signal.aborted) return;
+      if (this.lifetime.signal.aborted || !this.activated || !this.enabledDevices()) return;
       if (!idValid(id) || !Number.isSafeInteger(event.seq) || event.seq < 0 || !Number.isSafeInteger(event.time) || event.time < 0 || typeof event.type !== 'string' || event.type.length > 128) { this.coverage = 'degraded'; return; }
       if (this.queue.length >= 4096) { this.coverage = 'degraded'; this.overflow = true; return; }
       this.queue.push({ id, event });
       if (this.started) this.schedule();
     });
     this.watermarks = this.state.readNotificationState<Record<string, SourceState>>('producer') ?? {};
-    const pendingBefore = this.pendingCut();
-    try {
-      const sessions = await this.source.list(this.signal());
-      if (sessions.length > 10000) throw new HostError('unavailable');
-      const active = new Set(sessions.map(s => s.id));
-      for (const id of Object.keys(this.watermarks)) if (!active.has(id)) delete this.watermarks[id];
-      for (const session of sessions) {
-        const evidence = await this.source.evidence(session.id, this.signal());
-        if (evidence.valid === false) { this.coverage = 'degraded'; continue; }
-        this.watermarks[session.id] = { seq: evidence.cursor, ...(evidence.pending ? { attentionId: this.watermarks[session.id]?.attentionId ?? randomUUID() } : {}) };
-      }
-      if (pendingBefore !== this.pendingCut()) this.resetJournals();
-      this.state.writeNotificationState('producer', this.watermarks);
-      this.baselineReady = true;
-      this.coverage = this.coverage === 'degraded' ? 'degraded' : 'ready';
-    } catch { this.coverage = 'degraded'; }
-    this.started = true; this.schedule();
+    this.started = true;
+    this.activate();
     this.timer = setInterval(() => {
-      if (this.reconciling || this.lifetime.signal.aborted) return; this.reconciling = true;
+      if (this.reconciling || this.initializing || !this.activated || !this.enabledDevices() || this.lifetime.signal.aborted) return; this.reconciling = true;
       this.work = this.work.then(() => this.reconcile()).catch(() => { this.coverage = 'degraded'; }).finally(() => { this.reconciling = false; });
     }, 60_000);
     this.timer.unref();
+  }
+  private enabledDevices(): boolean { return this.state.listDevices().some(d => !!this.state.getDevice(d.deviceId) && this.state.readNotificationState<Journal>('device:' + d.deviceId)?.settings.enabled); }
+  private activate(): void {
+    if (this.activated || !this.started || !this.enabledDevices()) return;
+    this.activated = true; this.initializing = true; this.baselineAt = Date.now();
+    this.coverage = 'initializing';
+    this.work = this.work.then(async () => {
+      const pendingBefore = this.pendingCut();
+      const budget = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(this.baselineBudgetMs)]);
+      try {
+        const sessions = await this.source.list(budget);
+        if (sessions.length > 10000) throw new HostError('unavailable');
+        const active = new Set(sessions.map(s => s.id));
+        for (const id of Object.keys(this.watermarks)) if (!active.has(id)) delete this.watermarks[id];
+        for (const session of sessions) {
+          budget.throwIfAborted();
+          // Idle history is pre-baseline. Only running or previously pending
+          // sessions need authoritative attention recovery on hot-upgrade.
+          if (!session.running && !this.watermarks[session.id]?.attentionId) { delete this.watermarks[session.id]; continue; }
+          const evidence = await this.source.evidence(session.id, budget, session);
+          if (evidence.valid === false) { this.coverage = 'degraded'; continue; }
+          const queued = this.queue.filter(e => e.id === session.id).map(e => e.event.seq);
+          this.watermarks[session.id] = { seq: queued.length ? Math.min(...queued) - 1 : evidence.cursor, ...(evidence.pending ? { attentionId: this.watermarks[session.id]?.attentionId ?? randomUUID() } : {}) };
+        }
+        if (pendingBefore !== this.pendingCut()) this.resetJournals();
+        this.state.writeNotificationState('producer', this.watermarks);
+        this.coverage = this.coverage === 'degraded' ? 'degraded' : 'ready';
+      } catch { this.coverage = 'degraded'; this.resetJournals(); }
+      finally { this.baselineReady = true; this.initializing = false; this.schedule(); }
+    });
   }
   private pendingCut(): string { return JSON.stringify(Object.entries(this.watermarks).filter(([, s]) => s.attentionId).sort(([a], [b]) => a.localeCompare(b))); }
   private signal(): AbortSignal { return AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(10_000)]); }
@@ -101,12 +121,12 @@ export class NotificationFeed {
     const sessions = await this.source.list(this.signal());
     if (!sessions.some(s => s.id === id)) return;
     const old = this.watermarks[id];
-    if (old && event.seq <= old.seq) return;
+    if (event.time < this.baselineAt || (old && event.seq <= old.seq)) return;
     const gap = !!old && event.seq !== old.seq + 1;
     if (gap) { this.coverage = 'degraded'; this.resetJournals(); }
     if (!old && Object.keys(this.watermarks).length >= 10000) { this.coverage = 'degraded'; return; }
     if (!relevant.has(event.type)) { this.watermarks[id] = { ...old, seq: event.seq }; return; }
-    const proof = await this.source.evidence(id, this.signal());
+    const proof = await this.source.evidence(id, this.signal(), sessions.find(s => s.id === id));
     this.lifetime.signal.throwIfAborted();
     if (proof.valid === false) { this.coverage = 'degraded'; return; }
     this.batch = new Map();
@@ -131,7 +151,7 @@ export class NotificationFeed {
     for (const session of sessions) {
       const old = this.watermarks[session.id];
       if (old && !old.attentionId && !session.running) continue;
-      const proof = await this.source.evidence(session.id, this.signal());
+      const proof = await this.source.evidence(session.id, this.signal(), session);
       if (proof.valid === false) { this.coverage = 'degraded'; continue; }
       if (proof.pending && old && !old.attentionId) { old.attentionId = randomUUID(); this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/call' }, 'attention-needed', old.attentionId); }
       if (old?.attentionId && !proof.pending) this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/result' }, 'attention-cleared', old.attentionId);
@@ -173,7 +193,7 @@ export class NotificationFeed {
       j.settings = { revision: j.settings.revision + 1, ...policy };
       if (!policy.enabled) j.items = [];
     }
-    this.save(deviceId, j); return j.settings;
+    this.save(deviceId, j); this.activate(); return j.settings;
   }
   private emissionAllowed(key: string, limit: number): boolean {
     const now = Date.now();

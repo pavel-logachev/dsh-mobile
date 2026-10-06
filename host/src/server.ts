@@ -413,7 +413,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       sendJson(res, 200, { items: workspaces.filter(workspace => allowsWorkspace(current.grants.readWorkspaceIds, workspace.id)).map(workspace => ({ id: workspace.id, name: workspace.name, canExecute: allowsWorkspace(current.grants.executeWorkspaceIds, workspace.id) })) }); return;
     }
     if (req.method === 'GET' && url.pathname === '/v1/capabilities') {
-      sendJson(res, 200, { protocolVersion: 1, hostName: config.hostName, upstreamVersion: adapter.upstreamVersion, capabilities: { sessions: true, textPrompt: true, cancel: true, liveSnapshots: true, attachments: false, questions: false, approvals: false, push: false, notifications: !!notifications?.baselineReady }, notificationCapabilities: { version: 1, coverage: notifications?.coverage ?? 'degraded', feed: !!notifications, unifiedPush: false, retentionMs: 604800000 } }); return;
+      sendJson(res, 200, { protocolVersion: 1, hostName: config.hostName, upstreamVersion: adapter.upstreamVersion, capabilities: { sessions: true, textPrompt: true, cancel: true, liveSnapshots: true, attachments: false, questions: false, approvals: false, push: false, notifications: !!notifications }, notificationCapabilities: { version: 1, coverage: notifications?.coverage ?? 'degraded', feed: !!notifications, unifiedPush: false, retentionMs: 604800000 } }); return;
     }
     if (req.method === 'GET' && url.pathname === '/v1/presets') {
       const presets = await adapter.listPresets(signal); signal.throwIfAborted(); freshDevice(device.deviceId);

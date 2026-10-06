@@ -30,6 +30,28 @@ async function fixture(t: any) {
   return { state, feed, device, head, event, proof, source, listed: (rows: typeof listed) => { listed = rows; } };
 }
 
+test('zero enabled devices do no baseline IO; first opt-in initializes in background and leaves idle history lazy', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-notifications-lazy-')); const state = new HostState(join(dir, 'state.sqlite'));
+  const device = state.consumePairing(state.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Synthetic');
+  let lists = 0, opens = 0;
+  const source = { subscribe() { return () => {}; }, async list() { lists++; return Array.from({ length: 600 }, (_, i) => ({ id: 'idle-' + i, workspaceId: 'alpha', running: false })); }, async evidence(id: string) { opens++; return { sessionId: id, workspaceId: 'alpha', cursor: 100, pending: false, completed: [] }; } };
+  const feed = new NotificationFeed(state, source); t.after(async () => { await feed.close(); state.close(); rmSync(dir, { recursive: true, force: true }); });
+  await feed.start(); assert.equal(lists, 0); assert.equal(opens, 0);
+  feed.putSettings(device.deviceId, { expectedRevision: 0, enabled: true, projects: [], chats: [] });
+  assert.equal(feed.coverage, 'initializing'); await feed.idle(); assert.equal(feed.coverage, 'ready'); assert.equal(lists, 1); assert.equal(opens, 0);
+});
+
+test('enabled startup returns before a blocked baseline and its global budget degrades coverage', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-notifications-budget-')); const state = new HostState(join(dir, 'state.sqlite'));
+  const device = state.consumePairing(state.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Synthetic');
+  let entered = false;
+  const source = { subscribe() { return () => {}; }, async list() { return [{ id: 'running', workspaceId: 'alpha', running: true }]; }, async evidence(_id: string, signal: AbortSignal) { entered = true; return await new Promise<NotificationEvidence>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })); } };
+  const seed = new NotificationFeed(state, source); seed.putSettings(device.deviceId, { expectedRevision: 0, enabled: true, projects: [], chats: [] });
+  const feed = new NotificationFeed(state, source, 25); t.after(async () => { await feed.close(); state.close(); rmSync(dir, { recursive: true, force: true }); });
+  await feed.start(); assert.equal(feed.coverage, 'initializing');
+  await new Promise(r => setTimeout(r, 40)); await feed.idle(); assert.equal(entered, true); assert.equal(feed.coverage, 'degraded');
+});
+
 test('excluded subagent events never invalidate an ordinary completion journal', async t => {
   const f = await fixture(t); f.proof.completed = [{ turn: 1, sourceSeq: 0 }]; await f.event(0, 'turn/end', { turn: 1, completed: true });
   f.source.evidence = async () => { throw new (await import('../src/errors.ts')).HostError('not_found'); };
@@ -58,10 +80,10 @@ test('restart invalidates changed pending cut in both downtime directions', asyn
   const f = await fixture(t); f.proof.pending = true; await f.event(0, 'approval/asked');
   const cursor = (await f.feed.page(f.device.deviceId)).nextCursor;
   await f.feed.close(); f.proof.pending = false;
-  const resolved = new NotificationFeed(f.state, f.source); await resolved.start();
+  const resolved = new NotificationFeed(f.state, f.source); await resolved.start(); await resolved.idle();
   const cleared = await resolved.page(f.device.deviceId, cursor); assert.equal(cleared.resetRequired, true); assert.equal(cleared.pending.length, 0);
-  await resolved.close(); f.proof.pending = true;
-  const waiting = new NotificationFeed(f.state, f.source); t.after(() => waiting.close()); await waiting.start();
+  await resolved.close(); f.proof.pending = true; f.listed([{ id: 'chat', workspaceId: 'alpha', running: true }]);
+  const waiting = new NotificationFeed(f.state, f.source); t.after(() => waiting.close()); await waiting.start(); await waiting.idle();
   const pending = await waiting.page(f.device.deviceId, cleared.nextCursor); assert.equal(pending.resetRequired, true); assert.equal(pending.pending.length, 1);
 });
 
@@ -104,7 +126,7 @@ test('ambiguous evidence suppresses alerts without advancing the proof watermark
   await f.event(0, 'turn/end', { turn: 1, completed: true });
   assert.equal((await f.feed.page(f.device.deviceId, f.head)).items.length, 0);
   assert.equal(f.feed.coverage, 'degraded');
-  assert.equal(f.state.readNotificationState<any>('producer').chat.seq, -1);
+  assert.equal(f.state.readNotificationState<any>('producer').chat, undefined);
 });
 
 test('later queued-turn attention does not erase proved completion of previous turn', async t => {
