@@ -38,6 +38,7 @@ export class NotificationFeed {
   private initializing = false;
   private activated = false;
   private baselineAt = 0;
+  private lazyIdle: string[] = [];
   private scheduled = false;
   private reconciling = false;
   private overflow = false;
@@ -85,7 +86,7 @@ export class NotificationFeed {
           budget.throwIfAborted();
           // Idle history is pre-baseline. Only running or previously pending
           // sessions need authoritative attention recovery on hot-upgrade.
-          if (!session.running && !this.watermarks[session.id]?.attentionId) { delete this.watermarks[session.id]; continue; }
+          if (!session.running && !this.watermarks[session.id]?.attentionId) { delete this.watermarks[session.id]; this.lazyIdle.push(session.id); continue; }
           const evidence = await this.source.evidence(session.id, budget, session);
           if (evidence.valid === false) { this.coverage = 'degraded'; continue; }
           const queued = this.queue.filter(e => e.id === session.id).map(e => e.event.seq);
@@ -98,7 +99,7 @@ export class NotificationFeed {
       finally { this.baselineReady = true; this.initializing = false; this.schedule(); }
     });
   }
-  private pendingCut(): string { return JSON.stringify(Object.entries(this.watermarks).filter(([, s]) => s.attentionId).sort(([a], [b]) => a.localeCompare(b))); }
+  private pendingCut(): string { return JSON.stringify(Object.entries(this.watermarks).filter(([, s]) => s.attentionId).map(([id, s]) => [id, s.attentionId]).sort(([a], [b]) => a!.localeCompare(b!))); }
   private signal(): AbortSignal { return AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(10_000)]); }
   private schedule(): void {
     if (this.scheduled) return; this.scheduled = true;
@@ -148,10 +149,14 @@ export class NotificationFeed {
     if (sessions.length > 10000) { this.coverage = 'degraded'; return; }
     const visible = new Set(sessions.map(s => s.id));
     for (const id of Object.keys(this.watermarks)) if (!visible.has(id)) delete this.watermarks[id];
+    // Idle pending requests may report running:false; probe them gradually, never
+    // an N-history startup sweep or an N*10s reconciliation critical section.
+    const lazy = new Set(this.lazyIdle.splice(0, 8));
+    const budget = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(10_000)]);
     for (const session of sessions) {
       const old = this.watermarks[session.id];
-      if (old && !old.attentionId && !session.running) continue;
-      const proof = await this.source.evidence(session.id, this.signal(), session);
+      if (!old?.attentionId && !session.running && !lazy.has(session.id)) continue;
+      const proof = await this.source.evidence(session.id, budget, session);
       if (proof.valid === false) { this.coverage = 'degraded'; continue; }
       if (proof.pending && old && !old.attentionId) { old.attentionId = randomUUID(); this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/call' }, 'attention-needed', old.attentionId); }
       if (old?.attentionId && !proof.pending) this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/result' }, 'attention-cleared', old.attentionId);

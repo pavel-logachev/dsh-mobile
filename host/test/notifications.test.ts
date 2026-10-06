@@ -52,6 +52,30 @@ test('enabled startup returns before a blocked baseline and its global budget de
   await new Promise(r => setTimeout(r, 40)); await feed.idle(); assert.equal(entered, true); assert.equal(feed.coverage, 'degraded');
 });
 
+test('lazy idle reconciliation recovers pending without consuming a concurrently queued completion', async t => {
+  const f = await fixture(t); await f.feed.idle();
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  await f.feed.close(); const feed = new NotificationFeed(f.state, f.source); t.after(() => feed.close()); await feed.start(); await feed.idle();
+  const head = (await feed.page(f.device.deviceId)).nextCursor;
+  let entered!: () => void, release!: () => void;
+  const reading = new Promise<void>(r => { entered = r; }); const held = new Promise<void>(r => { release = r; });
+  f.source.evidence = async () => { entered(); await held; return structuredClone(f.proof); };
+  t.mock.timers.tick(60000); await reading;
+  f.proof.completed = [{ turn: 1, sourceSeq: 0 }]; f.proof.pending = true;
+  const terminal = f.event(0, 'turn/end', { turn: 1, completed: true }); release(); await terminal; await feed.idle();
+  const page = await feed.page(f.device.deviceId, head);
+  assert.equal(page.items.filter(e => e.kind === 'answer-finished').length, 1);
+  assert.equal(feed.coverage, 'ready');
+});
+
+test('unchanged pending episode survives restart without epoch reset when only sequence moved', async t => {
+  const f = await fixture(t); f.proof.pending = true; await f.event(0, 'approval/asked');
+  const before = await f.feed.page(f.device.deviceId); await f.feed.close(); f.proof.cursor = 20;
+  const resumed = new NotificationFeed(f.state, f.source); t.after(() => resumed.close()); await resumed.start(); await resumed.idle();
+  const after = await resumed.page(f.device.deviceId, before.nextCursor); assert.equal(after.resetRequired, false);
+  assert.equal(after.epoch, before.epoch);
+});
+
 test('excluded subagent events never invalidate an ordinary completion journal', async t => {
   const f = await fixture(t); f.proof.completed = [{ turn: 1, sourceSeq: 0 }]; await f.event(0, 'turn/end', { turn: 1, completed: true });
   f.source.evidence = async () => { throw new (await import('../src/errors.ts')).HostError('not_found'); };
