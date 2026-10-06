@@ -23,6 +23,7 @@ import kotlinx.coroutines.launch
 
 @Composable
 internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, onCopy: (String) -> Unit, modifier: Modifier = Modifier,
+    searchQuery: String = "", selectedMatch: SearchMatch? = null,
     classify: suspend (List<ChatMessage>, List<ChatItem>) -> List<ChatItem> = { messages, previous ->
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { chatItems(messages, previous) }
     }) {
@@ -38,7 +39,11 @@ internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, o
         val previous = value?.items.orEmpty()
         value = TimelineProjection(input, classify(input, previous))
     }
-    val visible = visibleTimeline(snapshot.messages, projection)
+    // Search includes all loaded messages, including normally collapsed service activity.
+    val searchItems = remember(snapshot.messages, searchQuery.isNotBlank()) {
+        if (searchQuery.isNotBlank()) snapshot.messages.map { ChatItem.Message(it) } else null
+    }
+    val visible = searchItems ?: visibleTimeline(snapshot.messages, projection)
     val loading = visible == null
     val timeline = visible.orEmpty()
     val messageCount = timeline.size + if (unconfirmed != null) 1 else 0
@@ -53,9 +58,18 @@ internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, o
         }
     }
     LaunchedEffect(messageCount, timeline, loading) {
-        if (loading) return@LaunchedEffect
+        if (loading || searchQuery.isNotBlank()) return@LaunchedEffect
         if (following && totalItems > 0) { list.scrollToItem(totalItems - 1); list.scrollBy(Float.MAX_VALUE) }
         else if (messageCount > 0) unread = true
+    }
+    LaunchedEffect(selectedMatch, timeline, snapshot.hasMore) {
+        if (selectedMatch != null) {
+            val index = timeline.indexOfFirst { it.id == selectedMatch.messageId }
+            if (index >= 0) {
+                following = false
+                list.scrollToItem(index + if (snapshot.hasMore) 1 else 0)
+            }
+        }
     }
     Box(modifier.fillMaxWidth()) {
         LazyColumn(state = list, modifier = Modifier.align(Alignment.TopCenter).widthIn(max = 840.dp).fillMaxSize().testTag("chat_timeline"),
@@ -72,7 +86,8 @@ internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, o
             items(timeline, key = { if (it is ChatItem.Activity) "activity:${it.id}" else LazyItemKeys.message(it.id) },
                 contentType = { if (it is ChatItem.Activity) "activity" else "message" }) { item ->
                 when (item) {
-                    is ChatItem.Message -> MessageItem(item.message, onCopy)
+                    is ChatItem.Message -> MessageItem(item.message, onCopy, searchQuery,
+                        selectedMatch?.takeIf { it.messageId == item.id })
                     is ChatItem.Activity -> AgentActivityGroup(item, onCopy)
                 }
             }
@@ -83,7 +98,7 @@ internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, o
                 }
             } }
         }
-        if (unread && !following) FilledTonalButton(onClick = {
+        if (unread && !following && searchQuery.isBlank()) FilledTonalButton(onClick = {
             following = true; unread = false
             scope.launch { if (list.layoutInfo.totalItemsCount > 0) { list.scrollToItem(list.layoutInfo.totalItemsCount - 1); list.scrollBy(Float.MAX_VALUE) } }
         }, modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp).testTag("new_messages")) { Text(stringResource(R.string.mobile_new_messages)) }

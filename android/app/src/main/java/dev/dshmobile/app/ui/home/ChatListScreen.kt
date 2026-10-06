@@ -74,27 +74,33 @@ internal fun ChatListScreen(state: MobileState, query: String, onQuery: (String)
             ConnectionIssueStrip(state, onRefresh)
             if (state.connection == ConnectionState.ONLINE) state.error?.let { ErrorText(it, Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) }
             pendingDelivery()
-            OutlinedTextField(value = query, onValueChange = onQuery, singleLine = true,
-                label = { Text(stringResource(R.string.mobile_search_chats)) },
-                leadingIcon = { Icon(MobileIcons.Search, null) },
-                trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { onQuery("") }) { Icon(MobileIcons.Close, stringResource(R.string.mobile_clear_search)) } },
-                shape = CircleShape, colors = OutlinedTextFieldDefaults.colors(
-                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
-                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
-                    unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant),
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).testTag("chat_search"))
-            LazyRow(Modifier.fillMaxWidth().testTag("project_filters"), contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                item(key = LazyItemKeys.ALL_PROJECTS) { ProjectChip(stringResource(R.string.mobile_all_projects), projectId == null, "project_all") { onProject(null) } }
-                items(projects, key = { LazyItemKeys.project(it.workspace.id) }) { project ->
-                    ProjectChip(stringResource(R.string.mobile_project_filter, project.workspace.name, project.chatCount), projectId == project.workspace.id,
-                        "project_filter_${project.workspace.id}") { onProject(project.workspace.id) }
-                }
-            }
             if (state.demo) Text(stringResource(R.string.mobile_demo_tag), Modifier.padding(horizontal = 20.dp, vertical = 4.dp).testTag("demo_label"),
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             PullToRefreshBox(isRefreshing = state.busy && state.connection == ConnectionState.SYNCING, onRefresh = onRefresh,
                 modifier = Modifier.weight(1f).fillMaxWidth()) {
-                LazyColumn(state = list, modifier = Modifier.fillMaxSize().testTag("chat_list"), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 80.dp + navigationBottom)) {
+                LazyColumn(state = list, modifier = Modifier.fillMaxSize().testTag("chat_list"), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, // Reserve the FAB plus its 16dp margin and extra scaled-label space; Scaffold already consumes bars.
+                    bottom = 96.dp + navigationBottom + (24 * androidx.compose.ui.platform.LocalDensity.current.fontScale).dp)) {
+                    // Filters scroll with the list so large landscape text cannot consume the row viewport.
+                    item(key = "list-filters") {
+                        Column {
+                            OutlinedTextField(value = query, onValueChange = onQuery, singleLine = true,
+                                label = { Text(stringResource(R.string.mobile_search_chats)) },
+                                leadingIcon = { Icon(MobileIcons.Search, null) },
+                                trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { onQuery("") }) { Icon(MobileIcons.Close, stringResource(R.string.mobile_clear_search)) } },
+                                shape = CircleShape, colors = OutlinedTextFieldDefaults.colors(
+                                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                                    unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant),
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).testTag("chat_search"))
+                            LazyRow(Modifier.fillMaxWidth().testTag("project_filters"), contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                item(key = LazyItemKeys.ALL_PROJECTS) { ProjectChip(stringResource(R.string.mobile_all_projects), projectId == null, "project_all") { onProject(null) } }
+                                items(projects, key = { LazyItemKeys.project(it.workspace.id) }) { project ->
+                                    ProjectChip(stringResource(R.string.mobile_project_filter, project.workspace.name, project.chatCount), projectId == project.workspace.id,
+                                        "project_filter_${project.workspace.id}") { onProject(project.workspace.id) }
+                                }
+                            }
+                        }
+                    }
                     if (visible.isEmpty()) item(key = LazyItemKeys.EMPTY_CHATS) {
                         EmptyState(
                             title = stringResource(when {

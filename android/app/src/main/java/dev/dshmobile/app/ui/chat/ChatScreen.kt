@@ -28,8 +28,14 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     val copied = stringResource(R.string.mobile_copied)
-    val onCopy: (String) -> Unit = { text -> scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("DSH", text))); snackbars.showSnackbar(copied) } }
+    val haptic = rememberActionHaptic()
+    val onCopy: (String) -> Unit = { text -> scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("DSH", text))); haptic(); snackbars.showSnackbar(copied) } }
     var cancel by remember { mutableStateOf(false) }
+    var searching by androidx.compose.runtime.saveable.rememberSaveable(requestedSession) { mutableStateOf(false) }
+    var query by androidx.compose.runtime.saveable.rememberSaveable(requestedSession) { mutableStateOf("") }
+    var matchIndex by remember(requestedSession, query) { mutableIntStateOf(0) }
+    val matches = remember(state.snapshot?.messages, query) { searchHistory(state.snapshot?.messages.orEmpty(), query) }
+    val selectedMatch = matches.getOrNull(matchIndex.coerceAtMost(matches.lastIndex))
     val snapshot = state.snapshot?.takeIf { requestedSession == null || it.session.id == requestedSession }
     val visibleState = if (snapshot == null) state.copy(snapshot = null) else state
     Scaffold(containerColor = MaterialTheme.colorScheme.background, snackbarHost = { SnackbarHost(snackbars) },
@@ -43,6 +49,9 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
                     style = MaterialTheme.typography.labelMedium, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.primary)
             }
         }, actions = {
+            IconButton(onClick = { searching = !searching; if (!searching) query = "" }, enabled = snapshot != null, modifier = Modifier.testTag("search_history")) {
+                Icon(MobileIcons.Search, stringResource(R.string.mobile_search_history))
+            }
             ConnectionPill(state, onConnection, compact = true)
             IconButton(onClick = model::refresh, enabled = !state.busy, modifier = Modifier.testTag("refresh_chat")) { Icon(MobileIcons.Refresh, stringResource(R.string.mobile_refresh)) }
         }, colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)) },
@@ -53,6 +62,10 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
             }
         }) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).testTag("chat_screen")) {
+            if (searching) HistorySearchBar(query, { query = it }, matches.size, if (selectedMatch == null) -1 else matches.indexOf(selectedMatch),
+                onPrevious = { matchIndex = nextSearchIndex(matches.indexOf(selectedMatch), matches.size, -1) },
+                onNext = { matchIndex = nextSearchIndex(matches.indexOf(selectedMatch), matches.size, 1) },
+                onClose = { searching = false; query = "" })
             ConnectionIssueStrip(state, model::refresh)
             if (state.connection == ConnectionState.ONLINE) state.error?.let { ErrorText(it, Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) }
             if (state.demo) Text(stringResource(R.string.mobile_demo_tag), Modifier.padding(horizontal = 20.dp, vertical = 4.dp).testTag("demo_label"),
@@ -62,7 +75,7 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
                 if (it.activity == "waiting") Notice(stringResource(R.string.mobile_desktop_notice))
                 else if (it.notice != null) Notice(stringResource(R.string.mobile_partial_information))
                 if (it.activity !in listOf("idle", "running", "waiting")) Notice(stringResource(R.string.mobile_unknown_activity))
-                key(it.session.id) { ChatTimeline(it, state.pending, onCopy, Modifier.weight(1f)) }
+                key(it.session.id) { ChatTimeline(it, state.pending, onCopy, Modifier.weight(1f), searchQuery = query, selectedMatch = selectedMatch) }
             } ?: Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 if (state.busy || model.interactionBlocked) CircularProgressIndicator()
                 else EmptyState(
@@ -73,7 +86,7 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
     }
     if (cancel) AlertDialog(onDismissRequest = { cancel = false }, title = { Text(stringResource(R.string.mobile_cancel_title)) },
         text = { Text(stringResource(R.string.mobile_cancel_explanation)) },
-        confirmButton = { TextButton(onClick = { cancel = false; model.cancelRun() }, enabled = snapshot != null && canCancel(visibleState) && !model.interactionBlocked, modifier = Modifier.testTag("stop_run_confirm")) { Text(stringResource(R.string.mobile_cancel_run)) } },
+        confirmButton = { TextButton(onClick = { cancel = false; model.cancelRun(haptic) }, enabled = snapshot != null && canCancel(visibleState) && !model.interactionBlocked, modifier = Modifier.testTag("stop_run_confirm")) { Text(stringResource(R.string.mobile_cancel_run)) } },
         dismissButton = { TextButton(onClick = { cancel = false }) { Text(stringResource(R.string.mobile_keep_running)) } })
 }
 

@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:networkSecurityConfig="@xml/debug_network_security_config" />
+    <application android:networkSecurityConfig="@xml/debug_network_security_config">
+        <!-- Library activity for pure Compose fixtures; absent from release builds. -->
+        <activity android:name="androidx.activity.ComponentActivity" android:exported="true" />
+    </application>
 </manifest>
