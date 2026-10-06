@@ -544,6 +544,31 @@ class RepositoryTest {
             assertTrue(fixture.requests.none { it.path == "/v1/device" })
         }
     }
+    @Test fun `drafts stay isolated across navigation and repository restart`() = runBlocking {
+        withRepository { repo, store, fixture, scope ->
+            fixture.index = """{"items":[${session()},${session().replace("\"id\":\"chat\"", "\"id\":\"other\"")}],"nextCursor":null}"""
+            repo.refresh()
+            repo.updateDraft("Черновик A")
+            repo.selectSession("other")
+            assertEquals("", repo.state.value.draft)
+            repo.updateDraft("Draft B")
+            repo.selectSession("chat")
+            assertEquals("Черновик A", repo.state.value.draft)
+            repo.close()
+            val restarted = NetworkMobileRepository(store, scope, true)
+            try {
+                restarted.restore()
+                assertEquals("Черновик A", restarted.state.value.draft)
+                restarted.setForeground(true)
+                restarted.selectSession("other")
+                assertEquals("Draft B", restarted.state.value.draft)
+                restarted.updateDraft("")
+                restarted.selectSession("chat")
+                assertEquals("Черновик A", restarted.state.value.draft)
+                assertTrue(fixture.mutations.isEmpty())
+            } finally { restarted.close() }
+        }
+    }
     @Test fun `burst edits remain immediate and restore the last complete draft`() = runBlocking {
         withRepository { repo, store, _, scope ->
             store.gate = CompletableDeferred()
