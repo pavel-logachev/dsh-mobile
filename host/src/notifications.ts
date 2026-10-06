@@ -89,8 +89,14 @@ export class NotificationFeed {
       this.state.writeNotificationState('producer', this.watermarks);
     }
   }).catch(() => { this.coverage = 'degraded'; }).finally(() => { this.scheduled = false; if (this.queue.length && !this.lifetime.signal.aborted) this.schedule(); }); }
-  async idle(): Promise<void> { await this.work; }
+  async idle(): Promise<void> {
+    do { await this.work; } while ((this.scheduled || this.queue.length) && !this.lifetime.signal.aborted);
+  }
   private async accept(id: string, event: NotificationSource): Promise<void> {
+    // Global events include excluded subagents. Establish current membership before
+    // sequence bookkeeping; absence is not source failure or a feed gap.
+    const sessions = await this.source.list(this.signal());
+    if (!sessions.some(s => s.id === id)) return;
     const old = this.watermarks[id];
     if (old && event.seq <= old.seq) return;
     const gap = !!old && event.seq !== old.seq + 1;

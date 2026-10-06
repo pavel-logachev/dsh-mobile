@@ -24,11 +24,19 @@ async function fixture(t: any) {
   feed.putSettings(device.deviceId, { expectedRevision: 0, enabled: true, projects: [], chats: [] });
   const head = (await feed.page(device.deviceId)).nextCursor;
   t.after(async () => { await feed.close(); state.close(); rmSync(dir, { recursive: true, force: true }); });
-  async function event(seq: number, type: string, options: Partial<NotificationSource> = {}) {
-    proof.cursor = seq; listener('chat', { seq, type, time: Date.now(), ...options }); await feed.idle();
+  async function event(seq: number, type: string, options: Partial<NotificationSource> = {}, id = 'chat') {
+    proof.cursor = seq; listener(id, { seq, type, time: Date.now(), ...options }); await feed.idle();
   }
   return { state, feed, device, head, event, proof, source, listed: (rows: typeof listed) => { listed = rows; } };
 }
+
+test('excluded subagent events never invalidate an ordinary completion journal', async t => {
+  const f = await fixture(t); f.proof.completed = [{ turn: 1, sourceSeq: 0 }]; await f.event(0, 'turn/end', { turn: 1, completed: true });
+  f.source.evidence = async () => { throw new (await import('../src/errors.ts')).HostError('not_found'); };
+  await f.event(0, 'turn/start', {}, 'subagent'); await f.event(1, 'tool/call', {}, 'subagent'); await f.event(2, 'step/end', {}, 'subagent');
+  const page = await f.feed.page(f.device.deviceId, f.head);
+  assert.equal(page.resetRequired, false); assert.equal(page.coverage, 'ready'); assert.equal(page.items[0]?.kind, 'answer-finished');
+});
 
 test('restart baselines history and keeps stable cursor/settings without completion storms', async t => {
   const f = await fixture(t); f.proof.completed = [{ turn: 1, sourceSeq: 0 }]; await f.event(0, 'turn/end', { turn: 1, completed: true });
