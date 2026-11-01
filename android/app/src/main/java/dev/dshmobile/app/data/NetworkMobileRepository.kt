@@ -787,7 +787,8 @@ internal class NetworkMobileRepository(
     private suspend fun dispatchOn(mutation: HostApi, command: StoredCommand, drafts: Map<String, String>) {
         // Persist the watch BEFORE any prompt bytes can leave. A process death cannot admit a
         // phone task whose watch was never stored. No draft text or attachments enter this record.
-        if (command.kind == "send") watchPrompt(requireNotNull(stored.host).deviceId, requireNotNull(command.sessionId), command.requestId)
+        if (command.kind == "send" && state.value.capabilities?.promptOutcomes == true)
+            watchPrompt(requireNotNull(stored.host).deviceId, requireNotNull(command.sessionId), command.requestId)
         try { persist(stored.copy(pending = command, drafts = drafts, notSentSessions = stored.notSentSessions.filterNot { it == command.sessionId }.toSet())) }
         catch (failure: Exception) { unwatchPrompt(command.requestId); throw failure }
         mutableState.value = state.value.copy(pending = command.presentation(), draft = draftFor(stored.selectedSessionId), busy = true, error = null)

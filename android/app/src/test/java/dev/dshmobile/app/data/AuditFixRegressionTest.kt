@@ -25,10 +25,11 @@ class AuditFixRegressionTest {
         var permanent = false
         var calls = 0
         var beforeMessage: (() -> Unit)? = null
+        var outcomes = true
         fun snapshot() = """{"session":{"id":"chat","title":"Synthetic","workspaceId":"w","updatedAt":1,"running":false,"canExecute":true},"messages":[],"cursor":1,"hasMore":false,"activity":"idle"}"""
         fun json(body: String, status: Int = 200) = MockResponse().setResponseCode(status).setHeader("Content-Type", "application/json").setBody(body)
         override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
-            "/v1/capabilities" -> json("""{"protocolVersion":1,"hostName":"Synthetic","upstreamVersion":"fixture","capabilities":{"sessions":true,"textPrompt":true,"cancel":true,"liveSnapshots":false,"attachments":false,"questions":false,"approvals":false,"push":false}}""")
+            "/v1/capabilities" -> json("""{"protocolVersion":1,"hostName":"Synthetic","upstreamVersion":"fixture","capabilities":{"sessions":true,"textPrompt":true,"cancel":true,"liveSnapshots":false,"attachments":false,"questions":false,"approvals":false,"push":false,"promptOutcomes":$outcomes}}""")
             "/v1/workspaces" -> json("""{"items":[{"id":"w","name":"Synthetic","canExecute":true}]}""")
             "/v1/presets" -> json("""{"items":[]}""")
             "/v1/sessions" -> json("""{"items":[{"id":"chat","title":"Synthetic","workspaceId":"w","updatedAt":1,"running":false,"canExecute":true}],"nextCursor":null}""")
@@ -37,8 +38,8 @@ class AuditFixRegressionTest {
             else -> json("{}", 404)
         }
     }
-    private suspend fun fixture(selected: Boolean, watch: suspend (String, String, String) -> Unit = { _, _, _ -> }, block: suspend (NetworkMobileRepository, Fixture, MutableList<Int>) -> Unit) {
-        val store = Store(); val fixture = Fixture(); val attempts = CopyOnWriteArrayList<Int>()
+    private suspend fun fixture(selected: Boolean, watch: suspend (String, String, String) -> Unit = { _, _, _ -> }, outcomes: Boolean = true, block: suspend (NetworkMobileRepository, Fixture, MutableList<Int>) -> Unit) {
+        val store = Store(); val fixture = Fixture().also { it.outcomes = outcomes }; val attempts = CopyOnWriteArrayList<Int>()
         MockWebServer().use { server ->
             server.dispatcher = fixture; server.start()
             store.value = StoredState(host = PairedHost(HostEndpoint(server.url("/").newBuilder().host("127.0.0.1").build().toString().removeSuffix("/")), "device", "synthetic-device-token-for-tests", "Synthetic"), selectedSessionId = if (selected) "chat" else null)
@@ -54,6 +55,15 @@ class AuditFixRegressionTest {
             fixture.beforeMessage = { assertEquals("device", watched?.first); assertEquals("chat", watched?.second); assertTrue(validRequestId(watched!!.third)) }
             repo.sendMessage("Synthetic phone prompt")
             assertNotNull(watched)
+        }
+    }
+    @Test fun capabilityFalseNeverRegistersWatchBeforePhoneAdmission() = runBlocking {
+        var watches = 0
+        fixture(true, { _, _, _ -> watches++ }, outcomes = false) { repo, fixture, _ ->
+            var admitted = false
+            fixture.beforeMessage = { admitted = true; assertEquals(0, watches) }
+            repo.sendMessage("Synthetic phone prompt")
+            assertTrue(admitted); assertEquals(0, watches)
         }
     }
     @Test fun `AND03 ordinary refresh retries a transient snapshot GET and recovers`() = runBlocking {

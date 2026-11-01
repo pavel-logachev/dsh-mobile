@@ -25,15 +25,14 @@ class NotificationStoreRecoveryTest {
         val recreated = NotificationStore(record, StateCipher { key })
         assertTrue(recreated.read().needsWatchService(101))
         var posts = 0
-        WatchCoordinator(recreated::read, recreated::update, {
-            dev.dshmobile.app.model.SessionSnapshot(dev.dshmobile.app.model.SessionSummary("chat", "Synthetic", "w", 1, false, true),
-                emptyList(), 1, false, "idle", promptOutcomes = listOf(dev.dshmobile.app.model.PromptOutcome(request, "turn", "completed")))
+        WatchCoordinator(recreated::read, recreated::update, { _, _, _, _ ->
+            PromptOutcomes("t", listOf(PromptOutcome(request, "completed", "2026-11-01T12:00:00Z", "turn")))
         }, { _, _ -> posts++ }, { 101 }).resync()
         assertEquals(1, posts); assertTrue(recreated.read().watches.isEmpty())
     }
-    @Test fun missingBaseRecoversApi26BackupInsteadOfForgettingOptInAndCursor() = runBlocking {
+    @Test fun missingBaseRecoversApi26BackupInsteadOfForgettingLocalPolicyAndWatch() = runBlocking {
         val cipher = StateCipher { SecretKeySpec(ByteArray(32) { 8 }, "AES") }
-        val expected = NotificationLocal(enabled = true, cursor = "head", processed = listOf(ProcessedNotification("event", 100)))
+        val expected = NotificationLocal(enabled = false, watches = listOf(PhoneWatch("chat", "00000000-0000-4000-8000-000000000001", 1000)))
         var backup: ByteArray? = cipher.encrypt(mobileJson.encodeToString(NotificationLocal.serializer(), expected).toByteArray())
         var recovered = false
         val record = object : AtomicStateFile {

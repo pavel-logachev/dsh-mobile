@@ -2,9 +2,9 @@ package dev.dshmobile.app.ui
 
 import kotlinx.coroutines.*
 
-/** Activity STARTED owns pending FGS admission; synchronization never gates admission. */
+/** Activity STARTED owns guarded admission of pending phone watches. */
 internal class NotificationResume(private val scope: CoroutineScope, private val allowed: suspend () -> Boolean,
-    private val start: () -> Unit, private val failed: suspend () -> Unit, private val sync: suspend () -> Unit) {
+    private val start: () -> Unit, private val failed: suspend () -> Unit) {
     private var active = false
     private var generation = 0L
     private var job: Job? = null
@@ -19,7 +19,6 @@ internal class NotificationResume(private val scope: CoroutineScope, private val
                 if (enabled) start() // Main-thread non-suspending admission immediately after guard.
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { runCatching { failed() } }
-            if (active && generation == ticket) runCatching { sync() }
         }
     }
 }

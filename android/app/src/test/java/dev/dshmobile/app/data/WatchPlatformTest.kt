@@ -51,6 +51,38 @@ class WatchPlatformTest {
         shadowOf(app.getSystemService(NotificationManager::class.java)).setNotificationsEnabled(false)
         assertFalse(watchAlertsAllowed(app))
     }
+    @Test fun actualNotificationManagerReplacesWaitingWithFinalAndTapTargetsChat() = runBlocking {
+        val store = NotificationStore(MemoryWatchRecord(), StateCipher { javax.crypto.spec.SecretKeySpec(ByteArray(32) { 5 }, "AES") })
+        app.getSharedPreferences("mobile_language", 0).edit().putString("language", "ru").commit()
+        for (channel in notificationChannels) app.getSystemService(NotificationManager::class.java).createNotificationChannel(
+            android.app.NotificationChannel(channel.id, channel.id, NotificationManager.IMPORTANCE_HIGH))
+        val waiting = WatchAlert("waiting-key", "chat", "turn", "attention", "Synthetic", expiresAt = Long.MAX_VALUE)
+        store.update { NotificationLocal(deviceId = "device", outbox = listOf(waiting)) }
+        NotificationPosting.recordForegroundPost()
+        org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(1))
+        postWatchAlert(app, "device", waiting, false, store)
+        val manager = app.getSystemService(NotificationManager::class.java)
+        val first = manager.activeNotifications.single { it.id == 2 }
+        assertEquals("Нужен ответ", first.notification.extras.getString(Notification.EXTRA_TITLE))
+        assertEquals(0, first.notification.flags and Notification.FLAG_ONLY_ALERT_ONCE)
+        val final = waiting.copy(key = "final-key", kind = "answer")
+        store.update { it.copy(outbox = listOf(final)) }
+        org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(1))
+        postWatchAlert(app, "device", final, false, store)
+        val second = manager.activeNotifications.single { it.id == 2 }
+        assertEquals(first.tag, second.tag); assertEquals("Ответ готов", second.notification.extras.getString(Notification.EXTRA_TITLE))
+        assertEquals(0, second.notification.flags and Notification.FLAG_ONLY_ALERT_ONCE)
+        val intent = shadowOf(second.notification.contentIntent).savedIntent
+        assertEquals("chat", intent.getStringExtra("notificationChat")); assertEquals("device", intent.getStringExtra("notificationDevice"))
+        org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(1))
+        postWatchAlert(app, "device", final, true, store)
+        assertTrue(manager.activeNotifications.single { it.id == 2 }.notification.flags and Notification.FLAG_ONLY_ALERT_ONCE != 0)
+        val failure = final.copy(key = "error", kind = "error", summary = "Ошибка 😀")
+        store.update { it.copy(outbox = listOf(failure)) }
+        org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(1))
+        postWatchAlert(app, "device", failure, false, store)
+        assertTrue(manager.activeNotifications.single { it.id == 2 }.notification.extras.getString(Notification.EXTRA_TEXT)!!.contains("Ошибка 😀"))
+    }
     @Test fun `boot restore receiver ignores unrelated broadcast without starting work`() {
         WatchRestoreReceiver().onReceive(app, Intent("synthetic.UNRELATED"))
         assertNull(shadowOf(app).nextStartedService)

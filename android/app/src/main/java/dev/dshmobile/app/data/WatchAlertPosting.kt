@@ -6,10 +6,11 @@ import androidx.core.app.NotificationCompat
 import dev.dshmobile.app.R
 import dev.dshmobile.app.locale.appLanguageContext
 
-/** Stable per-turn identity is also the crash-replay identity, independent of feed epochs. */
-internal suspend fun postWatchAlert(context: Context, device: String, alert: WatchAlert, replay: Boolean) {
+/** Stable chat slot replaces waiting with its final result; durable phase keys dedupe delivery. */
+internal suspend fun postWatchAlert(context: Context, device: String, alert: WatchAlert, replay: Boolean,
+    store: NotificationStore = NotificationStore(context)) {
     if (!watchAlertsAllowed(context)) throw MobileFailure("notifications_blocked")
-    val local = NotificationStore(context).read()
+    val local = store.read()
     if (!local.enabled || local.deviceId != device) return
     val strings = appLanguageContext(context)
     val attention = alert.kind == "attention"
@@ -21,7 +22,7 @@ internal suspend fun postWatchAlert(context: Context, device: String, alert: Wat
     val chat = alert.title.ifBlank { strings.getString(R.string.notif_unnamed_chat) }
     val body = if (alert.kind == "error") "$chat · ${alert.summary.orEmpty().ifBlank { strings.getString(R.string.mobile_turn_failed_unknown) }}" else chat
     val channel = if (attention) "attention_alert_v2" else "answers_alert_v2"
-    val tag = "$device:turn:${alert.key}"
+    val tag = watchNotificationTag(device, alert.sessionId)
     val notification = NotificationCompat.Builder(context, channel).setSmallIcon(R.drawable.ic_launcher_foreground)
         .setContentTitle(title).setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body))
         .setContentIntent(notificationChatIntent(context, device, alert.sessionId, null))
@@ -31,7 +32,7 @@ internal suspend fun postWatchAlert(context: Context, device: String, alert: Wat
         .setAutoCancel(true).setOnlyAlertOnce(replay).addExtras(alertLanguageExtras(if (alert.kind == "answer") "answers" else alert.kind, body)).build()
     NotificationPosting.paced {
         // No suspension between permission/policy guard and platform notify.
-        NotificationStore(context).postIfCurrent(device, alert.key) {
+        store.postIfCurrent(device, alert.key) {
             if (watchAlertsAllowed(context)) context.getSystemService(NotificationManager::class.java).notify(tag, 2, notification)
             else throw MobileFailure("notifications_blocked")
         }

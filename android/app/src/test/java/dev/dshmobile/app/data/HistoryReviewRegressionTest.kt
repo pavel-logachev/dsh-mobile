@@ -65,17 +65,6 @@ class HistoryReviewRegressionTest {
         assertEquals(0L, retryAfterMillis("Thu, 1 Jan 1970 00:02:00 GMT", 180000))
         assertEquals(3600000L, retryAfterMillis("999999", now))
     }
-    @Test fun `legacy system choices initialize modes once without overriding later edits`() {
-        val old = NotificationLocal()
-        val migrated = migrateLegacyModes(old, false, LegacyAlert(0, true), LegacyAlert(4, false))
-        assertEquals(AlertMode.OFF, migrated.answerMode); assertEquals(AlertMode.OFF, migrated.attentionMode)
-        assertEquals(AlertMode.SILENT, migrateLegacyModes(old, true, LegacyAlert(2, true), LegacyAlert(4, false)).answerMode)
-        assertEquals(AlertMode.SILENT, migrateLegacyModes(old, true, LegacyAlert(4, false), null).answerMode)
-        assertEquals(AlertMode.OFF, migrateLegacyModes(old, true, LegacyAlert(0, true), null).answerMode)
-        assertEquals(AlertMode.SOUND, migrateLegacyModes(old, true, LegacyAlert(3, true), null).answerMode)
-        val edited = migrated.copy(answerMode = AlertMode.SOUND)
-        assertEquals(edited, migrateLegacyModes(edited, false, LegacyAlert(0, false), null))
-    }
     @Test fun `atomic coexistence budget is at most ten MiB`() {
         assertTrue(EncryptedHistoryStore.RECORD_LIMIT * 2 <= 10 * 1024 * 1024)
     }

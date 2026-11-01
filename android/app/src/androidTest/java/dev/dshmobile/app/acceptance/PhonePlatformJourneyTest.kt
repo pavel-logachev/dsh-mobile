@@ -90,52 +90,6 @@ class PhonePlatformJourneyTest {
         dev.dshmobile.app.ui.chat.TemporaryMedia.cleanup(context, emptyList())
         assertFalse(camera.exists())
     }
-    @Test fun notificationTapFocusAndAnswer() {
-        configure()
-        val manager = context.getSystemService(NotificationManager::class.java)
-        val host = runBlocking { EncryptedStateStore(context).read().host!! }
-        val store = NotificationStore(context)
-        runBlocking { store.update { NotificationLocal(enabled = true, deviceId = host.deviceId, settings = NotificationSettings(enabled = true), dirty = true, channelModesMigrated = true) } }
-        val intent = android.content.Intent(context, NotificationService::class.java)
-        try { ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            scenario.onActivity { it.startForegroundService(intent) }
-            compose.waitUntil(20000) { manager.activeNotifications.any { it.notification.extras.getBoolean("dev.dshmobile.questionAlert") } }
-            val notification = manager.activeNotifications.single { it.notification.extras.getBoolean("dev.dshmobile.questionAlert") }.notification
-            assertEquals("Which synthetic check?", notification.extras.getString(android.app.Notification.EXTRA_TEXT))
-            assertEquals(android.app.Notification.VISIBILITY_PRIVATE, notification.visibility)
-            assertNotNull(notification.publicVersion)
-            assertNull(notification.publicVersion.extras.getString(android.app.Notification.EXTRA_TEXT))
-            assertFalse(notification.publicVersion.extras.toString().contains("Which synthetic check?"))
-            assertEquals(1, notification.actions.size)
-            instrumentation.uiAutomation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS)
-            // SystemUI auto-group summary repeats question text but launches MAIN, not OPEN_CHAT.
-            // Expand the DSH group, then click only the exact question in the real child row.
-            val exactQuestion: (AccessibilityNodeInfo) -> Boolean = { node -> node.isVisibleToUser && node.text?.toString() == "Which synthetic check?" }
-            if (android.os.Build.VERSION.SDK_INT < 36) {
-            val expand = awaitNode { node -> node.isVisibleToUser && node.viewIdResourceName == "android:id/expand_button" && node.parent?.parent?.let { header ->
-                fun containsApp(parent: AccessibilityNodeInfo): Boolean = parent.text?.toString() == "DSH Mobile" || (0 until parent.childCount).any { index -> parent.getChild(index)?.let(::containsApp) == true }
-                containsApp(header)
-            } == true }
-            val expandBounds = android.graphics.Rect(); expand.getBoundsInScreen(expandBounds)
-            instrumentation.uiAutomation.executeShellCommand("input tap ${expandBounds.centerX()} ${expandBounds.centerY()}").use { descriptor ->
-                android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { it.readBytes() }
-            }
-            }
-            instrumentation.uiAutomation.waitForIdle(500, 3000)
-            val questionNode = awaitNode(exactQuestion)
-            var target: AccessibilityNodeInfo? = questionNode
-            while (target != null && !target.isClickable) target = target.parent
-            check(target?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true)
-            try { compose.waitUntil(15000) { compose.onAllNodesWithTag("question_question").fetchSemanticsNodes().isNotEmpty() } }
-            catch (failure: Throwable) { compose.onRoot().printToLog("SyntheticPlatform"); awaitNode { false }; throw failure }
-            compose.onNodeWithTag("question_option_0").performScrollTo().performClick()
-            compose.onNodeWithTag("question_submit").performClick()
-            compose.waitUntil(15000) { compose.onAllNodesWithTag("question_record_question").fetchSemanticsNodes().isNotEmpty() }
-            compose.waitUntil(10000) { manager.activeNotifications.none { it.notification.extras.getBoolean("dev.dshmobile.questionAlert") } }
-            // SINGLE_TOP replaces the Activity intent; restore ActivityScenario's launch identity for teardown.
-            scenario.onActivity { it.intent = android.content.Intent(android.content.Intent.ACTION_MAIN).addCategory(android.content.Intent.CATEGORY_LAUNCHER).setClass(context, MainActivity::class.java) }
-        } } finally { context.stopService(intent); manager.cancelAll() }
-    }
     @Test fun photoPickerUploadsAndSends() {
         configure()
         val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, ContentValues().apply {

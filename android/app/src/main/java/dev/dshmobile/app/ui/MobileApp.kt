@@ -54,15 +54,6 @@ private fun PairedApp(state: MobileState, model: MobileViewModel) {
     var route by rememberSaveable { mutableStateOf("home") }
     var previousRoute by rememberSaveable { mutableStateOf("home") }
     var sessionId by rememberSaveable { mutableStateOf<String?>(null) }
-    val notificationOwner = LocalLifecycleOwner.current
-    DisposableEffect(route, sessionId, notificationOwner) {
-        fun update() { dev.dshmobile.app.data.VisibleNotificationChat.sessionId = sessionId?.takeIf {
-            route == "chat" && notificationOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
-        } }
-        val observer = LifecycleEventObserver { _, _ -> update() }
-        notificationOwner.lifecycle.addObserver(observer); update()
-        onDispose { notificationOwner.lifecycle.removeObserver(observer); dev.dshmobile.app.data.VisibleNotificationChat.sessionId = null }
-    }
     var project by rememberSaveable { mutableStateOf<String?>(null) }
     var search by rememberSaveable { mutableStateOf("") }
     var newChat by rememberSaveable { mutableStateOf(false) }

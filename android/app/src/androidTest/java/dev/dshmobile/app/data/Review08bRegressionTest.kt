@@ -16,69 +16,6 @@ import java.util.UUID
 /** Independent probes. Assertions intentionally assert required behavior, not the defect. */
 class Review08bRegressionTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
-    @Test fun rapidCancellationLeavesNoOrphanSummary() = runBlocking {
-        ensureNotificationChannels(context)
-        val manager = context.getSystemService(NotificationManager::class.java)
-        NotificationPosting.cancelAll(context); delay(400)
-        try {
-            repeat(12) { round ->
-                val child = NotificationCompat.Builder(context, "attention_silent_v2").setSmallIcon(R.drawable.ic_launcher_foreground)
-                    .setContentTitle("Synthetic").setGroup(ALERT_GROUP).setSilent(true).build()
-                manager.notify("a", 2, child); updateAlertSummary(context, added = "a" to child)
-                manager.notify("b", 2, child); updateAlertSummary(context, added = "b" to child)
-                withTimeout(3000) { while(manager.activeNotifications.count { it.id == 2 } != 2) delay(10) }
-                NotificationPosting.cancel(context, "a", 2)
-                NotificationPosting.cancel(context, "b", 2)
-                delay(2000)
-                assertEquals("round=$round: summary left after both children removed", 0, manager.activeNotifications.size)
-            }
-        } finally { NotificationPosting.cancelAll(context) }
-    }
-    @Test fun dismissalInvalidatesQueuedNotificationTicket() = runBlocking {
-        ensureNotificationChannels(context)
-        val manager = context.getSystemService(NotificationManager::class.java)
-        NotificationPosting.cancelAll(context); delay(300)
-        val ticket = NotificationPosting.ticket("dismissed", 2)
-        try {
-            NotificationDismissedReceiver().onReceive(context, Intent().putExtra("removedTag", "dismissed"))
-            var committed = false
-            NotificationPosting.commit(ticket) { committed = true }
-            assertFalse("Dismissed child's already queued post remains valid", committed)
-            val next = NotificationPosting.ticket("dismissed", 2)
-            try { NotificationPosting.commit(next) { committed = true }; assertTrue("New event must still alert", committed) }
-            finally { NotificationPosting.release(next) }
-        } finally { NotificationPosting.release(ticket); NotificationPosting.cancelAll(context) }
-    }
-    @Test fun summaryRelocalizesWithChildren() = runBlocking {
-        val manager = context.getSystemService(NotificationManager::class.java)
-        NotificationPosting.cancelAll(context)
-        ensureNotificationChannels(context)
-        val prefs = context.getSharedPreferences(dev.dshmobile.app.locale.LANGUAGE_PREFERENCES, android.content.Context.MODE_PRIVATE)
-        val previous = prefs.getString(dev.dshmobile.app.locale.LANGUAGE_KEY, null)
-        val locales = if (android.os.Build.VERSION.SDK_INT >= 33) context.getSystemService(android.app.LocaleManager::class.java).applicationLocales else null
-        fun pin(tag: String) {
-            if (android.os.Build.VERSION.SDK_INT >= 33) context.getSystemService(android.app.LocaleManager::class.java).applicationLocales = android.os.LocaleList.forLanguageTags(tag)
-            else prefs.edit().putString(dev.dshmobile.app.locale.LANGUAGE_KEY, tag).commit()
-        }
-        try {
-            pin("en")
-            val child = NotificationCompat.Builder(context, "attention_silent_v2").setSmallIcon(R.drawable.ic_launcher_foreground).setGroup(ALERT_GROUP).setSilent(true).build()
-            manager.notify("language", 2, child); updateAlertSummary(context, added = "language" to child)
-            withTimeout(3000) { while (manager.activeNotifications.none { it.id == 3 }) delay(20) }
-            val summary = manager.activeNotifications.single { it.id == 3 }.notification
-            assertEquals(summaryBody(dev.dshmobile.app.locale.appLanguageContext(context), NotificationSummary(1, 1, 0)), summary.extras.getString(Notification.EXTRA_TEXT))
-            val pendingIntent = summary.contentIntent
-            pin("ru")
-            refreshNotificationLanguagePass(context)
-            val russianBody = summaryBody(dev.dshmobile.app.locale.appLanguageContext(context), NotificationSummary(1, 1, 0))
-            withTimeout(10000) { while (manager.activeNotifications.single { it.id == 3 }.notification.extras.getString(Notification.EXTRA_TEXT) != russianBody) delay(50) }
-            assertEquals(pendingIntent, manager.activeNotifications.single { it.id == 3 }.notification.contentIntent)
-        } finally {
-            NotificationPosting.cancelAll(context)
-            if (android.os.Build.VERSION.SDK_INT >= 33) context.getSystemService(android.app.LocaleManager::class.java).applicationLocales = locales!!
-            else prefs.edit().apply { if (previous == null) remove(dev.dshmobile.app.locale.LANGUAGE_KEY) else putString(dev.dshmobile.app.locale.LANGUAGE_KEY, previous) }.commit()
-        }
-    }
     private class Store(var value: StoredState): SecureStateStore {
         override suspend fun read() = value
         override suspend fun write(value: StoredState) { this.value = value }

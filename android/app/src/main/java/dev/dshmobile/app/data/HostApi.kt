@@ -35,11 +35,9 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
         catch (failure: Exception) { relayProxy?.retire(); io.close { relayProxy?.closePhysical() }; throw failure }
     private val eventClient = client.newBuilder().callTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
         .addInterceptor(BoundedEventSource()).build()
-    // Notification-only hook: host comments every 15s (configured maximum 20s).
-    // Keep mutation and session-stream transport budgets unchanged.
-    private val notificationClient = client.newBuilder().callTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
-        .readTimeout(NOTIFICATION_IDLE_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
-        .addInterceptor(BoundedEventSource(128 * 1024L)).build()
+    // Endpoint holds for up to 25 s: do not route it through the ordinary 15 s GET budget.
+    private val outcomesClient = client.newBuilder().callTimeout(35, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(35, java.util.concurrent.TimeUnit.SECONDS).build()
     private val base = endpoint.baseUrl.toHttpUrl()
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
@@ -65,7 +63,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             }
         } ?: throw MobileFailure("network_unavailable")
     }
-    private suspend fun executeOnce(request: Request, limit: Int, recoverClosedRead: Boolean = false, retryOf: Call? = null): HttpResult = suspendCancellableCoroutine { continuation ->
+    private suspend fun executeOnce(request: Request, limit: Int, recoverClosedRead: Boolean = false, retryOf: Call? = null, transport: OkHttpClient = client): HttpResult = suspendCancellableCoroutine { continuation ->
         synchronized(admission) {
             if (!continuation.isActive) return@suspendCancellableCoroutine
             if (retired.get() || retryOf?.isCanceled() == true) {
@@ -82,7 +80,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             val callClient = mutationPool?.let { pool -> client.newBuilder().connectionPool(pool)
                 .eventListener(object : okhttp3.EventListener() {
                     override fun requestHeadersStart(call: Call) { headersAttempted.set(true) }
-                }).build() } ?: client
+                }).build() } ?: transport
             val singleRequest = if (request.method == "GET" || request.body == null) request else {
                 val body = request.body!!
                 request.newBuilder().method(request.method, object : okhttp3.RequestBody() {
@@ -197,6 +195,19 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
         // Receiving a bad/oversized history does not prove the paired host is offline.
         if (failure.key == "invalid_response") throw MobileFailure("chat_unavailable")
         throw failure
+    }
+
+    suspend fun promptOutcomes(sessionId: String, requestIds: List<String>, since: String? = null, waitSeconds: Int = 0): PromptOutcomes {
+        val ids = requestIds.map { it.lowercase() }.distinct()
+        if (ids.size !in 1..32 || ids.any { !validRequestId(it) } || waitSeconds !in 0..25) throw MobileFailure("invalid_selection")
+        val builder = request("sessions", sessionId, "prompt-outcomes")
+        val url = builder.build().url.newBuilder().apply {
+            ids.forEach { addQueryParameter("requestId", it) }
+            since?.let { addQueryParameter("since", it) }
+            addQueryParameter("waitSeconds", waitSeconds.toString())
+        }.build()
+        val result = executeOnce(builder.url(url).build(), 128 * 1024, transport = outcomesClient)
+        return decodePromptOutcomes(result.checked(), ids)
     }
 
     suspend fun command(value: StoredCommand): CommandReceipt {
@@ -341,39 +352,6 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             }
         }
     }
-    suspend fun notificationSettings(): NotificationSettings = decodeWire<NotificationSettings>(execute(request("notification-settings").build()).checked())
-    suspend fun putNotificationSettings(value: NotificationSettings): NotificationSettings = decodeWire<NotificationSettings>(execute(request("notification-settings")
-        .put(mobileJson.encodeToString(NotificationSettingsBody(value.revision, value.enabled, value.projects, value.chats)).toRequestBody(jsonType)).build()).checked())
-
-    fun observeNotifications(after: String?, onPage: (NotificationPage) -> Unit, onFailure: (String, Long) -> Unit): EventSource {
-        val builder = request("notification-events", "stream")
-        val url = builder.build().url.newBuilder().apply { after?.let { addQueryParameter("after", it) } }.build()
-        val req = builder.url(url).header("Accept", "text/event-stream").build()
-        val cancelled = java.util.concurrent.atomic.AtomicBoolean()
-        val source = synchronized(admission) {
-            if (retired.get()) throw MobileFailure("network_unavailable")
-            EventSources.createFactory(notificationClient).newEventSource(req, object : EventSourceListener() {
-                override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
-                    if (cancelled.get() || retired.get() || type != "notification-page") return
-                    try {
-                        if (data.toByteArray().size > 128 * 1024) throw MobileFailure("invalid_response")
-                        onPage(decodeWire<NotificationPage>(data).checked())
-                    } catch (_: Exception) { cancelOnIo { eventSource.cancel() }; onFailure("invalid_response", 0) }
-                }
-                override fun onClosed(eventSource: EventSource) { if (!cancelled.get() && !retired.get()) onFailure("network_unavailable", 0) }
-                override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                    if (cancelled.get() || retired.get()) return
-                    val retry = retryAfterMillis(response?.header("Retry-After"))
-                    onFailure(when { response?.code == 401 -> "unauthorized"; response?.code == 403 -> "forbidden"; response?.code == 429 -> "rate_limited"; t is SSLException -> "tls_failed"; t is EventLimitExceeded -> "invalid_response"; else -> "network_unavailable" }, retry)
-                }
-            })
-        }
-        return object : EventSource {
-            override fun request() = req
-            override fun cancel() { if (cancelled.compareAndSet(false, true)) cancelOnIo { source.cancel() } }
-        }
-    }
-
     private fun cancelOnIo(cancel: () -> Unit) {
         if (!io.submit(cancel) && !retired.get()) close()
     }

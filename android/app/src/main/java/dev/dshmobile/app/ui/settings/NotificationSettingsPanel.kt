@@ -65,18 +65,19 @@ import kotlinx.coroutines.launch
             if (value && Build.VERSION.SDK_INT >= 33 && !watchAlertsAllowed(context)) {
                 permissionPending = true; permission.launch(Manifest.permission.POST_NOTIFICATIONS)
             } else change(value)
-        }, onSystem = { context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)) })
+        }, onSystem = { context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)) },
+        supported = state.capabilities?.promptOutcomes == true)
 }
 
 @Composable internal fun NotificationSettingsContent(enabled: Boolean, busy: Boolean, failed: Boolean,
-    permissionMissing: Boolean, onEnabled: (Boolean) -> Unit, onSystem: () -> Unit) {
+    permissionMissing: Boolean, onEnabled: (Boolean) -> Unit, onSystem: () -> Unit, supported: Boolean = true) {
     val label = stringResource(R.string.notif_title)
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
         Switch(checked = enabled && !permissionMissing, onCheckedChange = onEnabled, enabled = !busy,
             modifier = Modifier.padding(start = 8.dp).semantics { contentDescription = label })
     }
-    Text(stringResource(R.string.notif_rationale), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Text(stringResource(if (supported) R.string.notif_rationale else R.string.notif_outcomes_unavailable), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
     if (failed || permissionMissing) Text(stringResource(R.string.notif_blocked), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
     SettingsLinkRow(stringResource(R.string.notif_system), onSystem)

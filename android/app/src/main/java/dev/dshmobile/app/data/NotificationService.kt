@@ -16,9 +16,7 @@ import dev.dshmobile.app.BuildConfig
 import dev.dshmobile.app.R
 import dev.dshmobile.app.locale.appLanguageContext
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collectLatest
-import kotlin.random.Random
 
 /** A bounded phone-task owner, never an always-on connection/status monitor. */
 class NotificationService : Service() {
@@ -59,68 +57,42 @@ class NotificationService : Service() {
         } catch (failure: Exception) { NotificationPosting.logFailure(failure); stopSelf(); return START_NOT_STICKY }
         if (!registered) { connectivity.registerDefaultNetworkCallback(callback); registered = true }
         if (running?.isActive != true) running = scope.launch {
-            try { reconnect.run { monitor() } }
+            try { reconnect.run { monitor(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() } }
             finally { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
         }
         if (policy?.isActive != true) policy = scope.launch {
-            var sessions = local.watches.map { it.sessionId }.toSet()
+            var sessions = local.watches.map { it.sessionId to it.requestId }.toSet()
             store.changes.collectLatest {
                 val current = store.read().pruneWatches(System.currentTimeMillis())
                 if (!current.enabled || (current.watches.isEmpty() && current.outbox.isEmpty())) {
                     stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
                 } else {
-                    val active = current.watches.map { it.sessionId }.toSet()
-                    if (sessions != active) reconnect.networkChanged()
+                    val active = current.watches.map { it.sessionId to it.requestId }.toSet()
+                    if ((active - sessions).isNotEmpty()) reconnect.networkChanged()
                     sessions = active
                 }
             }
         }
+        reconnect.networkChanged() // Explicit foreground/resume/start cancels any held poll.
         return START_STICKY // Ordinary OS process recreation restores the encrypted watch set.
     }
     private suspend fun monitor() {
-        var attempt = 0
-        while (currentCoroutineContext().isActive) {
-            val local = store.update { it.pruneWatches(System.currentTimeMillis()) }
-            if (!local.enabled || (local.watches.isEmpty() && local.outbox.isEmpty()) || !watchAlertsAllowed(this)) break
-            val host = EncryptedStateStore(this).read().host ?: break
-            if (host.deviceId != local.deviceId) break
-            EndpointPolicy.validate(host.endpoint, BuildConfig.DEBUG)
-            val transport = HostApi(host.endpoint, host.deviceToken)
-            val observers = mutableListOf<okhttp3.sse.EventSource>()
-            try {
-                ensureNotificationChannels(appLanguageContext(this))
-                // Open each existing authoritative session stream before GET. No notification
-                // feed subscription/settings or host continuity status participates in recovery.
-                val incoming = Channel<Result<Unit>>(Channel.CONFLATED)
-                for (session in local.watches.map { it.sessionId }.distinct()) {
-                    observers += transport.observe(session, { incoming.trySend(Result.success(Unit)) },
-                        { failure -> incoming.trySend(Result.failure(failure)) })
-                }
-                val coordinator = WatchCoordinator(store::read, store::update, transport::snapshot,
-                    post = { alert, replay -> postWatchAlert(this, host.deviceId, alert, replay) })
-                coordinator.drain()
-                coordinator.resync()
-                if (!store.read().needsWatchService(System.currentTimeMillis())) break
-                attempt = 0
-                val expiry = store.read().watches.minOf { it.expiresAt }
-                // A deadline enforces the promised watch TTL even on an otherwise silent socket.
-                withTimeout((expiry - System.currentTimeMillis()).coerceAtLeast(1)) {
-                    for (hint in incoming) {
-                        hint.getOrThrow()
-                        coordinator.resync()
-                        if (!store.read().needsWatchService(System.currentTimeMillis())) return@withTimeout
-                    }
-                }
-            } catch (timeout: TimeoutCancellationException) {
-                currentCoroutineContext().ensureActive()
-                store.update { it.pruneWatches(System.currentTimeMillis()) }
-            } catch (cancelled: CancellationException) { throw cancelled }
-            catch (failure: Exception) {
-                if (failure is MobileFailure && !notificationRetryable(failure.key)) break
-                delay(notificationRetryDelay(attempt++, 0, Random.nextDouble(0.5, 1.0)))
-            } finally { observers.forEach { it.cancel() }; transport.close() }
+        val local = store.update { it.pruneWatches(System.currentTimeMillis()) }
+        val host = EncryptedStateStore(this).read().host ?: return
+        if (host.deviceId != local.deviceId || !watchAlertsAllowed(this)) return
+        EndpointPolicy.validate(host.endpoint, BuildConfig.DEBUG)
+        val transport = HostApi(host.endpoint, host.deviceToken)
+        try {
+            ensureNotificationChannels(appLanguageContext(this))
+            val coordinator = WatchCoordinator(store::read, store::update, transport::promptOutcomes,
+                post = { alert, replay -> postWatchAlert(this, host.deviceId, alert, replay) })
+            WatchPollLoop(store::update, coordinator,
+                supported = { transport.capabilities().capabilities.promptOutcomes },
+                online = { connectivity.activeNetwork != null }, allowed = { watchAlertsAllowed(this) }).run()
+        } finally {
+            // Cancellation joins physical transport retirement before reconnect admits a new poll.
+            withContext(NonCancellable) { transport.closeAndAwait() }
         }
-        stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
     }
     override fun onDestroy() {
         running?.cancel(); policy?.cancel(); scope.cancel()
@@ -130,8 +102,6 @@ class NotificationService : Service() {
     }
     companion object {
         const val CONNECTION = "phone_task_watch_v1"
-        const val ANSWERS = "answers"
-        const val ATTENTION = "attention"
     }
 }
 

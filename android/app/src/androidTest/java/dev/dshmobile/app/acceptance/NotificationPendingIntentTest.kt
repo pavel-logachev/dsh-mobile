@@ -107,7 +107,7 @@ class NotificationPendingIntentTest {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val manager = context.getSystemService(NotificationManager::class.java)
-        manager.cancelAll(); VisibleNotificationChat.sessionId = null
+        manager.cancelAll()
         val service = Intent(context, NotificationService::class.java)
         val scenario = ActivityScenario.launch(MainActivity::class.java)
         try {
@@ -159,7 +159,6 @@ class NotificationPendingIntentTest {
                     .filterIsInstance<MainActivity>().forEach { if (!it.isFinishing) it.finishAndRemoveTask() }
             }
             instrumentation.waitForIdleSync()
-            VisibleNotificationChat.sessionId = null
         }
     }
 }

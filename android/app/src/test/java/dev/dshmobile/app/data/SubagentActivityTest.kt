@@ -28,13 +28,5 @@ class SubagentActivityTest {
         val waiting = decodeWire<SessionSummary>(base).copy(running = true, runningSubagents = 2, waitingForAnswer = true)
         assertEquals("Ждёт ответа", sessionWorkLabel(waiting, "Работает", "Субагенты", "2", "Ждёт ответа"))
     }
-    @Test fun `authoritative answer event displays regardless of stale list subagent count`() {
-        val event = NotificationEvent(1, "event", 1, 1, 99, "project", "chat", "answer-finished", 1)
-        val local = NotificationLocal(settings = NotificationSettings(enabled = true))
-        for (count in listOf(0, 2)) {
-            val sessions = listOf(decodeWire<SessionSummary>(base).copy(runningSubagents = count))
-            assertTrue(shouldDisplayNotification(event, local, null, sessions))
-            assertEquals(listOf(event), local.applyPage(NotificationPage(1, "epoch", listOf(event), "head", false, false, "ready"), 2).display)
-        }
-    }
+
 }

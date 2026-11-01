@@ -1,40 +1,16 @@
 <resources>
     <string name="notif_title">Уведомления</string>
-    <string name="notif_connection_channel">Связь с компьютером</string>
     <string name="notif_answers_channel">Ответы агента</string>
     <string name="notif_attention_channel">Нужно ваше решение</string>
     <string name="notif_answer_ready">Ответ готов</string>
     <string name="notif_needs_decision">Нужен ответ</string>
-    <string name="notif_generic">Откройте чат на компьютере</string>
     <string name="notif_rationale">Сообщим, когда задача, отправленная с этого телефона, завершится или потребует ответа. Нажатие открывает чат. Когда таких задач нет, фоновое подключение отключено.</string>
     <string name="notif_blocked">Не удалось включить уведомления. Проверьте разрешение и системные ограничения, затем повторите попытку.</string>
     <string name="notif_system">Системные настройки уведомлений</string>
-    <string name="notif_mode_sound">Со звуком</string>
-    <string name="notif_mode_silent">Без звука</string>
-    <string name="notif_answer">Ответить</string>
     <string name="notif_unnamed_chat">Чат без названия</string>
-    <string name="notif_open_chat_fallback">Нажмите, чтобы открыть чат в приложении</string>
-    <string name="notif_summary_channel">Сводка уведомлений о чатах</string>
-    <plurals name="notif_summary_chats">
-        <item quantity="one">%d чат</item>
-        <item quantity="few">%d чата</item>
-        <item quantity="many">%d чатов</item>
-        <item quantity="other">%d чата</item>
-    </plurals>
-    <plurals name="notif_summary_answers">
-        <item quantity="one">Ответы готовы в %d чате</item>
-        <item quantity="few">Ответы готовы в %d чатах</item>
-        <item quantity="many">Ответы готовы в %d чатах</item>
-        <item quantity="other">Ответы готовы в %d чатах</item>
-    </plurals>
-    <plurals name="notif_summary_attention">
-        <item quantity="one">Нужно ваше решение в %d чате</item>
-        <item quantity="few">Нужно ваше решение в %d чатах</item>
-        <item quantity="many">Нужно ваше решение в %d чатах</item>
-        <item quantity="other">Нужно ваше решение в %d чатах</item>
-    </plurals>
     <string name="notif_watch_channel">Задачи с телефона</string>
     <string name="notif_watch_title">Ждём результат задачи</string>
     <string name="notif_watch_body">Задача отправлена с этого телефона</string>
     <string name="notif_task_failed">Задача завершилась ошибкой</string>
+    <string name="notif_outcomes_unavailable">Уведомления о результате задач доступны, если подключённый компьютер поддерживает эту функцию.</string>
 </resources>

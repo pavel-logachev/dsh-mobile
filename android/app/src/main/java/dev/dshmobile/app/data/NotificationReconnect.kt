@@ -25,5 +25,3 @@ internal class NotificationNetworkChanges(private val changed: () -> Unit) {
         else if (signature != route) { val previous = signature; signature = route; if (previous != null) changed() }
     }
 }
-
-internal const val NOTIFICATION_IDLE_TIMEOUT_MS = 25_000L

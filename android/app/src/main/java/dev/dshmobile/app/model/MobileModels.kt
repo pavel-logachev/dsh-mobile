@@ -29,10 +29,6 @@ data class ChatMessage(
 @Serializable
 data class TurnFailure(val message: String, val code: String? = null)
 
-/** Additive host contract: outcomes are device-scoped and retained independently of the bounded transcript. */
-@Serializable
-data class PromptOutcome(val requestId: String, val turnId: String, val status: String, val summary: String? = null)
-
 @Serializable
 data class SessionSnapshot(
     val session: SessionSummary, val messages: List<ChatMessage>, val cursor: Long,
@@ -43,7 +39,6 @@ data class SessionSnapshot(
     val pendingQuestions: List<PendingQuestion> = emptyList(),
     val model: SessionModel? = null,
     val resolvedQuestions: List<ResolvedQuestion>? = null,
-    val promptOutcomes: List<PromptOutcome> = emptyList(),
     @Serializable(with = RunningSubagentsSerializer::class) val runningSubagents: Int = 0,
 )
 @Serializable
@@ -60,7 +55,7 @@ data class PendingCommand(
 data class MobileCapabilities(
     val sessions: Boolean, val textPrompt: Boolean, val cancel: Boolean, val liveSnapshots: Boolean,
     val attachments: Boolean, val questions: Boolean, val approvals: Boolean, val push: Boolean,
-    val notifications: Boolean = false,
+    val promptOutcomes: Boolean = false,
     val questionSkip: Boolean = false, val fileDownload: Boolean = false,
     val steer: Boolean = false, val queue: Boolean = false, val rename: Boolean = false, val models: Boolean = false,
 )

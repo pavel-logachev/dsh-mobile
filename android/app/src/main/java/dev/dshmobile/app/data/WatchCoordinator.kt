@@ -1,30 +1,45 @@
 package dev.dshmobile.app.data
 
-import dev.dshmobile.app.model.SessionSnapshot
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-/** Shared by the service and tests. Serializes authoritative cuts with outbox delivery.
- * A post is acknowledged only after notify succeeds; crash replay replaces the same stable ID,
- * with onlyAlertOnce, rather than manufacturing another notification or replaying a mutation. */
+/** One owner serializes every HTTP poll and durable outbox drain. Tokens are scoped to the
+ * exact ordered request set: adding a watch must never wait behind an unrelated old token. */
 internal class WatchCoordinator(private val read: suspend () -> NotificationLocal,
     private val update: suspend ((NotificationLocal) -> NotificationLocal) -> NotificationLocal,
-    private val snapshot: suspend (String) -> SessionSnapshot,
+    private val poll: suspend (String, List<String>, String?, Int) -> PromptOutcomes,
     private val post: suspend (WatchAlert, Boolean) -> Unit,
     private val now: () -> Long = System::currentTimeMillis) {
     private val lock = Mutex()
-    suspend fun resync() = lock.withLock {
+    private data class Cut(val ids: List<String>, val token: String)
+    private val tokens = mutableMapOf<String, Cut>()
+    suspend fun resync() = round(wait = false)
+    suspend fun round(wait: Boolean = true) = lock.withLock {
         val local = update { it.pruneWatches(now()) }
         if (!local.enabled) return@withLock
+        drainLocked()
         var failed: Exception? = null
-        for (session in local.watches.map { it.sessionId }.distinct()) {
+        val sessions = local.watches.map { it.sessionId }.distinct()
+        tokens.keys.retainAll(sessions.toSet())
+        for (session in sessions) {
+            val current = read().pruneWatches(now())
+            if (!current.enabled || current.deviceId != local.deviceId) break
+            val ids = current.watches.filter { it.sessionId == session }.map { it.requestId }
+            if (ids.isEmpty()) continue
+            val since = tokens[session]?.takeIf { it.ids == ids }?.token
+            // A lone group can hold 25 s. Multiple groups get a 1 s slice, preventing a
+            // quiet chat from delaying all other tasks by 25 s each. No periodic sleep.
+            val seconds = if (wait && since != null) if (sessions.size == 1) 25 else 1 else 0
             try {
-                val cut = snapshot(session)
-                update { current -> if (current.enabled && current.deviceId == local.deviceId) current.reconcileWatches(cut, now()) else current }
-            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                val result = poll(session, ids, since, seconds)
+                tokens[session] = Cut(ids, result.token)
+                update { value -> if (value.enabled && value.deviceId == local.deviceId)
+                    value.reconcileWatches(session, result, now()) else value }
+                drainLocked()
+            } catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: Exception) { failed = failure }
         }
-        drainLocked() // One broken chat must not starve successful unrelated outcomes.
         failed?.let { throw it }
     }
     suspend fun drain() = lock.withLock { drainLocked() }
@@ -32,7 +47,10 @@ internal class WatchCoordinator(private val read: suspend () -> NotificationLoca
         for (alert in read().outbox) {
             val current = read()
             if (!current.enabled || current.outbox.none { it.key == alert.key } || alert.expiresAt <= now()) continue
-            post(alert, true) // Replays retain the same identity, channel and only-alert-once flag.
+            // Persist attempt BEFORE crossing NotificationManager. Replay may replace the
+            // visible item silently; a new waiting/final phase may alert again on the same tag.
+            update { it.copy(outbox = it.outbox.map { item -> if (item.key == alert.key) item.copy(attempted = true) else item }) }
+            post(alert, alert.attempted)
             update { it.acknowledgeWatchAlert(alert.key, now()) }
         }
     }

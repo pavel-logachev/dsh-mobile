@@ -370,7 +370,7 @@ class MobileViewModel @JvmOverloads constructor(application: Application,
     }, start = {
         val context = getApplication<Application>()
         androidx.core.content.ContextCompat.startForegroundService(context, android.content.Intent(context, dev.dshmobile.app.data.NotificationService::class.java))
-    }, failed = {}, sync = {})
+    }, failed = {})
     fun foreground(active: Boolean) {
         notificationResume.foreground(active)
         viewModelScope.launch { repository.setForeground(active) }
