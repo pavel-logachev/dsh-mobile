@@ -107,6 +107,41 @@ Missing/pruned/wrong-epoch cursor resets at the current journal head with no com
 
 Additional limits: GET 60/min/device, stream opens 6/min/device, writes 6/min/device within existing 120 total; 429 `Retry-After:60`. Source entries 30/min/session, 120/min/device, 1,000/min/host; 64 enabled devices; 4,096 source envelopes/10,000 active sessions. Queue/capacity loss degrades coverage. Every route requires the existing bearer; no tokens in URL/SSE IDs. The phone service owns a separate pinned read-only transport, posts before atomically persisting dedupe+cursor; a replay silently replaces the same notification identity and never replays an agent mutation.
 
+## Phone prompt outcomes (additive v1 extension, host plugin 0.9.0)
+
+`GET /capabilities` adds **`capabilities.promptOutcomes: true`** when the durable journal reader is available (the existing feature-flag container is `capabilities`, not `features`). Absent/false means clients must not promise phone-task outcome alerts. This capability has no dependency on a notification feed, notification settings/coverage or SSE. `approvals:false` still means approvals cannot be answered from the phone; a pending approval can nevertheless be observed as `waiting`.
+
+`GET /sessions/{sessionId}/prompt-outcomes?requestId=<uuid>[&requestId=<uuid>...][&since=<token>][&waitSeconds=<0..25>]` uses the same bearer authentication, current session/workspace read grants, archived-session handling and errors as session snapshot GET. It never dispatches or resumes a task. Supply 1–32 **distinct** UUIDs; case is ignored, duplicates collapse and results are canonical lowercase in first-request order. Zero IDs, more than 32 distinct IDs or a non-UUID return `400 invalid_request`.
+
+```json
+{
+  "token": "<opaque string>",
+  "outcomes": [
+    {"requestId":"00000000-0000-4000-8000-000000000001","status":"completed","turnId":"1","updatedAt":"2026-11-01T12:00:00.000Z"}
+  ]
+}
+```
+
+One outcome is returned for each distinct requested ID. Only this device's persisted **prompt** receipt for this session authorizes journal correlation; unknown IDs, desktop prompts, another device's receipt, other command types and receipts for other sessions return `unknown`, without leaking their existence. Request IDs passed upstream are device-derived as described below. A receipt by itself proves admission, not execution or completion.
+
+| Status | Authoritative evidence |
+|---|---|
+| `unknown` | No matching journal evidence, or no contract-defined outcome can be proven. Unknown IDs use the fixed UTC epoch `updatedAt`; wall-clock/idle state never invent a transition. |
+| `queued` | The request is durably present in the pending inbox, not yet consumed by a turn. |
+| `running` | The turn claimed this inbox message or admitted its `user/message` with matching `source.rpcId`, and has not ended. |
+| `waiting` | That open turn has an unanswered `ask_user_question` call or an `approval/asked` without its matching decision. Resolution returns it to running; a later terminal outcome still applies. |
+| `completed` | Its consuming turn ended with `reason.kind:"completed"`. |
+| `failed` | Its consuming turn ended with `reason.kind:"error"`. Only this status includes optional plain-text `summary`, whitespace/control-sanitized, Unicode-safe and ≤2048 UTF-8 bytes. |
+| `rejected` | This device/session prompt receipt is a proven host rejection. |
+
+`turnId` is optional until a consuming turn is established and is scoped to the session; queued/steered prompts may share it. Canceled, blocked, interrupted, forked, max-token and future unrecognized endings are **not** success or host rejection and resolve to `unknown`. Unlike other v1 timestamps, outcome `updatedAt` is an **ISO-8601 UTC string** taken from the event that changed the outcome (or the rejection receipt). It does not change for unrelated journal events. Tokens are opaque content-change identifiers, not journal cursors or credentials; every returned outcome change changes the token.
+
+Long-poll semantics: `waitSeconds` defaults to 0 and is an integer 0–25. Only a positive wait with `since` equal to the current token is held. Omitted/different `since` returns immediately. A held request returns 200 on an outcome change or expiry, possibly with an unchanged token. A new held poll for a device completes the previous one immediately with its current authorized state, even across session groups. These polls do not consume the per-device SSE stream quota. Disconnect disposes the subscription; grant/session changes are rechecked before reads/responses. Shutdown promptly completes outcome HTTP requests with the existing `503 unavailable` envelope. Clients must not open more than one held poll per device and should group ≤32 watches/session, round-robin sessions, and perform immediate non-waiting reconciliation after reconnect/restore/foreground.
+
+Derivation reads the raw durable journal, not the bounded transcript/surface. SQLite retains a metadata-only checkpoint per queried prompt receipt (≤32 KiB each, same durable lifetime as the unpruned receipt ledger), including scan position, pending inbox position, consuming turn and unresolved attention IDs. No prompt text/tool arguments are persisted in checkpoints. Each fold reads ≤4096 events in pages of ≤256 and checks a 16 MiB serialized-event budget; ≤128 attention IDs per tracked fold. Checkpoints resume at the saved journal position across host restart and transcript eviction; completed/failed checkpoints need no rescan. A scan that has not reached the journal head exposes `unknown` until a later read catches up. At most four journal folds run concurrently per adapter (≤512 abortable capacity waiters). At most 128 held polls exist host-wide, separately from SSE; existing device rate limits still apply. Event wakeups have a one-second journal/receipt/grant recheck fallback, not a time-based status heuristic.
+
+**Upstream rc.5 limitation:** public `SessionPersistence.open(id,"read")` / `SessionHandle.read(offset,length)` is cold-safe and returns bounded slices, but JSONL internally materializes the entire stored log before slicing. Thus the bounds above cover this plugin's fold/retained state, not the upstream decoder's allocation or physical I/O; no streaming cold-read claim is made. Persistence batching can delay event visibility (the reader never forces a write/flush). This API provides reconciliation, not exactly-once notification/execution guarantees.
+
 ## Mutations and durable receipts
 
 The original wire bodies are unchanged; host plugin 0.7.0 added only optional message fields and new routes (see [Phone features](#phone-features-additive-v1-extension-host-plugin-070)), and host plugin 0.7.1 additionally records sessions accepted through `POST /sessions` for the session index (see `GET /sessions` in [Reads](#reads)). Internally the server binds each action to its authorized workspace ID; the adapter rechecks fresh scope and rejects a different workspace mapping before calling DSH. Registry-archived sessions are not valid prompt or cancellation targets. Grant revocation after adapter entry still does not retroactively cancel already-dispatched work.

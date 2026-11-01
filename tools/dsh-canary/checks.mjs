@@ -134,6 +134,8 @@ export async function coldChecks(runtime, sessionId) {
 export async function adapterChecks(runtime, module, workspace, coldSessionId) {
   const { ctx, deterministic } = runtime;
   const adapter = await module.createDshAdapter({ dshVersion: runtime.version, sessionController: ctx.sessionController, agentPresets: ctx.get('agentPresets'), workspaces: [workspace], pollIntervalMs: 100, throttleMs: 10,
+    sessionHeader: async (id, signal) => (await ctx.sessionPersistence.stat(id, { signal }))?.header,
+    promptJournal: { open: (id, signal) => ctx.sessionPersistence.open(id, 'read', { signal }) },
     sessionStatus: id => ({ running: ctx.agents.get(id)?.status === 'running', updatedAt: ctx.sessions.get(id)?.header.createdAt ?? 0 }) });
   try {
     assert.deepEqual(await adapter.listPresets(signal()), [], 'Absent preset registry must be an explicit empty catalog');
@@ -145,6 +147,13 @@ export async function adapterChecks(runtime, module, workspace, coldSessionId) {
     const coldWatch = adapter.watch(coldSessionId, coldAbort.signal)[Symbol.asyncIterator]();
     await coldWatch.next(); coldAbort.abort(); await coldWatch.return();
     assert.equal(ctx.agents.get(coldSessionId), undefined, 'Mobile cold snapshot/watch must not promote');
+    assert.equal(deterministic.calls, 0);
+    const coldPrompt = cold.messages.find(message => message.role === 'user' && message.requestId);
+    assert.ok(coldPrompt);
+    const coldOutcomes = await adapter.promptOutcomes(coldSessionId, [{ requestId: coldPrompt.requestId }], signal(), workspace.id);
+    assert.equal(coldOutcomes[0].outcome.status, 'completed', 'Resolve earlier completed turn after full runtime remount and subsequent turns');
+    assert.equal(ctx.agents.get(coldSessionId), undefined);
+    assert.equal(ctx.sessions.get(coldSessionId), undefined);
     assert.equal(deterministic.calls, 0);
     const requestId = randomUUID();
     const created = await adapter.createSession({ workspaceId: workspace.id, requestId }, signal(), workspace.id);
@@ -161,6 +170,10 @@ export async function adapterChecks(runtime, module, workspace, coldSessionId) {
       do { provisional = (await watcher.next()).value; }
       while (!provisional.messages.some(message => message.role === 'assistant' && message.provisional));
       assert.equal(provisional.session.running, true);
+      await ctx.sessionPersistence.flush();
+      const runningOutcome = await adapter.promptOutcomes(created.sessionId, [{ requestId: promptId }], signal(), workspace.id);
+      assert.equal(runningOutcome[0].outcome.status, 'running');
+      assert.equal(runningOutcome[0].outcome.turnId, '1');
       watchAbort.abort(); await watcher.return();
       assert.equal(ctx.agents.get(created.sessionId).status, 'running');
       deterministic.release('mobile');
@@ -169,6 +182,12 @@ export async function adapterChecks(runtime, module, workspace, coldSessionId) {
       assert.ok(after.messages.some(message => message.text === ANSWERS.mobile && !message.provisional));
       assert.equal(after.messages.find(message => message.role === 'user').requestId, promptId);
       assert.equal(after.session.running, false);
+      await ctx.sessionPersistence.flush();
+      const completedOutcome = await adapter.promptOutcomes(created.sessionId, [{ requestId: promptId, checkpoint: JSON.parse(JSON.stringify(runningOutcome[0])) }], signal(), workspace.id);
+      assert.equal(completedOutcome[0].outcome.status, 'completed');
+      assert.equal(completedOutcome[0].outcome.turnId, runningOutcome[0].outcome.turnId);
+      const coldOutcome = await adapter.promptOutcomes(created.sessionId, [{ requestId: promptId }], signal(), workspace.id);
+      assert.deepEqual(coldOutcome[0].outcome, completedOutcome[0].outcome, 'No process checkpoint needed to derive durable completion');
       const reconnectAbort = new AbortController();
       const reconnect = adapter.watch(created.sessionId, reconnectAbort.signal)[Symbol.asyncIterator]();
       const replacement = (await reconnect.next()).value;
@@ -185,7 +204,7 @@ export async function adapterChecks(runtime, module, workspace, coldSessionId) {
       const cancelled = await adapter.snapshot(created.sessionId, signal());
       assert.equal(cancelled.session.running, false);
       await ctx.sessionPersistence.flush();
-      return { checks: ['mobile-absent-presets/list-sessions', 'mobile-cold-safe', 'mobile-create/adopt', 'mobile-prompt/requestId', 'mobile-provisional-snapshot', 'mobile-disconnect/reconnect', 'mobile-cursor-guarded-cancel'], result: cancelled };
+      return { checks: ['mobile-absent-presets/list-sessions', 'mobile-cold-safe', 'mobile-create/adopt', 'mobile-prompt/requestId', 'mobile-provisional-snapshot', 'mobile-disconnect/reconnect', 'mobile-cursor-guarded-cancel', 'mobile-prompt-outcomes-real-durable-journal-running-completed-replay'], result: cancelled };
     } finally { watchAbort.abort(); await watcher.return(); }
   } finally { await adapter.dispose(); }
 }

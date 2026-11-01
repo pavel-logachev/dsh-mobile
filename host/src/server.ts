@@ -1,4 +1,7 @@
 import { FileStaging } from './file-staging.ts';
+import { PromptPolls } from './prompt-polls.ts';
+import { outcomeToken, unknownOutcome } from './prompt-outcomes.ts';
+import type { PromptOutcome, PromptLookup } from './prompt-outcomes.ts';
 import { safeFailure } from './failure.ts';
 import { sessionModel, settledQuestions, mutationAnswer } from './phone-projection.ts';
 import { gzipSync } from 'node:zlib';
@@ -112,6 +115,8 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
   const notificationStreams = new Set<string>();
   const limits = new RateLimiter();
   const shutdown = new AbortController();
+  const promptPolls = new PromptPolls();
+  const outcomeResponses = new Set<ServerResponse>();
   let closing = false, started: Promise<{ baseUrl: string }> | undefined;
   let claimed = false;
 
@@ -570,8 +575,9 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     if (!req.url?.startsWith('/v1/') || req.url.length > 2048 || /[#\x00-\x20\\]/.test(req.url)) throw new HostError('invalid_request');
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname + url.search !== req.url) throw new HostError('invalid_request');
-    const allowedQuery = req.method === 'GET' ? url.pathname === '/v1/sessions' ? ['workspaceId', 'limit', 'cursor'] : url.pathname === '/v1/notification-events' ? ['after', 'limit'] : url.pathname === '/v1/notification-events/stream' ? ['after'] : [] : [];
-    for (const key of url.searchParams.keys()) if (!allowedQuery.includes(key) || url.searchParams.getAll(key).length !== 1) throw new HostError('invalid_request');
+    const outcomesRoute = req.method === 'GET' && /^\/v1\/sessions\/[^/]+\/prompt-outcomes$/.test(url.pathname);
+    const allowedQuery = req.method === 'GET' ? outcomesRoute ? ['requestId', 'since', 'waitSeconds'] : url.pathname === '/v1/sessions' ? ['workspaceId', 'limit', 'cursor'] : url.pathname === '/v1/notification-events' ? ['after', 'limit'] : url.pathname === '/v1/notification-events/stream' ? ['after'] : [] : [];
+    for (const key of url.searchParams.keys()) if (!allowedQuery.includes(key) || (!(outcomesRoute && key === 'requestId') && url.searchParams.getAll(key).length !== 1)) throw new HostError('invalid_request');
     const segments = url.pathname.split('/').slice(2).map(segment => {
       try {
         const decoded = decodeURIComponent(segment);
@@ -640,7 +646,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     }
     if (req.method === 'GET' && url.pathname === '/v1/capabilities') {
       const cleanup = files.cleanupStats();
-      sendJson(res, 200, { protocolVersion: 1, hostVersion: HOST_VERSION, hostName: config.hostName, upstreamVersion: adapter.upstreamVersion, capabilities: { sessions: true, textPrompt: true, cancel: true, liveSnapshots: true, questionSkip: false, fileDownload: false, ...(adapter.phoneCapabilities?.() ?? { attachments: false, questions: false, steer: false, queue: false, rename: false, models: false }), approvals: false, push: false, notifications: !!notifications }, notificationCapabilities: { version: 1, coverage: notifications?.coverage ?? 'degraded', feed: !!notifications, unifiedPush: false, retentionMs: 604800000 }, storage: { pendingCleanups: cleanup.pending, cleanupFailures: cleanup.failures } }); return;
+      sendJson(res, 200, { protocolVersion: 1, hostVersion: HOST_VERSION, hostName: config.hostName, upstreamVersion: adapter.upstreamVersion, capabilities: { sessions: true, textPrompt: true, cancel: true, liveSnapshots: true, questionSkip: false, fileDownload: false, ...(adapter.phoneCapabilities?.() ?? { attachments: false, questions: false, steer: false, queue: false, rename: false, models: false }), approvals: false, push: false, notifications: !!notifications, promptOutcomes: adapter.promptOutcomesAvailable?.() ?? false }, notificationCapabilities: { version: 1, coverage: notifications?.coverage ?? 'degraded', feed: !!notifications, unifiedPush: false, retentionMs: 604800000 }, storage: { pendingCleanups: cleanup.pending, cleanupFailures: cleanup.failures } }); return;
     }
     if (req.method === 'GET' && url.pathname === '/v1/models') {
       if (!adapter.models) throw new HostError('unavailable');
@@ -681,6 +687,55 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         cursors.set(nextCursor, { deviceId: current.deviceId, workspaceId, after: { updatedAt: last.updatedAt, id: last.id }, expiresAt: Date.now() + 300_000 });
       }
       sendJson(res, 200, { items, nextCursor }); return;
+    }
+    if (outcomesRoute) {
+      outcomeResponses.add(res);
+      const remove = () => { outcomeResponses.delete(res); };
+      res.once('finish', remove); res.once('close', remove);
+      const raw = url.searchParams.getAll('requestId');
+      if (!raw.length || raw.some(id => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))) throw new HostError('invalid_request');
+      const ids = [...new Set(raw.map(id => id.toLowerCase()))];
+      if (ids.length > 32) throw new HostError('invalid_request');
+      const wait = url.searchParams.get('waitSeconds') ?? '0';
+      if (!/^[0-9]+$/.test(wait) || Number(wait) > 25) throw new HostError('invalid_request');
+      const sessionId = segments[1]!;
+      const read = async () => {
+        // Same point scope/error policy as snapshot GET, without reconstructing
+        // its bounded transcript just to authorize a durable-journal read.
+        let workspaceId: string;
+        try { workspaceId = adapter.sessionScope ? await adapter.sessionScope(sessionId, signal) : (await sessionSnapshot(sessionId, device.deviceId, signal, false)).session.workspaceId; }
+        catch (error) { return failedPointRead(sessionId, device.deviceId, signal, error); }
+        signal.throwIfAborted();
+        if (workspaceSource.archivedSessionIds().has(sessionId)) throw new HostError('not_found');
+        await checkScope(device.deviceId, workspaceId, false, true);
+        if (!adapter.promptOutcomes || !adapter.promptOutcomesAvailable?.()) throw new HostError('unavailable');
+        const outcomes = ids.map(unknownOutcome), lookups: PromptLookup[] = [], slots: { index: number; upstreamId: string }[] = [];
+        ids.forEach((id, index) => {
+          const command = state.promptReceipt(device.deviceId, sessionId, id);
+          if (!command || command.workspaceId !== workspaceId) return;
+          if (command.receipt.status === 'rejected') { outcomes[index] = { requestId: id, status: 'rejected', updatedAt: new Date(command.receipt.updatedAt).toISOString() }; return; }
+          const upstreamId = upstreamRequestId(device.deviceId, id);
+          const checkpoint = state.outcomeCheckpoint(device.deviceId, id, upstreamId);
+          lookups.push({ requestId: upstreamId, ...(checkpoint ? { checkpoint } : {}) }); slots.push({ index, upstreamId });
+        });
+        if (lookups.length) {
+          const derived = await adapter.promptOutcomes(sessionId, lookups, signal, workspaceId);
+          signal.throwIfAborted();
+          if (derived.length !== lookups.length) throw new HostError('unavailable');
+          await checkScope(device.deviceId, workspaceId, false, true);
+          if (workspaceSource.archivedSessionIds().has(sessionId)) throw new HostError('not_found');
+          derived.forEach((checkpoint, i) => {
+            const { index, upstreamId } = slots[i]!;
+            state.saveOutcomeCheckpoint(device.deviceId, ids[index]!, upstreamId, checkpoint);
+            const value = checkpoint.caughtUp === false ? unknownOutcome(ids[index]!) : checkpoint.outcome;
+            const projected: PromptOutcome = { requestId: ids[index]!, status: value.status, ...(value.turnId !== undefined ? { turnId: value.turnId } : {}), ...(value.status === 'failed' && value.summary !== undefined ? { summary: safeFailure({ message: value.summary }).message } : {}), updatedAt: value.updatedAt };
+            outcomes[index] = projected;
+          });
+        }
+        return { token: outcomeToken(outcomes), outcomes };
+      };
+      const page = await promptPolls.get(device.deviceId, url.searchParams.get('since'), Number(wait), read, wake => adapter.onPromptOutcomeChange?.(sessionId, wake) ?? (() => {}), signal);
+      assertOpen(res, signal); sendJson(res, 200, page); return;
     }
     if (req.method === 'DELETE' && segments[0] === 'sessions' && segments.length === 4 && segments[2] === 'uploads') {
       const upload = uploads.get(segments[3]!);
@@ -948,7 +1003,16 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     },
     async close() {
       if (closing) return;
-      closing = true; pumpUploads(); shutdown.abort(); clearInterval(uploadSweep); for (const id of uploads.keys()) removeUpload(id);
+      closing = true; pumpUploads();
+      // Also cover polls still in their asynchronous opening read. Complete the
+      // actual HTTP response, not just the poll promise, before socket teardown.
+      const drains = [...outcomeResponses].map(res => new Promise<void>(resolve => {
+        const done = () => { res.off('finish', done); res.off('close', done); resolve(); };
+        res.once('finish', done); res.once('close', done);
+        sendJson(res, 503, errorEnvelope(new HostError('unavailable')));
+      }));
+      await Promise.all(drains); shutdown.abort(); await promptPolls.close();
+      clearInterval(uploadSweep); for (const id of uploads.keys()) removeUpload(id);
       await Promise.all([...cleanups]).catch(() => {}); await files.close().catch(() => {});
       await notifications?.close();
       await relay?.close();

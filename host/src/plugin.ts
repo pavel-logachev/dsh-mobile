@@ -1,4 +1,6 @@
 import { HOST_VERSION } from './phone.ts';
+import { promptJournal } from './prompt-journal.ts';
+import type { OutcomePersistence } from './prompt-journal.ts';
 import { createQuestionBridge } from './question-bridge.ts';
 import type { QuestionServices } from './question-bridge.ts';
 import type { DshAdapterOptions } from './dsh-adapter.ts';
@@ -27,8 +29,8 @@ export interface CompanionContext {
   /** Inspected live state only, never used to authorize cwd or promote a Session. */
   sessions?: { get(id: string): LiveSession | undefined; list(): LiveSession[] };
   agents?: { get(id: string): LiveAgent | undefined; list(): LiveAgent[] };
-  /** Public rc.2 header-only persistence observation; no event-log decoding. */
-  sessionPersistence?: { stat(id: string, options?: { signal?: AbortSignal }): Promise<{ readonly header: unknown } | undefined> };
+  /** Inspected public header stat and optional read-only journal handle API. */
+  sessionPersistence?: Partial<OutcomePersistence> & { stat(id: string, options?: { signal?: AbortSignal }): Promise<{ readonly header: unknown } | undefined> };
   /** Cordis 4.0.4 active lookup bypasses inject and returns fresh tracing proxies. */
   get?<K extends 'workspaceRegistry' | 'sessions' | 'agents' | 'sessionPersistence' | 'fileUploads' | 'attachments' | 'userQuestions' | 'llm'>(name: K): ({ workspaceRegistry: DshWorkspaceRegistry; sessions: NonNullable<CompanionContext['sessions']>; agents: NonNullable<CompanionContext['agents']>; sessionPersistence: NonNullable<CompanionContext['sessionPersistence']>; fileUploads: NonNullable<CompanionContext['fileUploads']>; attachments: NonNullable<CompanionContext['attachments']>; userQuestions: QuestionServices; llm: NonNullable<CompanionContext['llm']> })[K] | undefined;
   on(name: string, listener: (...args: any[]) => any, options?: { global: boolean; prepend?: boolean }): () => unknown;
@@ -115,6 +117,7 @@ export async function apply(ctx: CompanionContext, config: Config): Promise<() =
     const llm = ctx.get ? ctx.get('llm') : ctx.llm;
     if (userQuestions && ctx.sessionController.resolveAgent) questions = createQuestionBridge(listener => ctx.on('user-questions/request', listener, { global: true, prepend: true }));
     adapter = await createDshAdapter({ dshVersion: config.dshVersion, sessionController: ctx.sessionController,
+      ...(typeof persistence()?.open === 'function' ? { promptJournal: promptJournal(() => { const backend = persistence(); return typeof backend?.open === 'function' ? backend as OutcomePersistence : undefined; }) } : {}),
       ...(fileUploads ? { fileUploads } : {}), ...(attachments ? { attachments } : {}),
       ...(llm ? { modelInfo: (provider, model, signal) => llm.resolveModelInfo(provider, model, signal) } : {}),
       ...(questions ? { questionBridge: questions, answerContinued: async (sessionId, callId, answer) => {
