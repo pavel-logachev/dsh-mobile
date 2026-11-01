@@ -15,7 +15,7 @@ import org.junit.Rule
 import org.junit.Test
 import java.io.File
 
-/** Fires the actual service-produced PendingIntent, independently of SystemUI hit testing. */
+/** Exercises the production chat PendingIntent and routing independently of SystemUI/service. */
 @org.junit.FixMethodOrder(org.junit.runners.MethodSorters.NAME_ASCENDING)
 class NotificationPendingIntentTest {
     @get:Rule val compose = createEmptyComposeRule()
@@ -33,9 +33,7 @@ class NotificationPendingIntentTest {
         val scenario = ActivityScenario.launch(MainActivity::class.java)
         val service = Intent(context, NotificationService::class.java)
         try {
-            scenario.onActivity { it.startForegroundService(service) }
-            compose.waitUntil(20000) { manager.activeNotifications.any { it.notification.extras.getBoolean("dev.dshmobile.questionAlert") } }
-            val first = manager.activeNotifications.first { it.notification.extras.getBoolean("dev.dshmobile.questionAlert") }.notification.contentIntent
+            val first = notificationChatIntent(context, "synthetic", "chat", null)
             host.historyDelayMs = 3000
             first.send()
             compose.waitUntil(2000) { compose.onAllNodesWithTag("chat_screen").fetchSemanticsNodes().isNotEmpty() }
@@ -89,9 +87,9 @@ class NotificationPendingIntentTest {
         val scenario = ActivityScenario.launch(MainActivity::class.java)
         val service = Intent(context, NotificationService::class.java)
         try {
-            scenario.onActivity { it.startForegroundService(service) }
-            compose.waitUntil(20000) { manager.activeNotifications.any { it.notification.extras.getBoolean("dev.dshmobile.questionAlert") } }
-            val notification = manager.activeNotifications.first { it.notification.extras.getBoolean("dev.dshmobile.questionAlert") }.notification
+            val notification = android.app.Notification.Builder(context, "attention_alert_v2")
+                .setSmallIcon(dev.dshmobile.app.R.drawable.ic_launcher_foreground)
+                .setContentIntent(notificationChatIntent(context, "synthetic", "chat", null)).build()
             host.historyDelayMs = 3000
             notificationTrace("test_pending_send_delayed")
             notification.contentIntent.send()
@@ -113,9 +111,9 @@ class NotificationPendingIntentTest {
         val service = Intent(context, NotificationService::class.java)
         val scenario = ActivityScenario.launch(MainActivity::class.java)
         try {
-            scenario.onActivity { it.startForegroundService(service) }
-            compose.waitUntil(20000) { manager.activeNotifications.any { it.notification.extras.getBoolean("dev.dshmobile.questionAlert") } }
-            val notification = manager.activeNotifications.first { it.notification.extras.getBoolean("dev.dshmobile.questionAlert") }.notification
+            val notification = android.app.Notification.Builder(context, "attention_alert_v2")
+                .setSmallIcon(dev.dshmobile.app.R.drawable.ic_launcher_foreground)
+                .setContentIntent(notificationChatIntent(context, "synthetic", "chat", null)).build()
             assertNotNull(notification.contentIntent)
             if (mode == "cold") host.closeScenario(scenario)
             if (mode == "warm") {

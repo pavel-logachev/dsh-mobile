@@ -30,6 +30,8 @@ import kotlin.random.Random
 fun createMobileRepository(context: Context, scope: CoroutineScope): MobileRepository =
     NetworkMobileRepository(EncryptedStateStore(context.applicationContext), scope, BuildConfig.DEBUG, observeRestoredSession = false,
         historyStore = EncryptedHistoryStore(context.applicationContext), prefetchEnabled = true,
+        watchPrompt = { device, session, request -> registerPhoneWatch(context.applicationContext, device, session, request) },
+        unwatchPrompt = { request -> NotificationStore(context.applicationContext).update { it.copy(watches = it.watches.filterNot { w -> w.requestId == request }) }; Unit },
         openAttachment = { source -> context.contentResolver.openInputStream(android.net.Uri.parse(source.uri)) ?: throw java.io.IOException("unavailable") })
 
 /** One process owner prevents Activity recreation from restoring an in-flight command as unknown
@@ -58,6 +60,8 @@ internal class NetworkMobileRepository(
     private val prefetchEnabled: Boolean = false,
     private val preHeaderRetryDelay: (Int) -> Long = { attempt -> if (attempt == 0) 500L else 1_500L },
     private val openAttachment: ((dev.dshmobile.app.model.DraftAttachment) -> java.io.InputStream)? = null,
+    private val watchPrompt: suspend (String, String, String) -> Unit = { _, _, _ -> },
+    private val unwatchPrompt: suspend (String) -> Unit = {},
 ) : MobileRepository {
     private val repositoryJob = SupervisorJob(ownerScope.coroutineContext[Job])
     private val scope = CoroutineScope(ownerScope.coroutineContext + repositoryJob)
@@ -408,17 +412,23 @@ internal class NetworkMobileRepository(
         if (foreground) StartupPerf.mark("online")
         StartupPerf.mark("list_fresh")
         var historyError: String? = null
+        var retryHistory = false
+        val target = requestedSessionId ?: selected
         val refreshed = try {
-            if (readHistory && selected != null && observingSession && (requestedSessionId == null || requestedSessionId == selected)) readObservedSnapshot(network, selected) else null
+            // A newly requested selection owns its own GET after metadata. An existing selection
+            // (including its retryable first projection) is safe for this refresh to recover.
+            if (readHistory && target != null && observingSession && (requestedSessionId == null || requestedSessionId == selected)) readObservedSnapshot(network, target) else null
         } catch (failure: MobileFailure) {
             if (failure.key != "chat_unavailable") throw failure
             // Metadata already authenticated successfully. A projection/size error belongs to
             // this chat, not host connectivity, and must not revalidate any cached cursor.
             historyError = failure.key
+            retryHistory = failure.retryable
             null
         }
-        val snapshot = refreshed ?: state.value.snapshot?.takeIf { it.session.id == selected }
-        if (stored.selectedSessionId != selected) persist(stored.copy(selectedSessionId = selected))
+        val snapshot = refreshed ?: state.value.snapshot?.takeIf { it.session.id == target }
+        val selection = refreshed?.session?.id ?: selected
+        if (stored.selectedSessionId != selection) persist(stored.copy(selectedSessionId = selection))
         mutableState.value = state.value.copy(
             hostName = caps.hostName, capabilities = caps.capabilities, workspaces = workspaces,
             presets = presets, sessions = sessions, sessionsTruncated = index.truncated,
@@ -427,6 +437,7 @@ internal class NetworkMobileRepository(
             demo = caps.upstreamVersion == "fixture", lastSyncedAt = now(), busy = false,
             connection = if (foreground) ConnectionState.ONLINE else ConnectionState.OFFLINE,
         )
+        if (retryHistory) scheduleProjectionRetry()
         if (refreshed != null && observingSession) {
             StartupPerf.mark("chat_fresh")
             reconcileSnapshot(refreshed)
@@ -774,7 +785,11 @@ internal class NetworkMobileRepository(
         } finally { if (transport !== initial) transport.close() }
     }
     private suspend fun dispatchOn(mutation: HostApi, command: StoredCommand, drafts: Map<String, String>) {
-        persist(stored.copy(pending = command, drafts = drafts, notSentSessions = stored.notSentSessions.filterNot { it == command.sessionId }.toSet()))
+        // Persist the watch BEFORE any prompt bytes can leave. A process death cannot admit a
+        // phone task whose watch was never stored. No draft text or attachments enter this record.
+        if (command.kind == "send") watchPrompt(requireNotNull(stored.host).deviceId, requireNotNull(command.sessionId), command.requestId)
+        try { persist(stored.copy(pending = command, drafts = drafts, notSentSessions = stored.notSentSessions.filterNot { it == command.sessionId }.toSet())) }
+        catch (failure: Exception) { unwatchPrompt(command.requestId); throw failure }
         mutableState.value = state.value.copy(pending = command.presentation(), draft = draftFor(stored.selectedSessionId), busy = true, error = null)
         try {
             val receipt = try { commandWithPreHeaderRecovery(mutation, command) } catch (missing: MobileFailure) {
@@ -804,7 +819,8 @@ internal class NetworkMobileRepository(
                 // the host provably did not dispatch it. Treat it as not sent, never uncertain.
                 persist(stored.copy(pending = null,
                     notSentSessions = if (command.kind == "send" && command.sessionId != null) stored.notSentSessions + command.sessionId else stored.notSentSessions))
-                fail(failure.key)
+                unwatchPrompt(command.requestId)
+                fail(failure.key, failure.retryable)
                 mutableState.value = state.value.copy(error = "recovery_hold", busy = false)
                 return
             }
@@ -812,12 +828,14 @@ internal class NetworkMobileRepository(
                 // Only transport evidence BEFORE requestHeadersStart permits this classification.
                 // Missing receipts, timeouts after headers, and lost responses remain uncertain.
                 persist(stored.copy(pending = null, notSentSessions = if (command.kind == "send" && command.sessionId != null) stored.notSentSessions + command.sessionId else stored.notSentSessions))
-                fail(failure.key)
+                unwatchPrompt(command.requestId)
+                fail(failure.key, failure.retryable)
                 mutableState.value = state.value.copy(error = "offline_no_send", busy = false)
                 return
             }
             if (failure.key == "upload_missing") {
                 persist(stored.copy(pending = null))
+                unwatchPrompt(command.requestId)
                 mutableState.value = state.value.copy(error = "attachment_unavailable", busy = false)
                 return
             }
@@ -833,10 +851,10 @@ internal class NetworkMobileRepository(
                 mutableState.value = state.value.copy(pending = stored.pending?.presentation(), error = "command_uncertain", busy = false)
                 if (foreground) {
                     try { resolveLocked(reloadSnapshot = true) }
-                    catch (lookup: MobileFailure) { fail(lookup.key) }
+                    catch (lookup: MobileFailure) { fail(lookup.key, lookup.retryable) }
                 }
             }
-            if (stored.pending == null || failure.key in setOf("unauthorized", "revoked", "forbidden", "incompatible_protocol", "tls_failed", "network_unavailable", "invalid_response", "rate_limited")) fail(failure.key)
+            if (stored.pending == null || failure.key in setOf("unauthorized", "revoked", "forbidden", "incompatible_protocol", "tls_failed", "network_unavailable", "invalid_response", "rate_limited")) fail(failure.key, failure.retryable)
         }
         mutableState.value = state.value.copy(busy = false)
         if (foreground && state.value.connection == ConnectionState.ONLINE) startObserver()
@@ -884,6 +902,7 @@ internal class NetworkMobileRepository(
             }
             "rejected" -> {
                 // Trustworthy rejection releases admission. Exact draft is retained for explicit edits.
+                unwatchPrompt(command.requestId)
                 persist(stored.copy(pending = null))
                 mutableState.value = state.value.copy(pending = null, error = "command_rejected")
             }
@@ -1063,7 +1082,8 @@ internal class NetworkMobileRepository(
             delay(retryDelay(projectionRetryAttempt++))
             projectionRetryJob = null
             action {
-                if (foreground && !closed && state.value.connection == ConnectionState.ONLINE && state.value.snapshot != null) refreshLocked()
+                if (foreground && !closed && observingSession && state.value.connection == ConnectionState.ONLINE &&
+                    (requestedSessionId != null || stored.selectedSessionId != null)) refreshLocked()
             }
         }
     }
@@ -1102,10 +1122,13 @@ internal class NetworkMobileRepository(
         }
     }
     override suspend fun forget() = action {
-        stopObserver(); cancelReconnect(); prefetch.cancel()
-        cacheMutex.withLock { diskHistory.clear() }
+        stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel()
+        // Credentials are the mandatory outcome; optional cache/key failures cannot gate it.
         try { store.clear() }
-        catch (_: Exception) { store.reset() } // Explicit forget must not strand a broken key/record.
+        catch (_: Exception) { store.reset() }
+        try { cacheMutex.withLock { diskHistory.clear() } }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { /* Credential deletion succeeded; cache is not authority. */ }
         val abandonedDrafts = stored.attachmentDrafts
         stored = stored.copy(attachmentDrafts = emptyMap())
         abandonedDrafts.forEach { (session, sources) -> discardStaging(session, sources) }

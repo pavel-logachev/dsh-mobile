@@ -23,6 +23,6 @@ internal suspend fun deliverNotificationPage(
     return update { current ->
         if (!current.enabled || current.deviceId != before.deviceId) throw MobileFailure("not_paired")
         current.copy(epoch = applied.state.epoch, cursor = applied.state.cursor, lastSequence = applied.state.lastSequence,
-            processed = applied.state.processed, attention = applied.state.attention, monitoringStatus = page.coverage)
+            processed = applied.state.processed, attention = applied.state.attention)
     }
 }

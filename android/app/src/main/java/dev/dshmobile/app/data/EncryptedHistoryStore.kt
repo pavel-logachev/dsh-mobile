@@ -37,7 +37,10 @@ internal class EncryptedHistoryStore internal constructor(private val file: Atom
             try { out.write(sealed); file.finishWrite(out) } catch (failure: Exception) { file.failWrite(out); throw failure }
         }
     }
-    override suspend fun clear() = withContext(Dispatchers.IO) { mutex.withLock { file.delete(); deleteKey() } }
+    override suspend fun clear() = withContext(Dispatchers.IO) { mutex.withLock {
+        file.delete()
+        try { deleteKey() } catch (_: Exception) { /* Deletion needs no working Keystore. */ }
+    } }
     companion object {
         internal const val RECORD_LIMIT = 5 * 1024 * 1024
         private const val LIMIT = RECORD_LIMIT

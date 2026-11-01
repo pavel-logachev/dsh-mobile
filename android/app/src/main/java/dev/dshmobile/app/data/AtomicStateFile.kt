@@ -13,14 +13,20 @@ internal interface AtomicStateFile {
     fun failWrite(stream: OutputStream?)
     fun delete()
 }
-internal class AndroidAtomicStateFile(base: File) : AtomicStateFile {
+internal class AndroidAtomicStateFile(private val base: File) : AtomicStateFile {
     private val file = AtomicFile(base)
     override val identity = base.canonicalPath
     override fun openRead(): InputStream = file.openRead()
     override fun startWrite(): OutputStream = file.startWrite()
     override fun finishWrite(stream: OutputStream) = file.finishWrite(stream as FileOutputStream)
     override fun failWrite(stream: OutputStream?) = file.failWrite(stream as FileOutputStream?)
-    override fun delete() = file.delete()
+    override fun delete() {
+        file.delete()
+        // AtomicFile.delete() ignores unlink failure. Never report a destructive reset as done
+        // while either the credential record or its recoverable backup remains.
+        if (listOf(base, File(base.path + ".bak"), File(base.path + ".new")).any { it.exists() })
+            throw IOException("Atomic state deletion failed")
+    }
 }
 internal object StateFileOwners {
     private val locks = mutableMapOf<String, Mutex>()

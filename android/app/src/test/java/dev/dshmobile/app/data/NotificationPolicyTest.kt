@@ -7,12 +7,11 @@ import org.junit.Test
 
 class NotificationPolicyTest {
     private fun event(id: String, sequence: Long = 0) = NotificationEvent(1, id, sequence, 100, 1000, "alpha", "chat", "answer-finished", 4)
-    @Test fun coverageAndStartFailureAreDurableMonitoringWarnings() {
+    @Test fun legacyFeedStatusNeverChangesLocalWatchState() {
+        val local = NotificationLocal().registerWatch("device", "chat", "request", 100)
         val page = NotificationPage(1, "epoch", emptyList(), "cursor", false, false, "degraded")
-        val degraded = NotificationLocal(enabled = true).applyPage(page, 200).state
-        assertEquals("degraded", degraded.monitoringStatus)
-        assertEquals("degraded", mobileJson.decodeFromString<NotificationLocal>(mobileJson.encodeToString(NotificationLocal.serializer(), degraded)).monitoringStatus)
-        assertEquals("ready", degraded.applyPage(page.copy(coverage = "ready"), 200).state.monitoringStatus)
+        assertEquals(local.watches, local.applyPage(page, 200).state.watches)
+        assertEquals(local.watches, local.applyPage(page.copy(legacyState = "ready"), 200).state.watches)
     }
     @Test fun pageApplicationCommitsCursorAndDeduplicatesEvents() {
         val page = NotificationPage(1, "epoch", listOf(event("event")), "cursor", false, false, "ready")

@@ -41,7 +41,6 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
     val context = androidx.compose.ui.platform.LocalContext.current
     val fileUnavailable = stringResource(R.string.mobile_file_unavailable)
     val fileFailed = stringResource(R.string.mobile_file_download_failed)
-    val unknownTurnFailure = stringResource(R.string.mobile_turn_failed_unknown)
     val saveDocument = rememberDocumentSaver(snackbars)
     val downloads = remember { kotlinx.coroutines.sync.Semaphore(2) }
     val copied = stringResource(R.string.mobile_copied)
@@ -165,13 +164,7 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
                 if (model.taskNotSentIn(it.session.id, model.editorDraft)) Text(stringResource(R.string.mobile_task_not_sent), Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
                     .testTag("task_not_sent").semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.bodyMedium, color = LocalMobileColors.current.warning)
                 if (!executable(state)) Notice(stringResource(R.string.mobile_read_only_notice))
-                it.failure?.let { failure ->
-                    val detail = failure.message.ifBlank { unknownTurnFailure }
-                    Text(stringResource(R.string.mobile_turn_failed, detail),
-                        Modifier.padding(horizontal = Spacing.Gutter, vertical = Spacing.S).testTag("turn_failure")
-                            .semantics { liveRegion = LiveRegionMode.Polite },
-                        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
-                }
+                it.failure?.let { failure -> TurnFailureNotice(failure.message) }
                 if (it.activity == "waiting" && !(state.capabilities?.questions == true && it.pendingQuestions.isNotEmpty())) Notice(stringResource(R.string.mobile_desktop_notice))
                 else if (it.notice != null) Notice(stringResource(R.string.mobile_partial_information))
                 if (it.activity !in listOf("idle", "running", "waiting")) Notice(stringResource(R.string.mobile_unknown_activity))

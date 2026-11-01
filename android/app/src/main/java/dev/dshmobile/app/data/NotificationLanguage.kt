@@ -20,20 +20,10 @@ internal fun alertLanguageExtras(kind: String, names: String?) = Bundle().apply 
     putString(ALERT_NAMES, names)
 }
 internal fun connectionLanguageExtras(status: String) = Bundle().apply { putString(CONNECTION_STATUS, status) }
-internal fun connectionTitleResource(status: String) = when (status) {
-    "offline", "reconnecting" -> R.string.notif_ongoing_title_reconnecting
-    "degraded" -> R.string.notif_ongoing_title_degraded
-    "blocked" -> R.string.notif_ongoing_title_blocked
-    "initializing" -> R.string.notif_ongoing_title_connecting
-    else -> R.string.notif_ongoing_title_online
-}
-internal fun connectionBodyResource(status: String) = when (status) {
-    "initializing" -> R.string.notif_ongoing_connecting_body
-    "degraded" -> R.string.notif_ongoing_degraded_body
-    "offline", "reconnecting" -> R.string.notif_ongoing_reconnecting_body
-    "blocked" -> R.string.notif_ongoing_blocked_body
-    else -> R.string.notif_ongoing_ready
-}
+@Suppress("UNUSED_PARAMETER")
+internal fun connectionTitleResource(status: String) = R.string.notif_watch_title
+@Suppress("UNUSED_PARAMETER")
+internal fun connectionBodyResource(status: String) = R.string.notif_watch_body
 internal fun connectionBody(context: Context, status: String): String = context.getString(connectionBodyResource(status))
 
 /** Nonblocking entry point. A new request cancels/coalesces the old pass, not ordinary alert posting. */
@@ -75,16 +65,6 @@ private suspend fun refreshNotificationLanguagePassChecked(context: Context) {
     }
 }
 
-private fun legacyConnectionStatus(context: Context, body: String?): String {
-    if (body in setOf("Connection interrupted. Reconnecting; alerts may be delayed.",
-            "Связь прервана. Переподключение; уведомления могут задерживаться.")) return "offline"
-    val resources = listOf("en", "ru").map { tag ->
-        context.createConfigurationContext(Configuration(context.resources.configuration).apply { setLocale(Locale.forLanguageTag(tag)) })
-    }
-    return listOf("ready" to R.string.notif_restart, "initializing" to R.string.notif_initializing,
-        "offline" to R.string.notif_offline, "degraded" to R.string.notif_degraded)
-        .firstOrNull { (_, id) -> resources.any { it.getString(id) == body } }?.first ?: "initializing"
-}
 
 /** null means an unrelated or already translated notification. Does not post or change identity/channel. */
 internal fun translatedNotification(context: Context, id: Int, tag: String?, old: Notification, silent: Boolean = true): Notification? {
@@ -104,21 +84,18 @@ internal fun translatedNotification(context: Context, id: Int, tag: String?, old
     val previousActions = old.actions.orEmpty().map { it.title.toString() }
     val builder = Notification.Builder.recoverBuilder(context, old)
     if (id == 1 && tag == null && old.channelId == NotificationService.CONNECTION) {
-        val status = old.extras.getString(CONNECTION_STATUS) ?: legacyConnectionStatus(context, previousBody)
+        val status = "watching"
         builder.addExtras(connectionLanguageExtras(status))
             .setContentTitle(localized.getString(connectionTitleResource(status)))
             .setContentText(connectionBody(localized, status))
-        builder.setActions(*old.actions.orEmpty().mapIndexed { index, action ->
-            Notification.Action.Builder(action.getIcon(), localized.getString(if (index == 0) R.string.notif_disable else R.string.notif_open_settings), action.actionIntent)
-                .addExtras(action.extras).build()
-        }.toTypedArray())
+        builder.setActions()
     } else if (id == 2 && old.channelId in notificationChannels.map { it.id }) {
         val kind = old.extras.getString(ALERT_KIND) ?: when {
             tag?.endsWith(":answers") == true -> "answers"
             tag?.endsWith(":attention") == true -> "attention"
             else -> return null
         }
-        val title = localized.getString(if (kind == "answers") R.string.notif_answer_ready else R.string.notif_needs_decision)
+        val title = localized.getString(when (kind) { "answers" -> R.string.notif_answer_ready; "error" -> R.string.notif_task_failed; else -> R.string.notif_needs_decision })
         val names = if (old.extras.containsKey(ALERT_KIND)) old.extras.getString(ALERT_NAMES) else {
             val generic = listOf("en", "ru").any { language ->
                 context.createConfigurationContext(Configuration(context.resources.configuration).apply {

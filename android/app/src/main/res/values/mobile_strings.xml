@@ -87,8 +87,6 @@
     <string name="mobile_no_executable_workspace">No project allows task execution. Ask the host owner to grant access.</string>
     <string name="mobile_workspace_scope">Projects match DSH on your computer.</string>
     <string name="mobile_create">Create chat</string>
-    <string name="mobile_notifications_title">While the app is closed</string>
-    <string name="mobile_notifications_body">Tasks run on your computer. Turn on notifications to hear about finished answers and decision requests. The app then keeps a background connection to your computer with a persistent notification.</string>
     <string name="mobile_phone_limits">Agent actions can only be approved on the computer.</string>
     <string name="mobile_forget">Remove connection from this phone</string>
     <string name="mobile_forget_help">Local removal does not revoke this device on your computer and does not stop its tasks. To revoke access, use the host device settings.</string>
@@ -131,6 +129,8 @@
     <string name="mobile_partial_information">Some details are not available on the phone yet. Open the chat on your computer if needed.</string>
     <string name="mobile_turn_failed">The turn ended with an error: %1$s</string>
     <string name="mobile_turn_failed_unknown">unknown upstream error</string>
+    <string name="mobile_error_details">Error details</string>
+    <string name="mobile_error_close">Close</string>
     <string name="mobile_paste_json">Paste JSON manually</string>
     <string name="mobile_hide_json">Hide invitation JSON</string>
     <string name="mobile_invitation_ready">Invitation loaded. Review the computer identity before connecting.</string>

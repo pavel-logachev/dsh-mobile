@@ -18,22 +18,23 @@ import kotlinx.serialization.Serializable
     val kind: String, val sourceSeq: Long, val turn: Long? = null, val attentionId: String? = null)
 @Serializable internal data class PendingAttention(val sessionId: String, val workspaceId: String, val attentionId: String)
 @Serializable internal data class NotificationPage(val version: Int, val epoch: String, val items: List<NotificationEvent>,
-    val nextCursor: String, val hasMore: Boolean, val resetRequired: Boolean, val coverage: String,
+    val nextCursor: String, val hasMore: Boolean, val resetRequired: Boolean, val legacyState: String = "",
     val pending: List<PendingAttention> = emptyList()) {
     fun checked(): NotificationPage {
         if (version != 1 || !validId(epoch) || nextCursor.length !in 1..256 || !nextCursor.all { it.isLetterOrDigit() || it in "_-" } ||
-            items.size > 100 || pending.size > 1000 || coverage !in setOf("ready", "initializing", "degraded") ||
+            items.size > 100 || pending.size > 1000 ||
             items.any { it.version != 1 || !validId(it.eventId) || !validId(it.sessionId) || !validId(it.workspaceId) || it.sequence < 0 || it.sourceSeq < -1 || it.occurredAt < 0 || it.expiresAt < 0 || it.kind !in setOf("answer-finished", "attention-needed", "attention-cleared") || (it.kind != "answer-finished" && !validId(it.attentionId.orEmpty())) } ||
             items.zipWithNext().any { it.first.sequence >= it.second.sequence } || pending.any { !validId(it.sessionId) || !validId(it.workspaceId) || !validId(it.attentionId) }) throw MobileFailure("invalid_response")
         return this
     }
 }
 @Serializable internal data class ProcessedNotification(val id: String, val at: Long)
-@Serializable internal data class NotificationLocal(val enabled: Boolean = false, val deviceId: String? = null,
+@Serializable internal data class NotificationLocal(val enabled: Boolean = true, val deviceId: String? = null,
+    val watches: List<PhoneWatch> = emptyList(), val outbox: List<WatchAlert> = emptyList(),
+    val deliveredTurns: List<ProcessedNotification> = emptyList(),
     val settings: NotificationSettings = NotificationSettings(), val dirty: Boolean = false,
     val epoch: String? = null, val cursor: String? = null, val lastSequence: Long = -1,
     val processed: List<ProcessedNotification> = emptyList(), val attention: Map<String, String> = emptyMap(),
-    val monitoringStatus: String = "initializing",
     val answerMode: AlertMode = AlertMode.SOUND, val attentionMode: AlertMode = AlertMode.SOUND,
     val channelModesMigrated: Boolean = false) {
     fun applyPage(page: NotificationPage, now: Long): AppliedNotifications {
@@ -54,7 +55,7 @@ import kotlinx.serialization.Serializable
             if (event.kind == "attention-cleared" || event.expiresAt > now) display += event
         }
         return AppliedNotifications(copy(epoch = page.epoch, cursor = page.nextCursor, lastSequence = sequence,
-            processed = seen, attention = pending.toMap(), monitoringStatus = page.coverage), display.filter { it.kind != "attention-needed" || pending[it.sessionId] == it.attentionId }
+            processed = seen, attention = pending.toMap()), display.filter { it.kind != "attention-needed" || pending[it.sessionId] == it.attentionId }
                 .groupBy { it.sessionId to it.kind }.values.map { it.last() }
                 .filter { it.kind != "answer-finished" || it.sessionId !in pending }, reset)
     }

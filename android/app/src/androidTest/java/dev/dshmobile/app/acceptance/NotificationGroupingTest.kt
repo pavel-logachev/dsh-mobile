@@ -41,9 +41,12 @@ class NotificationGroupingTest {
         manager.cancelAll(); VisibleNotificationChat.sessionId = null
         val scenario = ActivityScenario.launch(MainActivity::class.java)
         val service = Intent(context, NotificationService::class.java)
-        scenario.onActivity { it.startForegroundService(service) }
-        compose.waitUntil(20000) { manager.activeNotifications.any { it.id == 2 } }
-        val original = manager.activeNotifications.first { it.id == 2 }.notification
+        runBlocking { ensureNotificationChannels(context) }
+        val original = android.app.Notification.Builder(context, "answers_alert_v2")
+            .setSmallIcon(dev.dshmobile.app.R.drawable.ic_launcher_foreground).setGroup(ALERT_GROUP)
+            .setContentTitle("Synthetic").setContentIntent(notificationChatIntent(context, "synthetic", "chat", null))
+            .addExtras(alertLanguageExtras("answers", "Synthetic")).build()
+        runBlocking { NotificationPosting.paced { manager.notify("synthetic:chat:answers", 2, original); updateAlertSummary(context, added = "synthetic:chat:answers" to original) } }
         for (index in 2..count) {
             val tag = "synthetic-group-$index"
             val child = android.app.Notification.Builder(context, original.channelId)
@@ -53,25 +56,19 @@ class NotificationGroupingTest {
             runBlocking { NotificationPosting.paced { manager.notify(tag, 2, child); updateAlertSummary(context, added = tag to child) } }
         }
         compose.waitUntil(5000) { manager.activeNotifications.count { it.id == 2 } == count && manager.activeNotifications.any { it.id == 3 && it.notification.number == count } }
-        val ongoing = manager.activeNotifications.single { it.id == 1 }
-        assertEquals("dev.dshmobile.monitoring", ongoing.notification.group)
-        assertNotNull(ongoing.notification.contentIntent)
+        assertTrue(manager.activeNotifications.none { it.id == 1 })
         val summary = manager.activeNotifications.single { it.id == 3 }
         assertEquals(ALERT_GROUP, summary.notification.group)
         assertEquals(count, summary.notification.number)
         assertEquals(SUMMARY_CHANNEL, summary.notification.channelId)
         assertFalse(summary.notification.extras.getString(android.app.Notification.EXTRA_TEXT).orEmpty().contains("computer"))
-        assertNotEquals(ongoing.groupKey, summary.groupKey)
         assertTrue(manager.activeNotifications.filter { it.id == 2 }.all { it.groupKey == summary.groupKey })
-        assertNull(ongoing.overrideGroupKey)
         val dump = instrumentation.uiAutomation.executeShellCommand("dumpsys notification --noredact")
         File(context.filesDir, "notification-groups-$count.txt").outputStream().use { out -> android.os.ParcelFileDescriptor.AutoCloseInputStream(dump).use { it.copyTo(out) } }
         if (!stage) {
-            ongoing.notification.contentIntent.send()
-            compose.waitUntil(5000) { compose.onAllNodesWithTag("session_chat").fetchSemanticsNodes().isNotEmpty() }
             // Deterministic routing check; actual shade taps are recorded separately via adb.
             summary.notification.contentIntent.send()
-            val tag = if (count == 1) "question_question" else "session_chat"
+            val tag = "session_chat"
             compose.waitUntil(15000) {
                 try { compose.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty() }
                 catch (_: IllegalStateException) { false } // CLEAR_TOP can briefly remove all compositions.

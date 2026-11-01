@@ -30,8 +30,7 @@ import dev.dshmobile.app.ui.theme.Spacing
 
 @Composable
 internal fun displayedConnection(connection: ConnectionState): ConnectionState {
-    val stream = dev.dshmobile.app.data.NotificationStreamStatus.status.collectAsState().value
-    return dev.dshmobile.app.data.notificationHeaderConnection(connection, stream)
+    return connection // Task notification transport never overrides the UI connection.
 }
 
 @Composable

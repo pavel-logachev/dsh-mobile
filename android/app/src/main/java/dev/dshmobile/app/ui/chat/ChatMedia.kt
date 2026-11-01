@@ -156,6 +156,9 @@ internal suspend fun fetchImagePreview(fetch: suspend () -> ByteArray): ByteArra
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
+            val transient = failure is java.io.IOException || (failure is dev.dshmobile.app.data.MobileFailure &&
+                (failure.retryable || failure.key in setOf("network_unavailable", "rate_limited")))
+            if (!transient) throw failure
             last = failure
             if (attempt == 0) delay(PREVIEW_RETRY_DELAY_MS)
         }
@@ -168,11 +171,13 @@ private const val PREVIEW_RETRY_DELAY_MS = 750L
 
 @Composable
 private fun MediaImage(ref: AttachmentRef, cache: ImageMemoryCache, modifier: Modifier, description: String, onOpen: () -> Unit) {
-    var retry by remember(ref.id) { mutableIntStateOf(0) }
-    var failed by remember(ref.id) { mutableStateOf(false) }
-    val bitmap by produceState<Bitmap?>(null, ref.id, retry) {
+    var retry by remember(ref.id, cache) { mutableIntStateOf(0) }
+    var failed by remember(ref.id, cache) { mutableStateOf(false) }
+    val bitmap by produceState<Bitmap?>(null, ref.id, cache, retry) {
         failed = false
-        try { value = decodeImage(fetchImagePreview { cache.get(ref.id) }, 1024) } catch (_: Exception) { failed = true }
+        try { value = decodeImage(fetchImagePreview { cache.get(ref.id) }, 1024) }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { failed = true }
     }
     val retryLabel = stringResource(R.string.mobile_media_retry)
     Box(modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest).clickable { if (failed) retry++ else if (bitmap != null) onOpen() }
@@ -227,9 +232,9 @@ internal fun ImageViewer(refs: List<AttachmentRef>, initial: Int, cache: ImageMe
     val context = LocalContext.current
     val scope = rememberCoroutineScope(); val snackbar = remember { SnackbarHostState() }
     val ref = refs[index]
-    var bytes by remember(index) { mutableStateOf<ByteArray?>(null) }
-    var failed by remember(index) { mutableStateOf(false) }
-    val decoded by produceState<DecodedImage?>(null, index, retry) {
+    var bytes by remember(ref.id, cache) { mutableStateOf<ByteArray?>(null) }
+    var failed by remember(ref.id, cache) { mutableStateOf(false) }
+    val decoded by produceState<DecodedImage?>(null, ref.id, cache, retry) {
         value = null; bytes = null; failed = false
         try { val data = cache.get(ref.id); bytes = data; value = withContext(Dispatchers.Default) { decodeBoundedImage({ data.inputStream() }, 4096) } }
         catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }

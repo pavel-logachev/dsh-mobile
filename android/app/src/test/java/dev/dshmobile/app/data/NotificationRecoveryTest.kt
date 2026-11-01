@@ -87,8 +87,8 @@ class NotificationRecoveryTest {
     @Test fun streamAndHeaderShareLivenessWithoutChangingCommandState() {
         val online = dev.dshmobile.app.model.ConnectionState.ONLINE
         val offline = dev.dshmobile.app.model.ConnectionState.OFFLINE
-        assertEquals(offline, notificationHeaderConnection(online, "offline"))
-        assertEquals(online, notificationHeaderConnection(offline, "ready"))
+        assertEquals(online, notificationHeaderConnection(online, "offline"))
+        assertEquals(offline, notificationHeaderConnection(offline, "ready"))
         assertEquals(online, notificationHeaderConnection(online, "degraded"))
         assertEquals(offline, notificationHeaderConnection(offline, null))
     }

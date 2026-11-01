@@ -15,6 +15,20 @@ import org.junit.Test
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class ChatMediaCacheTest {
+    @Test fun `AND05 permanent image failures are never retried`() = runTest {
+        for (key in listOf("unsupported", "chat_unavailable", "forbidden", "invalid_response")) {
+            var calls = 0
+            try { fetchImagePreview { calls++; throw dev.dshmobile.app.data.MobileFailure(key) }; fail("must fail") }
+            catch (expected: dev.dshmobile.app.data.MobileFailure) { assertEquals(key, expected.key) }
+            assertEquals("Permanent $key was retried", 1, calls)
+        }
+    }
+    @Test fun `AND05 external cancellation escapes preview without retry`() = runTest {
+        var calls = 0
+        try { fetchImagePreview { calls++; throw CancellationException("disposed") }; fail("must cancel") }
+        catch (expected: CancellationException) { assertEquals("disposed", expected.message) }
+        assertEquals(1, calls)
+    }
     @Test fun `preview retries one transient fetch failure`() = runTest {
         var calls = 0
         val result = fetchImagePreview {

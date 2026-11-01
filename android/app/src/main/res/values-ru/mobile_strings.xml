@@ -87,8 +87,6 @@
     <string name="mobile_no_executable_workspace">Нет проекта с правом запуска задач. Попросите владельца компьютера предоставить доступ.</string>
     <string name="mobile_workspace_scope">Список проектов совпадает с DSH на компьютере.</string>
     <string name="mobile_create">Создать чат</string>
-    <string name="mobile_notifications_title">Когда приложение закрыто</string>
-    <string name="mobile_notifications_body">Задачи выполняются на компьютере. Включите уведомления, чтобы узнавать о готовых ответах и запросах решения. Для этого приложение держит фоновое подключение к ПК с постоянным уведомлением.</string>
     <string name="mobile_phone_limits">Подтверждать действия агента можно только на компьютере.</string>
     <string name="mobile_forget">Удалить подключение с телефона</string>
     <string name="mobile_forget_help">Удаление с телефона не отзывает его доступ на компьютере и не останавливает задачи. Чтобы отозвать доступ, используйте настройки устройств на компьютере.</string>
@@ -131,6 +129,8 @@
     <string name="mobile_partial_information">Часть сведений пока недоступна на телефоне. При необходимости откройте чат на компьютере.</string>
     <string name="mobile_turn_failed">Ход завершился ошибкой: %1$s</string>
     <string name="mobile_turn_failed_unknown">неизвестная ошибка провайдера</string>
+    <string name="mobile_error_details">Подробности ошибки</string>
+    <string name="mobile_error_close">Закрыть</string>
     <string name="mobile_paste_json">Вставить JSON вручную</string>
     <string name="mobile_hide_json">Скрыть JSON приглашения</string>
     <string name="mobile_invitation_ready">Приглашение загружено. Проверьте компьютер перед подключением.</string>

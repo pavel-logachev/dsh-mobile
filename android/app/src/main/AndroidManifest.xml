@@ -4,6 +4,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- The read-only notification monitor follows default-network / VPN route changes. -->
@@ -29,8 +30,14 @@
         </provider>
         <service android:name=".data.NotificationService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="User-enabled continuous monitoring of a paired local AI desktop for answer completion and approval/question attention; no platform push service; persistent notification with Stop control." />
+                android:value="Bounded monitoring of tasks explicitly started on this phone until completion or user attention; encrypted watches expire within 24 hours; no idle service or platform push." />
         </service>
+        <receiver android:name=".data.WatchRestoreReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
         <receiver android:name=".data.NotificationDismissedReceiver" android:exported="false" />
         <receiver android:name=".locale.LanguageChangedReceiver" android:exported="false">
             <intent-filter>

@@ -49,7 +49,7 @@ internal object NotificationPosting {
         try { block() } catch (cancelled: CancellationException) { throw cancelled }
         catch (failure: Exception) { logFailure(failure) }
     }
-    suspend fun <T> paced(block: () -> T): T = lane.withLock {
+    suspend fun <T> paced(block: suspend () -> T): T = lane.withLock {
         // A synchronous foreground promotion can move the timestamp while this coroutine waits.
         while (true) {
             val remaining = 260L - (SystemClock.elapsedRealtime() - lastPost)

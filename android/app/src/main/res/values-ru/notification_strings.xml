@@ -1,51 +1,20 @@
 <resources>
     <string name="notif_title">Уведомления</string>
-    <string name="notif_connected">DSH Mobile на связи</string>
     <string name="notif_connection_channel">Связь с компьютером</string>
     <string name="notif_answers_channel">Ответы агента</string>
     <string name="notif_attention_channel">Нужно ваше решение</string>
-    <string name="notif_disable">Отключить</string>
     <string name="notif_answer_ready">Ответ готов</string>
-    <string name="notif_needs_decision">Агент ждёт вашего решения</string>
+    <string name="notif_needs_decision">Нужен ответ</string>
     <string name="notif_generic">Откройте чат на компьютере</string>
-    <string name="notif_rationale">Уведомления об ответах и запросах решения во всех доступных чатах, включая задачи с компьютера. «Ответ готов» показывает только названия проекта и чата, без текста ответа. Если агент задал вопрос, уведомление «Агент ждёт вашего решения» на разблокированном телефоне показывает текст вопроса, а на экране блокировки — только название чата. Постоянное уведомление поддерживает связь и расходует заряд.</string>
-    <string name="notif_restart">Чтобы сообщать «Ответ готов» и «Агент ждёт вашего решения», приложение держит фоновое подключение к ПК. Android требует для него постоянное уведомление — беззвучное и с низким приоритетом; нажатие открывает список чатов. Автозапуска после перезагрузки телефона нет — откройте приложение, чтобы подключиться снова. Уведомления могут задерживаться в режиме Doze, при выключенном ПК или обрыве связи.</string>
-    <string name="notif_unsupported">Этот хост пока не поддерживает уведомления. После обновления хоста обновите соединение.</string>
+    <string name="notif_rationale">Сообщим, когда задача, отправленная с этого телефона, завершится или потребует ответа. Нажатие открывает чат. Когда таких задач нет, фоновое подключение отключено.</string>
     <string name="notif_blocked">Не удалось включить уведомления. Проверьте разрешение и системные ограничения, затем повторите попытку.</string>
-    <string name="notif_unsynced">Настройки сохранены на телефоне; ожидается синхронизация с хостом.</string>
     <string name="notif_system">Системные настройки уведомлений</string>
-    <string name="notif_battery">Настройки оптимизации батареи</string>
-    <string name="notif_oneplus">OnePlus: разрешите работу в фоне и проверьте оптимизацию сна в системных настройках. Это не гарантирует доставку после принудительной остановки.</string>
-    <string name="notif_filters">Уведомления проектов и чатов</string>
-    <string name="notif_projects">Проекты</string>
-    <string name="notif_chats">Чаты (до 256 отдельных настроек)</string>
-    <!-- Временные строки; окончательная редактура отдельно. -->
-    <string name="notif_monitoring">Ответы с компьютера</string>
-    <string name="notif_initializing">Подключение к ПК…</string>
-    <string name="notif_listening">ПК онлайн · Ждём ответы</string>
-    <string name="notif_degraded">Часть событий могла быть пропущена.</string>
-    <string name="notif_offline">Связь прервана · переподключение…</string>
     <string name="notif_mode_sound">Со звуком</string>
     <string name="notif_mode_silent">Без звука</string>
-    <string name="notif_mode_off">Выключены</string>
-    <string name="notif_answer_system">Настройки канала ответов</string>
-    <string name="notif_attention_system">Настройки канала запросов ввода</string>
     <string name="notif_answer">Ответить</string>
-    <string name="notif_ongoing_title_connecting">Подключение к ПК…</string>
-    <string name="notif_ongoing_title_online">ПК на связи · уведомления включены</string>
-    <string name="notif_ongoing_title_offline">Нет связи с ПК · переподключение</string>
-    <string name="notif_ongoing_ready">Сообщим, когда ответ готов или агент ждёт вашего решения</string>
-    <string name="notif_open_settings">Настройки</string>
     <string name="notif_unnamed_chat">Чат без названия</string>
     <string name="notif_open_chat_fallback">Нажмите, чтобы открыть чат в приложении</string>
     <string name="notif_summary_channel">Сводка уведомлений о чатах</string>
-    <string name="notif_ongoing_title_degraded">ПК на связи · возможны пропуски</string>
-    <string name="notif_ongoing_title_reconnecting">Переподключение к ПК…</string>
-    <string name="notif_ongoing_title_blocked">Уведомления отключены</string>
-    <string name="notif_ongoing_connecting_body">Настраиваем фоновую связь для уведомлений о чатах</string>
-    <string name="notif_ongoing_degraded_body">Часть уведомлений могла не прийти. Проверьте чаты</string>
-    <string name="notif_ongoing_reconnecting_body">Связь прервалась. Уведомления могут приходить с задержкой</string>
-    <string name="notif_ongoing_blocked_body">Нет доступа к ПК. Откройте приложение и проверьте подключение</string>
     <plurals name="notif_summary_chats">
         <item quantity="one">%d чат</item>
         <item quantity="few">%d чата</item>
@@ -64,4 +33,8 @@
         <item quantity="many">Нужно ваше решение в %d чатах</item>
         <item quantity="other">Нужно ваше решение в %d чатах</item>
     </plurals>
+    <string name="notif_watch_channel">Задачи с телефона</string>
+    <string name="notif_watch_title">Ждём результат задачи</string>
+    <string name="notif_watch_body">Задача отправлена с этого телефона</string>
+    <string name="notif_task_failed">Задача завершилась ошибкой</string>
 </resources>

@@ -1,51 +1,20 @@
 <resources>
     <string name="notif_title">Notifications</string>
-    <string name="notif_connected">DSH Mobile connected</string>
     <string name="notif_connection_channel">Connection to computer</string>
     <string name="notif_answers_channel">Agent answers</string>
     <string name="notif_attention_channel">Your decision needed</string>
-    <string name="notif_disable">Disable</string>
     <string name="notif_answer_ready">Answer ready</string>
-    <string name="notif_needs_decision">Agent needs your decision</string>
+    <string name="notif_needs_decision">Response needed</string>
     <string name="notif_generic">Open the chat on your computer</string>
-    <string name="notif_rationale">Receive answer and decision alerts for permitted chats, including work started on the computer. “Answer ready” shows only project and chat names, never answer text. When the agent asks a question, “Agent needs your decision” shows the question text while the phone is unlocked and only the chat name on the lock screen. Monitoring uses a persistent notification and battery power.</string>
-    <string name="notif_restart">To alert you with “Answer ready” and “Agent needs your decision”, the app keeps a background connection to your computer. Android requires a permanent notification: silent and low-priority; tapping it opens your chat list. There is no automatic start after a phone restart, so open the app to reconnect. Alerts may be delayed in Doze mode, when the computer is off or if the connection drops.</string>
-    <string name="notif_unsupported">This host does not support notifications yet. Refresh the connection after upgrading it.</string>
+    <string name="notif_rationale">Notify when a task sent from this phone finishes or needs your response. Tap to open its chat. With no active phone tasks, the background connection is stopped.</string>
     <string name="notif_blocked">Notifications could not be enabled. Check notification access and system restrictions, then try again.</string>
-    <string name="notif_unsynced">Local preferences saved; waiting for host synchronization.</string>
     <string name="notif_system">System notification settings</string>
-    <string name="notif_battery">Battery optimization settings</string>
-    <string name="notif_oneplus">OnePlus: allow background activity and check sleep/standby optimization in system settings. These settings do not guarantee delivery after force stop.</string>
-    <string name="notif_filters">Project and chat notifications</string>
-    <string name="notif_projects">Projects</string>
-    <string name="notif_chats">Chats (up to 256 overrides)</string>
-    <!-- Placeholder connection copy; final wording reviewed separately. -->
-    <string name="notif_monitoring">Answers from your computer</string>
-    <string name="notif_initializing">Connecting to computer…</string>
-    <string name="notif_listening">Computer online · Listening for answers</string>
-    <string name="notif_degraded">Some events may have been missed.</string>
-    <string name="notif_offline">Connection lost · reconnecting…</string>
     <string name="notif_mode_sound">With sound</string>
     <string name="notif_mode_silent">Silent</string>
-    <string name="notif_mode_off">Off</string>
-    <string name="notif_answer_system">Answer channel settings</string>
-    <string name="notif_attention_system">Attention channel settings</string>
     <string name="notif_answer">Answer</string>
-    <string name="notif_ongoing_title_connecting">Connecting to computer…</string>
-    <string name="notif_ongoing_title_online">Computer connected · alerts on</string>
-    <string name="notif_ongoing_title_offline">No connection · reconnecting…</string>
-    <string name="notif_ongoing_ready">We\'ll notify you when an answer is ready or an agent needs your decision</string>
-    <string name="notif_open_settings">Settings</string>
     <string name="notif_unnamed_chat">Untitled chat</string>
     <string name="notif_open_chat_fallback">Tap to open the chat in the app</string>
     <string name="notif_summary_channel">Chat alerts summary</string>
-    <string name="notif_ongoing_title_degraded">Computer connected · possible gaps</string>
-    <string name="notif_ongoing_title_reconnecting">Reconnecting to computer…</string>
-    <string name="notif_ongoing_title_blocked">Notifications turned off</string>
-    <string name="notif_ongoing_connecting_body">Setting up a background connection for chat alerts</string>
-    <string name="notif_ongoing_degraded_body">Some alerts may not have arrived. Check your chats</string>
-    <string name="notif_ongoing_reconnecting_body">Connection lost. Alerts may be delayed</string>
-    <string name="notif_ongoing_blocked_body">Couldn\'t access your computer. Open the app to check the connection</string>
     <plurals name="notif_summary_chats">
         <item quantity="one">%d chat</item>
         <item quantity="other">%d chats</item>
@@ -58,4 +27,8 @@
         <item quantity="one">Decision needed in %d chat</item>
         <item quantity="other">Decision needed in %d chats</item>
     </plurals>
+    <string name="notif_watch_channel">Phone tasks</string>
+    <string name="notif_watch_title">Waiting for task result</string>
+    <string name="notif_watch_body">Task sent from this phone</string>
+    <string name="notif_task_failed">Task failed</string>
 </resources>

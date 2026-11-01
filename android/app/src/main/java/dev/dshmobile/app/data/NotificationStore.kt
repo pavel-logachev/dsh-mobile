@@ -26,6 +26,21 @@ internal class NotificationStore internal constructor(private val file: AtomicSt
     })
     private val mutex = StateFileOwners.mutex(file.identity)
     val changes: kotlinx.coroutines.flow.StateFlow<Long> get() = updates
+    suspend fun reset() = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            file.delete() // Deliberately no read/decrypt/encrypt on destructive forget.
+            updates.value = updates.value + 1
+            try { KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(ALIAS) }
+            catch (_: Exception) { /* Deleted record is no longer recoverable. */ }
+        }
+    }
+    /** Policy check + synchronous platform post share the same owner as disable/reset. */
+    suspend fun postIfCurrent(device: String, key: String, post: () -> Unit) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            val current = readLocked()
+            if (current.enabled && current.deviceId == device && current.outbox.any { it.key == key }) post()
+        }
+    }
     suspend fun read(): NotificationLocal = withContext(Dispatchers.IO) { mutex.withLock { readLocked() } }
     suspend fun update(change: (NotificationLocal) -> NotificationLocal): NotificationLocal = withContext(Dispatchers.IO) {
         mutex.withLock {

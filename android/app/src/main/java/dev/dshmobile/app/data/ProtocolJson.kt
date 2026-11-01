@@ -62,6 +62,11 @@ internal fun SessionSummary.checked(): SessionSummary {
 }
 internal fun SessionSnapshot.checked(expectedId: String): SessionSnapshot {
     session.checked()
+    if (promptOutcomes.size > 1024 || promptOutcomes.map { it.requestId }.distinct().size != promptOutcomes.size ||
+        promptOutcomes.any { !validRequestId(it.requestId) || !validId(it.turnId) ||
+            it.status !in setOf("queued", "running", "waiting", "completed", "failed", "rejected") ||
+            (it.summary != null && (it.summary.toByteArray().size > 2048 || it.summary.any { c -> c.isISOControl() })) })
+        throw MobileFailure("invalid_response")
     if (session.id != expectedId || cursor < -1 || messages.size > 100 || notice.orEmpty().length > 4096 ||
         (failure != null && (failure.message.toByteArray().size > 2048 || failure.message.any { it.isISOControl() } ||
             (failure.code != null && (failure.code.length > 64 || !Regex("[A-Za-z0-9_.:-]{1,64}").matches(failure.code))))) ||

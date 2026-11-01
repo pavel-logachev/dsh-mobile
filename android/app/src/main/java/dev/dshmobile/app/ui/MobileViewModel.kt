@@ -8,6 +8,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.dshmobile.app.ui.pairing.PairingInput
+import dev.dshmobile.app.data.needsWatchService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -65,7 +66,7 @@ class MobileViewModel @JvmOverloads constructor(application: Application,
     fun answer(callId: String, answer: dev.dshmobile.app.model.QuestionAnswer) {
         val session = state.value.snapshot?.session?.id ?: return
         phoneMutation("answer:$callId", { repository.answer(callId, answer) }) {
-            answeredQuestions = answeredQuestions + (dev.dshmobile.app.model.questionDraftKey(session, callId) to answer)
+            answeredQuestions = (answeredQuestions + (dev.dshmobile.app.model.questionDraftKey(session, callId) to answer)).entries.toList().takeLast(32).associate { it.toPair() }
         }
     }
     fun saveAnswer(sessionId: String, callId: String, answer: dev.dshmobile.app.model.QuestionAnswer) { viewModelScope.launch { repository.saveAnswerDraft(sessionId, callId, answer) } }
@@ -83,6 +84,7 @@ class MobileViewModel @JvmOverloads constructor(application: Application,
     var editorDraft by mutableStateOf("")
         private set
     private var editorSessionId: String? = null
+    private var answerSessionId: String? = null
     private var pendingDraftWrites = 0
     private val editorActions = Mutex()
     var interactionBlocked by mutableStateOf(false)
@@ -113,6 +115,7 @@ class MobileViewModel @JvmOverloads constructor(application: Application,
                     if (it.error == "command_rejected") taskNotSent = taskNotSent + (created to task)
                 } }
                 val sessionId = it.snapshot?.session?.id
+                if (sessionId != answerSessionId) { answeredQuestions = emptyMap(); answerSessionId = sessionId }
                 if (sessionId != editorSessionId || it.pending != null || pendingDraftWrites == 0) {
                     editorSessionId = sessionId
                     editorDraft = it.draft
@@ -291,13 +294,16 @@ class MobileViewModel @JvmOverloads constructor(application: Application,
     fun abandonPending() { firstTaskContinuation = null; viewModelScope.launch { repository.abandonPending() } }
     fun forget() {
         firstTaskContinuation = null
+        answeredQuestions = emptyMap()
         pairingInput.edit("")
         viewModelScope.launch {
             val context = getApplication<Application>()
             context.stopService(android.content.Intent(context, dev.dshmobile.app.data.NotificationService::class.java))
             dev.dshmobile.app.data.NotificationPosting.cancelAll(context)
-            dev.dshmobile.app.data.NotificationStore(context).update { dev.dshmobile.app.data.NotificationLocal() }
-            repository.forget()
+            try { dev.dshmobile.app.data.NotificationStore(context).reset() }
+            catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (_: Exception) { /* Optional notifications cannot prevent credential deletion. */ }
+            finally { repository.forget() }
         }
     }
     private val notificationRequests = NotificationTargetRequests()
@@ -355,13 +361,16 @@ class MobileViewModel @JvmOverloads constructor(application: Application,
         val context = getApplication<Application>()
         val local = dev.dshmobile.app.data.NotificationStore(context).read()
         val host = dev.dshmobile.app.data.EncryptedStateStore(context).read().host
-        local.enabled && host?.deviceId == local.deviceId && context.getSystemService(android.app.NotificationManager::class.java).areNotificationsEnabled()
+        if (!local.enabled || (!local.needsWatchService(System.currentTimeMillis()) && local.outbox.isEmpty())) {
+            val manager = context.getSystemService(android.app.NotificationManager::class.java)
+            manager.cancel(1); manager.deleteNotificationChannel("connection")
+        }
+        local.enabled && (local.needsWatchService(System.currentTimeMillis()) || local.outbox.isNotEmpty()) &&
+            host?.deviceId == local.deviceId && dev.dshmobile.app.data.watchAlertsAllowed(context)
     }, start = {
         val context = getApplication<Application>()
         androidx.core.content.ContextCompat.startForegroundService(context, android.content.Intent(context, dev.dshmobile.app.data.NotificationService::class.java))
-    }, failed = {
-        dev.dshmobile.app.data.NotificationStore(getApplication()).update { it.copy(enabled = false, monitoringStatus = "blocked") }
-    }, sync = { dev.dshmobile.app.data.syncNotificationPreferences(getApplication()) })
+    }, failed = {}, sync = {})
     fun foreground(active: Boolean) {
         notificationResume.foreground(active)
         viewModelScope.launch { repository.setForeground(active) }
