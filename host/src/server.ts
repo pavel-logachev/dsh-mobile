@@ -514,7 +514,13 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     if (closing) throw new HostError('unavailable');
     // No browser surface, cookies, CORS or query credentials. A native client has no Origin.
     if (req.headers.origin !== undefined || req.headers['sec-fetch-site'] !== undefined) throw new HostError('forbidden');
-    if (!req.url?.startsWith('/v1/') || req.url.length > 2048 || /[#\x00-\x20\\]/.test(req.url)) throw new HostError('invalid_request');
+    if (!req.url?.startsWith('/v1/') || /[#\x00-\x20\\]/.test(req.url)) throw new HostError('invalid_request');
+    // Only this route needs room for 32 UUIDs and a 256-byte session segment.
+    // Worst-case %HH session/key/UUID encoding + the existing 2048-byte allowance
+    // for fixed path, since/waitSeconds and query syntax = 7200 raw characters.
+    const outcomeUrl = req.method === 'GET' && /^\/v1\/sessions\/[^/]+\/prompt-outcomes$/.test(req.url.split('?')[0]!);
+    const urlLimit = outcomeUrl ? 3 * 256 + 32 * (1 + 3 * 'requestId'.length + 1 + 3 * 36) + 2048 : 2048;
+    if (req.url.length > urlLimit) throw new HostError('invalid_request');
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname + url.search !== req.url) throw new HostError('invalid_request');
     const outcomesRoute = req.method === 'GET' && /^\/v1\/sessions\/[^/]+\/prompt-outcomes$/.test(url.pathname);
@@ -604,7 +610,8 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       const wait = url.searchParams.get('waitSeconds') ?? '0';
       if (!/^[0-9]+$/.test(wait) || Number(wait) > 25) throw new HostError('invalid_request');
       const sessionId = segments[1]!;
-      const read = async () => {
+      let pageWorkspaceId: string | undefined;
+      const read = async (signal: AbortSignal) => {
         // Same point scope/error policy as snapshot GET, without reconstructing
         // its bounded transcript just to authorize a durable-journal read.
         let workspaceId: string;
@@ -624,10 +631,13 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
           lookups.push({ requestId: upstreamId, ...(checkpoint ? { checkpoint } : {}) }); slots.push({ index, upstreamId });
         });
         if (lookups.length) {
-          const derived = await adapter.promptOutcomes(sessionId, lookups, signal, workspaceId);
+          let derived;
+          try { derived = await adapter.promptOutcomes(sessionId, lookups, signal, workspaceId); }
+          catch (error) { return failedPointRead(sessionId, device.deviceId, signal, error); }
           signal.throwIfAborted();
           if (derived.length !== lookups.length) throw new HostError('unavailable');
           await checkScope(device.deviceId, workspaceId, false, true);
+          signal.throwIfAborted();
           if (workspaceSource.archivedSessionIds().has(sessionId)) throw new HostError('not_found');
           derived.forEach((checkpoint, i) => {
             const { index, upstreamId } = slots[i]!;
@@ -637,9 +647,21 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
             outcomes[index] = projected;
           });
         }
+        signal.throwIfAborted();
+        pageWorkspaceId = workspaceId;
         return { token: outcomeToken(outcomes), outcomes };
       };
       const page = await promptPolls.get(device.deviceId, url.searchParams.get('since'), Number(wait), read, wake => adapter.onPromptOutcomeChange?.(sessionId, wake) ?? (() => {}), signal);
+      // Expiry/supersede may return the last settled page while its reread is
+      // still blocked. Reauthorize that page independently, never reuse a grant
+      // or workspace mapping captured before the held interval.
+      assertOpen(res, signal);
+      let currentWorkspaceId: string;
+      try { currentWorkspaceId = adapter.sessionScope ? await adapter.sessionScope(sessionId, signal) : (await sessionSnapshot(sessionId, device.deviceId, signal, false)).session.workspaceId; }
+      catch (error) { return failedPointRead(sessionId, device.deviceId, signal, error); }
+      if (currentWorkspaceId !== pageWorkspaceId) throw new HostError('not_found');
+      await checkScope(device.deviceId, currentWorkspaceId, false, true);
+      if (workspaceSource.archivedSessionIds().has(sessionId)) throw new HostError('not_found');
       assertOpen(res, signal); sendJson(res, 200, page); return;
     }
     if (req.method === 'DELETE' && segments[0] === 'sessions' && segments.length === 4 && segments[2] === 'uploads') {

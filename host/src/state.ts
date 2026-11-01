@@ -473,11 +473,14 @@ export class HostState {
   saveOutcomeCheckpoint(deviceId: string, requestId: string, upstreamId: string, value: OutcomeCheckpoint): void {
     const json = JSON.stringify(value);
     if (Buffer.byteLength(json) > 32 * 1024) throw new HostError('unavailable');
-    // Per-command cursor only advances, including overlapping reads. Receipts are
-    // durable and not TTL-pruned; checkpoints share that lifetime (metadata only).
+    // Within one consumption proof version the cursor only advances. A newer
+    // proof version may restart a legacy scan; an old in-flight fold cannot win.
+    // Receipts/checkpoints are durable and not TTL-pruned (metadata only).
     this.db.prepare(`INSERT INTO prompt_outcome_checkpoints VALUES (?,?,?,?)
       ON CONFLICT(device_id,request_id) DO UPDATE SET upstream_id=excluded.upstream_id,checkpoint=excluded.checkpoint
-      WHERE json_extract(excluded.checkpoint,'$.nextSeq')>=json_extract(prompt_outcome_checkpoints.checkpoint,'$.nextSeq')`).run(deviceId, requestId, upstreamId, json);
+      WHERE COALESCE(json_extract(excluded.checkpoint,'$.consumptionVersion'),0)>COALESCE(json_extract(prompt_outcome_checkpoints.checkpoint,'$.consumptionVersion'),0)
+         OR (COALESCE(json_extract(excluded.checkpoint,'$.consumptionVersion'),0)=COALESCE(json_extract(prompt_outcome_checkpoints.checkpoint,'$.consumptionVersion'),0)
+             AND json_extract(excluded.checkpoint,'$.nextSeq')>=json_extract(prompt_outcome_checkpoints.checkpoint,'$.nextSeq'))`).run(deviceId, requestId, upstreamId, json);
   }
   /** Bounded recent prompt identities; no text or foreign-device IDs are read. */
   promptCommandIds(deviceId: string): string[] {

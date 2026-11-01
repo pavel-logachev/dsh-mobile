@@ -10,26 +10,29 @@ import { createDshAdapter } from '../src/dsh-adapter.ts';
 import type { DshObservation } from '../src/dsh-adapter.ts';
 import { opening, summary } from './fixtures/rc2.ts';
 
-async function setup(t: TestContext) {
+async function setup(t: TestContext, sessionId = summary.sessionId) {
   const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-outcomes-'))); mkdirSync(join(dir, 'проект с пробелами'));
   const workspace = { id: 'alpha', name: 'Synthetic', path: join(dir, 'проект с пробелами') };
-  const frame = structuredClone(opening); frame.header.cwd = workspace.path;
+  mkdirSync(join(dir, 'beta')); const otherWorkspace = { id: 'beta', name: 'Other synthetic', path: join(dir, 'beta') };
+  const frame = structuredClone(opening); frame.header.cwd = workspace.path; frame.header.id = sessionId;
   const listeners = new Set<(e: DshObservation) => void>(), journal: unknown[] = [], calls: { offset: number; length: number }[] = [], prompted: string[] = [];
-  let beforeJournalRead = async () => {};
-  const row = { ...structuredClone(summary), cwd: workspace.path };
+  let beforeJournalRead: (signal?: AbortSignal) => Promise<void> = async () => {};
+  let beforeJournalOpen = async () => {}, beforeJournalClose = async () => {};
+  let readerCloses = 0;
+  const row = { ...structuredClone(summary), sessionId, cwd: workspace.path };
   const options = {
-    dshVersion: '0.2.1-rc.5', workspaces: [workspace], sessionHeader: async () => frame.header,
+    dshVersion: '0.2.1-rc.5', workspaces: [workspace, otherWorkspace], sessionHeader: async () => frame.header,
     sessionController: {
       async list() { return { items: [row] }; },
       async *follow(_req: unknown, signal: AbortSignal) { try { yield structuredClone(frame); throw new Error('must not resume'); } finally { assert.ok(signal.aborted); } },
       async page() { return { records: [], hasMore: false }; }, async projections() { return frame.projections; },
       async create() { return { sessionId: 'synthetic' }; }, async prompt(input: { requestId: string }) { prompted.push(input.requestId); }, cancel() {},
     },
-    promptJournal: { async open() { return { async read(offset: number, length: number) { calls.push({ offset, length }); await beforeJournalRead(); return { events: journal.slice(offset, offset + length) }; }, async close() {} }; } },
+    promptJournal: { async open() { await beforeJournalOpen(); return { async read(offset: number, length: number, readOptions?: { signal?: AbortSignal }) { calls.push({ offset, length }); await beforeJournalRead(readOptions?.signal); return { events: journal.slice(offset, offset + length) }; }, async close() { readerCloses++; await beforeJournalClose(); } }; } },
     events: { subscribe(_id: string, listener: (e: DshObservation) => void) { listeners.add(listener); return () => { listeners.delete(listener); }; } },
   };
   let adapter = await createDshAdapter(options);
-  const config = { hostName: 'Synthetic', bind: '127.0.0.1', port: 0, allowInsecureLoopback: true, statePath: join(dir, 'host.sqlite'), workspaces: [workspace] };
+  const config = { hostName: 'Synthetic', bind: '127.0.0.1', port: 0, allowInsecureLoopback: true, statePath: join(dir, 'host.sqlite'), workspaces: [workspace, otherWorkspace] };
   let host = await startHostServer({ config, adapter }), baseUrl = (await host.start()).baseUrl;
   t.after(async () => { await host.close(); adapter.dispose(); rmSync(dir, { recursive: true, force: true }); });
   async function request(path: string, token?: string, method = 'GET', body?: unknown, abort?: AbortSignal) {
@@ -48,10 +51,13 @@ async function setup(t: TestContext) {
     host.state.admitCommand(deviceId, id, operation, 'a'.repeat(64), 'alpha', sessionId);
     host.state.finishCommand(deviceId, id, status);
   }
-  const url = (ids: string[], extra = '') => '/sessions/' + row.sessionId + '/prompt-outcomes?' + ids.map(id => 'requestId=' + encodeURIComponent(id)).join('&') + extra;
+  const url = (ids: string[], extra = '') => '/sessions/' + encodeURIComponent(row.sessionId) + '/prompt-outcomes?' + ids.map(id => 'requestId=' + encodeURIComponent(id)).join('&') + extra;
   async function send(token: string, id: string) { return request('/sessions/' + row.sessionId + '/messages', token, 'POST', { requestId: id, text: 'Synthetic' }); }
-  return { request, pair, append, admitted, send, url, calls, listeners, journal, frame, prompted, host: () => host,
-    beforeRead(fn: () => Promise<void>) { beforeJournalRead = fn; },
+  return { request, pair, append, admitted, send, url, calls, listeners, journal, frame, prompted, otherWorkspace, adapter: () => adapter, host: () => host,
+    beforeRead(fn: (signal?: AbortSignal) => Promise<void>) { beforeJournalRead = fn; },
+    beforeOpen(fn: () => Promise<void>) { beforeJournalOpen = fn; },
+    beforeClose(fn: () => Promise<void>) { beforeJournalClose = fn; },
+    readerCloses: () => readerCloses,
     async restart() { await host.close(); adapter.dispose(); adapter = await createDshAdapter(options); host = await startHostServer({ config, adapter }); baseUrl = (await host.start()).baseUrl; },
   };
 }
@@ -69,6 +75,22 @@ test('capabilities.promptOutcomes and HTTP 0/1/32/33 UUIDs, duplicates, case, no
     const result = await json(await h.request(h.url(values), phone.deviceToken));
     assert.deepEqual(result.outcomes.map((o: any) => o.requestId), [...new Set(values.map(id => id.toLowerCase()))]);
     assert.ok(result.outcomes.every((o: any) => o.status === 'unknown' && o.updatedAt === '1970-01-01T00:00:00.000Z'));
+  }
+});
+
+test('R10 32 UUIDs fit any legal 256-byte encoded session segment without enlarging other routes', async t => {
+  for (const sessionId of ['я'.repeat(128), '😀'.repeat(64), 'a'.repeat(256), 'e\u0301'.repeat(85)]) {
+    const h = await setup(t, sessionId), phone = h.pair(), ids = Array.from({ length: 32 }, () => randomUUID());
+    const path = h.url(ids, '&waitSeconds=25&since=' + 'x'.repeat(43));
+    const result = await json(await h.request(path, phone.deviceToken));
+    assert.equal(result.outcomes.length, 32);
+    assert.deepEqual(result.outcomes.map((o: any) => o.requestId), ids);
+    // Percent-encoded UUID bytes are legal too; retain literal route/query names.
+    const encodedQuery = '/sessions/' + encodeURIComponent(sessionId) + '/prompt-outcomes?' + ids.map(id => 'requestId=' + [...id].map(c => '%' + c.charCodeAt(0).toString(16)).join('')).join('&');
+    assert.equal((await h.request(encodedQuery, phone.deviceToken)).status, 200);
+    assert.equal((await h.request(path + '&since=' + 'x'.repeat(9000), phone.deviceToken)).status, 400);
+    assert.equal((await h.request('/sessions?workspaceId=' + 'x'.repeat(2048), phone.deviceToken)).status, 400);
+    assert.equal((await h.request(h.url(ids).replace(encodeURIComponent(sessionId), encodeURIComponent(sessionId + 'aa')), phone.deviceToken)).status, 400);
   }
 });
 
@@ -179,6 +201,119 @@ test('held outcome polls do not consume the three per-device SSE slots; grant re
     const response = await poll; assert.equal(response.status, 404);
   } finally { for (const reader of streams) await reader.cancel(); }
 });
+
+for (const stage of ['opening', 'held'] as const) for (const phase of ['beforeOpen', 'beforeRead', 'beforeClose'] as const) {
+  test(`R06 HTTP shutdown during ${stage} ${phase} finishes host and removes subscription before IO settles`, async t => {
+    const h = await setup(t), phone = h.pair(), id = randomUUID();
+    h.admitted(phone.deviceId, id);
+    const initial = await json(await h.request(h.url([id]), phone.deviceToken));
+    const gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+    let calls = 0;
+    h[phase](async () => { if (++calls === (stage === 'held' ? 2 : 1)) { entered.resolve(); await gate.promise; } });
+    const pending = h.request(h.url([id], '&waitSeconds=25&since=' + initial.token), phone.deviceToken);
+    await entered.promise;
+    try {
+      await Promise.race([h.host().close(), new Promise<never>((_, reject) => { const timer = setTimeout(() => reject(new Error('host.close retained journal IO')), 500); timer.unref(); })]);
+      const response = await pending; assert.equal(response.status, 503);
+      assert.equal(h.listeners.size, 0);
+    } finally { gate.resolve(); await pending; }
+  });
+}
+
+test('R06 timeout detaches held journal read and late settlement closes its exact reader', async t => {
+  const h = await setup(t), phone = h.pair(), id = randomUUID(); h.admitted(phone.deviceId, id);
+  const initial = await json(await h.request(h.url([id]), phone.deviceToken));
+  const gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+  let reads = 0;
+  h.beforeRead(async () => { if (++reads > 1) { entered.resolve(); await gate.promise; } });
+  const pending = h.request(h.url([id], '&waitSeconds=2&since=' + initial.token), phone.deviceToken);
+  await entered.promise;
+  try {
+    assert.deepEqual(await json(await pending), initial); assert.equal(h.listeners.size, 0);
+    const closes = h.readerCloses();
+    gate.resolve(); await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(h.readerCloses(), closes + 1, 'late reader closes once; aborted read never publishes');
+  } finally { gate.resolve(); }
+});
+
+test('R06 timeout of a blocked reread reauthorizes the last page before responding', async t => {
+  const h = await setup(t), phone = h.pair(), id = randomUUID(); h.admitted(phone.deviceId, id);
+  const initial = await json(await h.request(h.url([id]), phone.deviceToken));
+  const gate = Promise.withResolvers<void>(); let reads = 0;
+  h.beforeRead(async () => { if (++reads < 2) return; h.host().state.replaceDeviceGrants(phone.deviceId, { readWorkspaceIds: [], executeWorkspaceIds: [] }); await gate.promise; });
+  try {
+    const response = await h.request(h.url([id], '&waitSeconds=2&since=' + initial.token), phone.deviceToken);
+    assert.equal(response.status, 404); assert.equal(h.listeners.size, 0);
+  } finally { gate.resolve(); }
+});
+
+test('R06 deadline forwards abort to cooperative journal read and releases its reader before late publication', async t => {
+  const h = await setup(t), phone = h.pair(), id = randomUUID(); h.admitted(phone.deviceId, id);
+  const initial = await json(await h.request(h.url([id]), phone.deviceToken)); let reads = 0, aborts = 0;
+  h.beforeRead(async active => {
+    if (++reads < 2) return;
+    assert.ok(active);
+    await new Promise<void>((_, reject) => { const abort = () => { aborts++; reject(active.reason); }; active.addEventListener('abort', abort, { once: true }); if (active.aborted) abort(); });
+  });
+  assert.deepEqual(await json(await h.request(h.url([id], '&waitSeconds=2&since=' + initial.token), phone.deviceToken)), initial);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(aborts, 1); assert.equal(h.readerCloses(), 3); assert.equal(h.listeners.size, 0);
+});
+
+test('R06 aborted IO keeps all four actual adapter slots until read and close settle; capacity waiter aborts', async t => {
+  const h = await setup(t), gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+  const controllers = Array.from({ length: 4 }, () => new AbortController()); let reads = 0;
+  h.beforeRead(async () => { if (++reads === 4) entered.resolve(); await gate.promise; });
+  const inFlight = controllers.map(controller => h.adapter().promptOutcomes(summary.sessionId, [{ requestId: randomUUID() }], controller.signal, 'alpha'));
+  const observed = inFlight.map(p => p.then(() => undefined, error => error));
+  await entered.promise; controllers.forEach(controller => controller.abort());
+  const fifth = new AbortController(), waiting = h.adapter().promptOutcomes(summary.sessionId, [{ requestId: randomUUID() }], fifth.signal, 'alpha');
+  const rejected = assert.rejects(waiting);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(reads, 4); assert.equal(h.readerCloses(), 0);
+  fifth.abort(); await rejected;
+  gate.resolve(); await Promise.all(observed); assert.equal(h.readerCloses(), 4);
+  h.beforeRead(async () => {});
+  assert.equal((await h.adapter().promptOutcomes(summary.sessionId, [{ requestId: randomUUID() }], new AbortController().signal, 'alpha'))[0]!.outcome.status, 'unknown');
+});
+
+test('R07 legacy false terminal HTTP checkpoint is replaced by authoritative rescan across restart', async t => {
+  const h = await setup(t), phone = h.pair(), id = randomUUID();
+  assert.equal((await h.send(phone.deviceToken, id)).status, 200); const rpcId = h.prompted[0]!;
+  h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { nextSeq: 8000, caughtUp: true, turn: 1, approvals: [], questions: [], outcome: { requestId: rpcId, status: 'completed', turnId: '1', updatedAt: '1970-01-01T00:00:01.000Z' } });
+  h.append('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [{ source: { kind: 'user', rpcId } }] });
+  const result = await json(await h.request(h.url([id]), phone.deviceToken));
+  assert.equal(result.outcomes[0].status, 'queued');
+  const saved = h.host().state.outcomeCheckpoint(phone.deviceId, id, rpcId)!;
+  assert.equal(saved.nextSeq, 1); assert.equal(saved.consumptionVersion, 1);
+  // Late legacy writers and same-version lower cursors cannot restore false evidence.
+  h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, consumptionVersion: undefined, nextSeq: 9000, outcome: { ...saved.outcome, status: 'completed' } });
+  h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, nextSeq: 0, outcome: { ...saved.outcome, status: 'unknown' } });
+  await h.restart(); assert.deepEqual(await json(await h.request(h.url([id]), phone.deviceToken)), result);
+});
+
+test('R09 session remap while reader.close yields cannot publish outcome or checkpoint', async t => {
+  const h = await setup(t), phone = h.pair(), id = randomUUID();
+  assert.equal((await h.send(phone.deviceToken, id)).status, 200);
+  h.append('turn/start', { turn: 1 }); h.append('user/message', { source: { kind: 'user', rpcId: h.prompted[0] } });
+  h.append('turn/end', { turn: 1, reason: { kind: 'error', error: { message: 'Synthetic alpha-only failure' } } });
+  h.beforeClose(async () => { await Promise.resolve(); h.frame.header.cwd = h.otherWorkspace.path; });
+  const response = await h.request(h.url([id]), phone.deviceToken);
+  assert.equal(response.status, 404); assert.equal((await response.json()).error.code, 'not_found');
+  assert.equal(h.readerCloses(), 1);
+  assert.equal(h.host().state.outcomeCheckpoint(phone.deviceId, id, h.prompted[0]!), undefined);
+});
+
+for (const phase of ['beforeOpen', 'beforeRead', 'beforeClose'] as const) {
+  test(`R08 grant revoked during failing journal ${phase} uses snapshot not_found policy`, async t => {
+    const h = await setup(t), phone = h.pair(), id = randomUUID();
+    assert.equal((await h.send(phone.deviceToken, id)).status, 200);
+    h[phase](async () => { h.host().state.replaceDeviceGrants(phone.deviceId, { readWorkspaceIds: [], executeWorkspaceIds: [] }); throw new Error('synthetic journal failure'); });
+    const response = await h.request(h.url([id]), phone.deviceToken);
+    assert.equal(response.status, 404); assert.equal((await response.json()).error.code, 'not_found');
+    assert.equal(h.host().state.outcomeCheckpoint(phone.deviceId, id, h.prompted[0]!), undefined);
+  });
+}
 
 test('grant revoked during journal I/O is rechecked before outcomes or checkpoints can leak', async t => {
   const h = await setup(t), phone = h.pair(), id = randomUUID();

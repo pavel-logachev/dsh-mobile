@@ -6,6 +6,8 @@ export type PromptStatus = 'unknown' | 'queued' | 'running' | 'waiting' | 'compl
 export interface PromptOutcome { requestId: string; status: PromptStatus; turnId?: string; summary?: string; updatedAt: string }
 export interface OutcomeCheckpoint {
   nextSeq: number; caughtUp?: boolean; openTurn?: number; turn?: number;
+  /** v1 binds consuming turns only to durable user/message, not inbox removal. */
+  consumptionVersion?: 1;
   pending?: { target: string; index: number }; approvals: string[]; questions: string[];
   outcome: PromptOutcome;
 }
@@ -20,18 +22,22 @@ function pendingResult(content: unknown): boolean {
   if (typeof text?.text !== 'string') return false;
   try { return object(JSON.parse(text.text)).pending === true; } catch { return false; }
 }
-const terminal = (c: OutcomeCheckpoint) => c.outcome.status === 'completed' || c.outcome.status === 'failed';
+export const provenTerminal = (c: OutcomeCheckpoint) => c.consumptionVersion === 1 && !c.pending && (c.outcome.status === 'completed' || c.outcome.status === 'failed');
+const terminal = provenTerminal;
 export const unknownOutcome = (requestId: string): PromptOutcome => ({ requestId, status: 'unknown', updatedAt: '1970-01-01T00:00:00.000Z' });
 export function outcomeToken(outcomes: readonly PromptOutcome[]): string { return createHash('sha256').update(JSON.stringify(outcomes)).digest('base64url'); }
 
 /** Incremental journal fold. Checkpoints contain metadata only, never prompt/tool text.
  * A turn is established BEFORE user/message (agent-loop rc.5:945,1072).
- * Inbox splices prove admission/claim even before the first step (rc.5:180-204).
+ * Splices prove pending admission, not consumption: claimed is live-only (103-109).
+ * Durable user/message.source.rpcId proves actual consumption (1067-1072).
  * End reasons not named by this contract fail closed to unknown, never success.
  */
 export async function derivePromptOutcomes(reader: JournalReader, lookups: readonly PromptLookup[], signal: AbortSignal): Promise<OutcomeCheckpoint[]> {
   if (lookups.length > 32) throw new HostError('invalid_request');
-  const states = lookups.map(item => item.checkpoint ? structuredClone(item.checkpoint) : { nextSeq: 0, approvals: [], questions: [], outcome: unknownOutcome(item.requestId) } as OutcomeCheckpoint);
+  // Old checkpoints may contain a false consuming turn, including memoized terminal
+  // results. Re-scan once under the new proof rule rather than trust that evidence.
+  const states = lookups.map(item => item.checkpoint?.consumptionVersion === 1 ? structuredClone(item.checkpoint) : { consumptionVersion: 1, nextSeq: 0, approvals: [], questions: [], outcome: unknownOutcome(item.requestId) } as OutcomeCheckpoint);
   const active = states.filter(c => !terminal(c));
   if (!active.length) return states;
   let offset = Math.min(...active.map(c => c.nextSeq)), bytes = 0, count = 0, caughtUp = false;
@@ -60,14 +66,14 @@ export async function derivePromptOutcomes(reader: JournalReader, lookups: reado
           const start = Number(d.start), removed = Number(d.removedCount ?? 0);
           if (c.pending && c.pending.target === d.target) {
             if (c.pending.index >= start && c.pending.index < start + removed) {
-              if (d.outcome !== 'canceled' && c.openTurn !== undefined) { c.turn = c.openTurn; update('running'); }
-              else update('unknown');
+              delete c.turn; update('unknown');
               delete c.pending;
             } else if (c.pending.index >= start + removed) c.pending.index += d.inserted.length - removed;
           }
           for (let j = 0; j < d.inserted.length; j++) {
             const source = object(object(d.inserted[j]).source);
             if (source.kind === 'user' && typeof source.rpcId === 'string' && source.rpcId.toLowerCase() === rpcId) {
+              delete c.turn;
               c.pending = { target: String(d.target), index: start + j }; update('queued');
             }
           }

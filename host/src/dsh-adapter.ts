@@ -1,5 +1,5 @@
 import { PhoneProjection, sessionModel, mutationAnswer } from './phone-projection.ts';
-import { derivePromptOutcomes } from './prompt-outcomes.ts';
+import { derivePromptOutcomes, provenTerminal } from './prompt-outcomes.ts';
 import type { PromptJournal, PromptLookup, OutcomeCheckpoint } from './prompt-outcomes.ts';
 import { createHash } from 'node:crypto';
 import { attachmentRefs, questionsOf, queueOf, record, validateAnswer, safeFileMime, UPLOAD_LIMIT, IMAGE_MIMES } from './phone.ts';
@@ -582,15 +582,18 @@ export class DshAdapter implements HostAdapter {
       const { workspaceId, view, revision } = await this.pointScope(sessionId, active);
       if (workspaceId !== expectedWorkspaceId || !this.options.promptJournal) throw new HostError('not_found');
       // Proven terminal checkpoints need no journal open/decoder allocation.
-      if (lookups.every(item => item.checkpoint?.outcome.status === 'completed' || item.checkpoint?.outcome.status === 'failed')) return lookups.map(item => structuredClone(item.checkpoint!));
+      if (lookups.every(item => item.checkpoint && provenTerminal(item.checkpoint))) return lookups.map(item => structuredClone(item.checkpoint!));
       const reader = await this.options.promptJournal.open(sessionId, active);
-      try {
-        const results = await derivePromptOutcomes(reader, lookups, active);
-        active.throwIfAborted(); this.checkCurrent(view, sessionId); this.checkLifecycle(sessionId, revision);
-        const fresh = await this.pointScope(sessionId, active);
-        if (fresh.workspaceId !== expectedWorkspaceId) throw new HostError('not_found');
-        return results;
-      } finally { await reader.close(); }
+      let results: OutcomeCheckpoint[];
+      try { results = await derivePromptOutcomes(reader, lookups, active); }
+      finally { await reader.close(); }
+      // close() is asynchronous and not cancellable upstream. No result may cross
+      // that boundary before checking the current session mapping and lifecycle.
+      active.throwIfAborted(); this.checkCurrent(view, sessionId); this.checkLifecycle(sessionId, revision);
+      const fresh = await this.pointScope(sessionId, active);
+      active.throwIfAborted(); this.checkCurrent(view, sessionId); this.checkLifecycle(sessionId, revision);
+      if (fresh.workspaceId !== expectedWorkspaceId) throw new HostError('not_found');
+      return results;
     } finally { this.outcomeReads--; this.releaseCapacity(this.outcomeCapacity); }
   }
   dispose(): void {

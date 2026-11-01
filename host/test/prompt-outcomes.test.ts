@@ -20,7 +20,7 @@ test('queued admission comes from durable inbox, not an accepted receipt or idle
   assert.equal((await derivePromptOutcomes(reader([]), [{ requestId: id }], signal()))[0]!.outcome.status, 'unknown');
 });
 
-test('running begins at inbox claim before user message and queued steer shares the turn', async () => {
+test('durable user message proves consuming turn and queued steer shares the turn', async () => {
   const steer = '00000000-0000-4000-8000-000000000002';
   const events = [event('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [message()] }, 0), event('turn/start', { turn: 7 }, 1), event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [] }, 2), event('user/message', message(), 3), event('agent/inbox/spliced', { target: 'next-step', start: 0, inserted: [message(steer)] }, 4), event('agent/inbox/spliced', { target: 'next-step', start: 0, removedCount: 1, inserted: [] }, 5), event('user/message', message(steer), 6)];
   const running = await derivePromptOutcomes(reader(events), [{ requestId: id }, { requestId: steer }], signal());
@@ -97,6 +97,33 @@ test('inbox reorder/removal and cancellation cannot attach a queued phone prompt
   const events = [event('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [message('desktop'), message()] }, 0), event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' }, 1), event('turn/start', { turn: 5 }, 2), event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' }, 3), event('turn/end', { turn: 5, reason: { kind: 'completed' } }, 4)];
   const [checkpoint] = await derivePromptOutcomes(reader(events), [{ requestId: id }], signal());
   assert.equal(checkpoint!.outcome.status, 'unknown'); assert.equal(checkpoint!.outcome.turnId, undefined);
+});
+
+test('R07 replacement and cross-inbox reinsertion stay queued through completed or failed unrelated turns', async () => {
+  for (const target of ['next-turn', 'next-step']) for (const reason of [{ kind: 'completed' }, { kind: 'error', error: { message: 'unrelated' } }]) {
+    const events = [event('turn/start', { turn: 1 }, 0), event('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [message('desktop'), message()] }, 1),
+      event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 2, inserted: target === 'next-turn' ? [message(), message('desktop')] : [] }, 2)];
+    if (target === 'next-step') events.push(event('agent/inbox/spliced', { target, start: 0, inserted: [message()] }, events.length));
+    const [pending] = await derivePromptOutcomes(reader(events), [{ requestId: id }], signal());
+    assert.equal(pending!.outcome.status, 'queued'); assert.equal(pending!.outcome.turnId, undefined);
+    events.push(event('turn/end', { turn: 1, reason }, events.length));
+    const [result] = await derivePromptOutcomes(reader(events), [{ requestId: id, checkpoint: JSON.parse(JSON.stringify(pending)) }], signal());
+    assert.equal(result!.outcome.status, 'queued'); assert.equal(result!.outcome.turnId, undefined); assert.equal(result!.pending?.target, target);
+  }
+});
+
+test('R07 removal without durable consumption is unknown, even across checkpoint restart', async () => {
+  const events = [event('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [message()] }, 0), event('turn/start', { turn: 7 }, 1), event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [] }, 2)];
+  const [checkpoint] = await derivePromptOutcomes(reader(events), [{ requestId: id }], signal());
+  assert.equal(checkpoint!.outcome.status, 'unknown'); assert.equal(checkpoint!.outcome.turnId, undefined);
+  events.push(event('turn/end', { turn: 7, reason: { kind: 'completed' } }, 3));
+  assert.equal((await derivePromptOutcomes(reader(events), [{ requestId: id, checkpoint: checkpoint! }], signal()))[0]!.outcome.status, 'unknown');
+});
+
+test('R07 legacy terminal checkpoint without consumption proof is rederived instead of memoized', async () => {
+  const events = [event('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [message()] }, 0)];
+  const checkpoint = { nextSeq: 1, caughtUp: true, turn: 1, pending: { target: 'next-turn', index: 0 }, approvals: [], questions: [], outcome: { requestId: id, status: 'completed' as const, turnId: '1', updatedAt: '1970-01-01T00:00:01.000Z' } };
+  assert.equal((await derivePromptOutcomes(reader(events), [{ requestId: id, checkpoint }], signal()))[0]!.outcome.status, 'queued');
 });
 
 test('journal gaps, duplicate/reordered records, oversized events and canceled reads fail closed', async () => {
