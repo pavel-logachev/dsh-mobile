@@ -27,6 +27,9 @@ export interface HostSnapshot {
 export interface FileUploadReservation { release(): void }
 export interface HostAdapter {
   readonly upstreamVersion: string;
+  promptOutcomesAvailable?(): boolean;
+  promptOutcomes?(sessionId: string, lookups: readonly import('./prompt-outcomes.ts').PromptLookup[], signal: AbortSignal, expectedWorkspaceId: string): Promise<import('./prompt-outcomes.ts').OutcomeCheckpoint[]>;
+  onPromptOutcomeChange?(sessionId: string, listener: () => void): () => void;
   listPresets(signal: AbortSignal): Promise<Preset[]>;
   listSessions(signal: AbortSignal): Promise<HostSession[]>;
   /** Header-only scope resolution for hiding failed point reads; never returns transcript data. */

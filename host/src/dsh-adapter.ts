@@ -1,4 +1,6 @@
 import { PhoneProjection, sessionModel, mutationAnswer } from './phone-projection.ts';
+import { derivePromptOutcomes } from './prompt-outcomes.ts';
+import type { PromptJournal, PromptLookup, OutcomeCheckpoint } from './prompt-outcomes.ts';
 import { createHash } from 'node:crypto';
 import { attachmentRefs, questionsOf, queueOf, record, validateAnswer, safeFileMime, UPLOAD_LIMIT, IMAGE_MIMES } from './phone.ts';
 import type { PendingQuestion, SessionMutation, ModelCatalog, ModelSelection, PromptOptions, UploadedAttachment, AttachmentRef, ImageMime } from './phone.ts';
@@ -102,6 +104,7 @@ export interface DshAdapterOptions {
    * Used only to decide scope when a point opening fails before its first frame.
    */
   sessionHeader?: (sessionId: string, signal: AbortSignal) => Promise<unknown>;
+  promptJournal?: PromptJournal;
   /** Synchronous live-only descendant reduction; no persisted catalog traversal. */
   runningSubagentCounts?: () => ReadonlyMap<string, number>;
   pollIntervalMs?: number;
@@ -564,6 +567,31 @@ export class DshAdapter implements HostAdapter {
   constructor(options: DshAdapterOptions, source: WorkspaceSource) {
     this.options = options; this.source = source; this.upstreamVersion = options.dshVersion;
     this.disposeHistory = options.events?.subscribeDisposed?.(id => { this.lifecycles.delete(id); this.evictHistory(id); const flight = this.historyFlights.get(id); if (flight) this.detachHistory(id, flight); const opening = this.openingFlights.get(id); if (opening) this.detachOpening(id, opening); });
+  }
+  promptOutcomesAvailable(): boolean { return !!this.options.promptJournal; }
+  onPromptOutcomeChange(sessionId: string, listener: () => void): () => void {
+    return this.options.events?.subscribe(sessionId, observation => { if (observation.type === 'event') listener(); }) ?? (() => {});
+  }
+  private outcomeReads = 0;
+  private readonly outcomeCapacity = new Set<() => void>();
+  async promptOutcomes(sessionId: string, lookups: readonly PromptLookup[], signal: AbortSignal, expectedWorkspaceId: string): Promise<OutcomeCheckpoint[]> {
+    const active = this.signal(signal);
+    while (this.outcomeReads >= 4) await this.waitCapacity(this.outcomeCapacity, active);
+    active.throwIfAborted(); this.outcomeReads++;
+    try {
+      const { workspaceId, view, revision } = await this.pointScope(sessionId, active);
+      if (workspaceId !== expectedWorkspaceId || !this.options.promptJournal) throw new HostError('not_found');
+      // Proven terminal checkpoints need no journal open/decoder allocation.
+      if (lookups.every(item => item.checkpoint?.outcome.status === 'completed' || item.checkpoint?.outcome.status === 'failed')) return lookups.map(item => structuredClone(item.checkpoint!));
+      const reader = await this.options.promptJournal.open(sessionId, active);
+      try {
+        const results = await derivePromptOutcomes(reader, lookups, active);
+        active.throwIfAborted(); this.checkCurrent(view, sessionId); this.checkLifecycle(sessionId, revision);
+        const fresh = await this.pointScope(sessionId, active);
+        if (fresh.workspaceId !== expectedWorkspaceId) throw new HostError('not_found');
+        return results;
+      } finally { await reader.close(); }
+    } finally { this.outcomeReads--; this.releaseCapacity(this.outcomeCapacity); }
   }
   dispose(): void {
     this.lifetime.abort(); this.disposeHistory?.();

@@ -4,6 +4,7 @@ import { dirname, isAbsolute } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { HostError } from './errors.ts';
 import type { CommandReceipt, DeviceGrants, RelayGrant, RelayAccess } from './types.ts';
+import type { OutcomeCheckpoint } from './prompt-outcomes.ts';
 
 export interface AuthorizedDevice { deviceId: string; deviceName: string; grants: DeviceGrants; createdAt: number }
 export interface DeviceSummary extends AuthorizedDevice { revokedAt: number | null }
@@ -80,6 +81,11 @@ export class HostState {
         hold INTEGER NOT NULL CHECK(hold IN (0,1)), hold_reason TEXT,
         admitted_count INTEGER NOT NULL CHECK(admitted_count >= 0), completed_count INTEGER NOT NULL CHECK(completed_count >= 0),
         newest_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS prompt_outcome_checkpoints (
+        device_id TEXT NOT NULL, request_id TEXT NOT NULL, upstream_id TEXT NOT NULL,
+        checkpoint TEXT NOT NULL, PRIMARY KEY(device_id,request_id),
+        FOREIGN KEY(device_id,request_id) REFERENCES commands(device_id,request_id)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS mobile_created_sessions (id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS runtime_lock (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, pid INTEGER NOT NULL) STRICT;
@@ -454,6 +460,24 @@ export class HostState {
     });
     if (admission.fresh) this.syncLedgerWitness();
     return admission;
+  }
+  /** Exact device/session/operation receipt lookup, not the bounded snapshot-id window. */
+  promptReceipt(deviceId: string, sessionId: string, requestId: string): StoredCommand | undefined {
+    const row = this.db.prepare("SELECT * FROM commands WHERE device_id=? AND request_id=? AND session_id=? AND operation='prompt'").get(deviceId, requestId.toLowerCase(), sessionId);
+    return row ? this.command(row) : undefined;
+  }
+  outcomeCheckpoint(deviceId: string, requestId: string, upstreamId: string): OutcomeCheckpoint | undefined {
+    const row = this.db.prepare('SELECT checkpoint FROM prompt_outcome_checkpoints WHERE device_id=? AND request_id=? AND upstream_id=?').get(deviceId, requestId, upstreamId);
+    return row ? JSON.parse(String(row.checkpoint)) as OutcomeCheckpoint : undefined;
+  }
+  saveOutcomeCheckpoint(deviceId: string, requestId: string, upstreamId: string, value: OutcomeCheckpoint): void {
+    const json = JSON.stringify(value);
+    if (Buffer.byteLength(json) > 32 * 1024) throw new HostError('unavailable');
+    // Per-command cursor only advances, including overlapping reads. Receipts are
+    // durable and not TTL-pruned; checkpoints share that lifetime (metadata only).
+    this.db.prepare(`INSERT INTO prompt_outcome_checkpoints VALUES (?,?,?,?)
+      ON CONFLICT(device_id,request_id) DO UPDATE SET upstream_id=excluded.upstream_id,checkpoint=excluded.checkpoint
+      WHERE json_extract(excluded.checkpoint,'$.nextSeq')>=json_extract(prompt_outcome_checkpoints.checkpoint,'$.nextSeq')`).run(deviceId, requestId, upstreamId, json);
   }
   /** Bounded recent prompt identities; no text or foreign-device IDs are read. */
   promptCommandIds(deviceId: string): string[] {
