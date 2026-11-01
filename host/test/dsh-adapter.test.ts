@@ -16,7 +16,7 @@ import { createWorkspaceSource } from '../src/workspace-source.ts';
 import { HostState } from '../src/state.ts';
 import { NotificationFeed } from '../src/notifications.ts';
 
-async function harness(t: { after: (fn: () => Promise<void>) => void }, pollIntervalMs = 10000) {
+async function harness(t: { after: (fn: () => Promise<void>) => void }, pollIntervalMs = 10000, throttleMs = 5) {
   const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-adapter-')));
   const alpha = join(dir, 'alpha');
   await mkdir(alpha);
@@ -48,7 +48,7 @@ async function harness(t: { after: (fn: () => Promise<void>) => void }, pollInte
     agentPresets: { async remoteExportList() { return { presets }; } },
     workspaces: [{ id: 'alpha', name: 'Alpha', path: alpha }],
     events: { subscribeNotifications() { return () => {}; }, subscribe(_id, listener) { listeners.add(listener); return () => { listeners.delete(listener); }; } },
-    pollIntervalMs, throttleMs: 5,
+    pollIntervalMs, throttleMs,
   });
   const cleanupResources: (() => Promise<unknown>)[] = [];
   t.after(async () => { for (const cleanup of cleanupResources.toReversed()) await cleanup(); adapter.dispose(); await rm(dir, { recursive: true, force: true }); });
@@ -475,6 +475,147 @@ test('create adopts a stable UUID-derived identity at the configured root and pr
   await h.adapter.prompt('session-fixture', 'Hello', requestId, signal, 'alpha');
   assert.deepEqual(h.calls().created, { cwd: h.alpha, agentPreset: 'working', sessionId: 'session-7b15f469-52f6-4f44-a0a1-c2b8575e3f90' });
   assert.deepEqual(h.calls().prompted, { sessionId: 'session-fixture', requestId, mode: 'queue', content: [{ type: 'text', text: 'Hello' }] });
+});
+
+test('watch publishes the first text immediately, then coalesces subsequent text at the original throttle', async t => {
+  const h = await harness(t, 10000, 100);
+  const abort = new AbortController();
+  const iterator = h.adapter.watch('session-fixture', abort.signal)[Symbol.asyncIterator]();
+  h.closeBeforeCleanup(async () => { abort.abort(); await iterator.return!(); });
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1700000100000 });
+  await iterator.next();
+  let ready = false;
+  const first = iterator.next().then(item => { ready = true; return item.value; });
+  h.emit(streamFrames[0] as DshObservation);
+  h.emit(streamFrames[1] as DshObservation);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ready, true, 'first text must arrive without advancing the 100ms clock');
+  assert.equal((await first).messages.at(-1)?.text, 'Hello ');
+
+  ready = false;
+  const next = iterator.next().then(item => { ready = true; return item.value; });
+  h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'attempt-fixture', revision: 3, index: 1, chunk: { type: 'text-delta', index: 0, text: 'world' } } });
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(99);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ready, false, 'subsequent text still waits for the throttle');
+  h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'attempt-fixture', revision: 4, index: 2, chunk: { type: 'text-delta', index: 0, text: '.' } } });
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(1);
+  assert.equal((await next).messages.at(-1)?.text, 'Hello world.', 'one replacement includes both subsequent deltas');
+});
+
+test('watch waits through empty and non-text chunks but gives each new attempt a text leading edge', async t => {
+  const h = await harness(t, 10000, 100), abort = new AbortController();
+  const iterator = h.adapter.watch('session-fixture', abort.signal)[Symbol.asyncIterator]();
+  h.closeBeforeCleanup(async () => { abort.abort(); await iterator.return!(); });
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1700000100000 });
+  await iterator.next();
+  let ready = false;
+  const first = iterator.next().then(item => { ready = true; return item.value; });
+  h.emit(streamFrames[0] as DshObservation);
+  h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'attempt-fixture', revision: 2, index: 0, chunk: { type: 'text-delta', index: 0, text: '' } } });
+  h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'attempt-fixture', revision: 3, index: 1, chunk: { type: 'reasoning-delta', index: 1, text: 'PRIVATE' } } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ready, false, 'start, empty text and reasoning do not bypass the throttle');
+  t.mock.timers.tick(100);
+  assert.equal((await first).messages.some(m => m.provisional), false);
+  const text = iterator.next();
+  h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'attempt-fixture', revision: 4, index: 2, time: 1700000000010, chunk: { type: 'block-end', index: 0, block: { type: 'text', text: '\uFEFFЯ🌍\r\n\r\n' } } } });
+  assert.equal((await text).value.messages.at(-1)?.text, '\uFEFFЯ🌍\r\n\r\n', 'block-end may supply the first visible text');
+  const secondAttempt = iterator.next();
+  h.emit({ type: 'assistant-stream', frame: { type: 'start', attemptId: 'next-attempt', revision: 1, turn: 2, step: 2 } });
+  h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'next-attempt', revision: 2, index: 0, chunk: { type: 'text-delta', index: 0, text: 'Next' } } });
+  assert.equal((await secondAttempt).value.messages.at(-1)?.id, 'provisional:next-attempt', 'a new attempt need not wait for the previous attempt throttle');
+});
+
+test('text already included in the opening snapshot does not acquire another leading edge', async t => {
+  const h = await harness(t, 10000, 100), abort = new AbortController();
+  Object.assign(h.frame.assistantStream, { revision: 2, activeAttempt: { attemptId: 'active', turn: 2, step: 1, nextIndex: 1, stream: [{ type: 'text-chunks', index: 0, texts: ['Opening'] }] } });
+  const iterator = h.adapter.watch('session-fixture', abort.signal)[Symbol.asyncIterator]();
+  h.closeBeforeCleanup(async () => { abort.abort(); await iterator.return!(); });
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1700000100000 });
+  assert.equal((await iterator.next()).value.messages.at(-1)?.text, 'Opening');
+  let ready = false;
+  const next = iterator.next().then(item => { ready = true; return item.value; });
+  h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'active', revision: 3, index: 1, chunk: { type: 'text-delta', index: 0, text: ' tail' } } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ready, false);
+  t.mock.timers.tick(100);
+  assert.equal((await next).messages.at(-1)?.text, 'Opening tail');
+});
+
+test('text queued during cold opening is included once and its next delta stays throttled', async t => {
+  const h = await harness(t, 10000, 100), abort = new AbortController();
+  const follow = h.controller.follow;
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  h.controller.follow = async function* (request, signal) { enter(); await gate; yield* follow(request, signal); };
+  const iterator = h.adapter.watch('session-fixture', abort.signal)[Symbol.asyncIterator]();
+  h.closeBeforeCleanup(async () => { release(); abort.abort(); await iterator.return!(); });
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1700000100000 });
+  const opening = iterator.next();
+  await entered;
+  h.emit(streamFrames[0] as DshObservation); h.emit(streamFrames[1] as DshObservation);
+  release();
+  assert.equal((await opening).value.messages.at(-1)?.text, 'Hello ');
+  let ready = false;
+  const next = iterator.next().then(item => { ready = true; return item.value; });
+  h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'attempt-fixture', revision: 3, index: 1, chunk: { type: 'text-delta', index: 0, text: 'tail' } } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ready, false, 'queued opening text already consumed the leading edge');
+  t.mock.timers.tick(100);
+  assert.equal((await next).messages.at(-1)?.text, 'Hello tail');
+});
+
+for (const boundary of ['bytes', 'blocks'] as const) test(`leading-edge text respects the exact provisional ${boundary} bound and drops overflow`, async t => {
+  const h = await harness(t, 10000, 100), abort = new AbortController();
+  const iterator = h.adapter.watch('session-fixture', abort.signal)[Symbol.asyncIterator]();
+  h.closeBeforeCleanup(async () => { abort.abort(); await iterator.return!(); });
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1700000100000 });
+  await iterator.next();
+  const pending = iterator.next();
+  h.emit(streamFrames[0] as DshObservation);
+  // Both cases are exactly at the declared bound. Astral UTF-8 text checks bytes,
+  // not JS code units; reverse block order checks sorted assembly at the edge.
+  const count = boundary === 'bytes' ? 1 : 1024;
+  for (let index = 0; index < count; index++) h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'attempt-fixture', revision: index + 2, index, chunk: { type: 'text-delta', index: boundary === 'bytes' ? 0 : 1023 - index, text: boundary === 'bytes' ? '🌍'.repeat(524288) : index === 1023 ? 'A' : 'x' } } });
+  const bounded = (await pending).value.messages.at(-1)!;
+  assert.equal(bounded.provisional, true);
+  if (boundary === 'bytes') { assert.equal(Buffer.byteLength(bounded.text), 2097152); assert.equal(bounded.text.isWellFormed(), true); }
+  else assert.equal(bounded.text, 'A' + 'x'.repeat(1023));
+  const overflow = iterator.next();
+  h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'attempt-fixture', revision: count + 2, index: count, chunk: { type: 'text-delta', index: boundary === 'bytes' ? 0 : 1024, text: 'x' } } });
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(100);
+  const invalid = await overflow;
+  assert.equal(invalid.value.activity, 'unknown');
+  assert.equal(invalid.value.messages.some(m => m.provisional), false);
+  assert.match(invalid.value.notice!, /observation was interrupted/);
+});
+
+for (const ending of ['committed', 'revision-gap', 'overflow'] as const) test(`a first-text burst ending in ${ending} publishes only the final authoritative state`, async t => {
+  const h = await harness(t, 10000, 100), abort = new AbortController();
+  const iterator = h.adapter.watch('session-fixture', abort.signal)[Symbol.asyncIterator]();
+  h.closeBeforeCleanup(async () => { abort.abort(); await iterator.return!(); });
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1700000100000 });
+  await iterator.next();
+  let ready = false;
+  const next = iterator.next().then(item => { ready = true; return item.value; });
+  for (const frame of streamFrames) h.emit(frame as DshObservation);
+  if (ending === 'committed') {
+    h.emit(committed);
+    h.emit({ type: 'assistant-stream', frame: { type: 'end', attemptId: 'attempt-fixture', revision: 6, index: 4, outcome: { kind: 'committed', seq: 8 } } });
+  } else h.emit({ type: 'assistant-stream', frame: { type: 'chunk', attemptId: 'attempt-fixture', revision: ending === 'revision-gap' ? 7 : 6, index: 4, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(2097153) } } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ready, false, 'no stale first-text signal may bypass the throttle after settlement or invalidation');
+  t.mock.timers.tick(100);
+  const result = await next;
+  assert.equal(result.messages.some(m => m.provisional), false);
+  if (ending === 'committed') { assert.equal(result.cursor, 8); assert.equal(result.messages.at(-1)?.id, 'assistant-3'); assert.notEqual(result.activity, 'unknown'); }
+  else { assert.equal(result.activity, 'unknown'); assert.match(result.notice!, /observation was interrupted/); }
+  assert.deepEqual(h.cleanup(), { closed: 1, resumed: 0 }, 'no early cold refresh');
 });
 
 test('watch replaces provisional text with durable text and releases cold-read subscriptions on abort', async (t) => {

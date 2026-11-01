@@ -334,6 +334,10 @@ class Transcript {
   markGap(): void { this.gap = true; this.attempt = undefined; }
   get needsResync(): boolean { return this.gap; }
   get needsHistory(): boolean { return this.historyCut && !this.unsupported && !this.gap; }
+  /** Only bounded text that snapshot() can expose may bypass the publish throttle. */
+  get provisionalTextAttemptId(): string | undefined {
+    return !this.unsupported && !this.retentionCut && !this.gap && this.attempt?.bytes ? this.attempt.id : undefined;
+  }
   accept(observation: DshObservation): void {
     if (observation.type === 'status') {
       this.running = observation.running;
@@ -954,6 +958,9 @@ export class DshAdapter implements HostAdapter {
     let lastOpened = Date.now();
     let nextPoll = lastOpened + pollMs;
     let lastValue = '';
+    // Keep the published attempt across cold polls and empty replacements so an
+    // already visible attempt cannot repeatedly acquire a leading edge.
+    let lastTextAttemptId: string | undefined;
     try {
       const initialView = await this.open(sessionId, active);
       this.checkCurrent(initialView.view, sessionId);
@@ -964,6 +971,7 @@ export class DshAdapter implements HostAdapter {
       lastOpened = Date.now(); nextPoll = lastOpened + pollMs;
       const initial = this.phoneSnapshot(transcript);
       lastValue = JSON.stringify(initial);
+      lastTextAttemptId = transcript.provisionalTextAttemptId;
       lastPublished = Date.now();
       yield initial;
       while (!active.aborted) {
@@ -981,12 +989,15 @@ export class DshAdapter implements HostAdapter {
           lastOpened = Date.now(); nextPoll = lastOpened + pollMs;
           changed = true;
         }
-        if (changed && Date.now() - lastPublished >= throttleMs) {
+        const textAttemptId = transcript.provisionalTextAttemptId;
+        const firstText = textAttemptId !== undefined && textAttemptId !== lastTextAttemptId;
+        if (changed && (firstText || Date.now() - lastPublished >= throttleMs)) {
           const snapshot = this.phoneSnapshot(transcript);
           const serialized = JSON.stringify(snapshot);
           changed = false;
           if (serialized !== lastValue) {
             lastValue = serialized;
+            if (textAttemptId !== undefined) lastTextAttemptId = textAttemptId;
             lastPublished = Date.now();
             yield snapshot;
             continue;
