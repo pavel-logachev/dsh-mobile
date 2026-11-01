@@ -10,13 +10,23 @@ English | [Русский](README.ru.md)
 
 **Your [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) agent runs on your computer. From your Android phone you assign tasks with photos and files, read replies in real time, answer the agent's questions and get an “Answer ready” notification.**
 
-[Download APK 0.8.2](https://github.com/pavel-logachev/dsh-mobile/releases/tag/v0.8.2) · [Installation](#installation) · [Architecture](#how-it-works) · [Security](#security)
+[Published releases](https://github.com/pavel-logachev/dsh-mobile/releases) · [0.9.0 candidate](<docs/RELEASE_0.9.0.md>) · [Installation](#installation) · [Architecture](#how-it-works) · [Security](#security)
 
 > An unofficial project by Pavel Logachev. Developed independently of DeepSeek.
 
 Android 8.0+ · QR code pairing · Wi‑Fi or Tailscale
 
 Models, tools and subscriptions stay on the computer. DSH Mobile has no cloud server.
+
+## What's new in 0.9.0
+
+Current source candidate: **app 0.9.0 / versionCode 17 and host 0.9.0**, with additive API `/v1` extensions. This is not a publication announcement: final artifact and physical acceptance results belong in the [release checklist](<docs/RELEASE_0.9.0.md#verification>).
+
+- Notifications now follow phone-started tasks: completion, failure and needs-answer through `GET /v1/sessions/{id}/prompt-outcomes` and capability `promptOutcomes`. No permanent idle connection notification or coverage banner. The old feed is retired: older apps report notifications unavailable on the new host, so upgrade both components together.
+- Turn errors are shown in chat. Recovery hold/witness and `recovery-status`, `recovery-hold`, `recovery-release --new-epoch` support operator reconciliation, not exactly-once execution.
+- At most 32 unsettled host dispatches; overflow is refused before admission. A ten-minute post-admission deadline settles as `uncertain`, without automatic replay.
+- Network return wakes reconnect; online status follows the first authorized index page. Chat opens stream-first without an initial full GET; the first nonempty text is published immediately, with subsequent updates still throttled. Real-phone speed numbers still require measurements.
+- DSH `0.2.1-rc.5` passed the full isolated canary: **25 checks**. This is not physical-phone or external-model acceptance. [Evidence matrix](<docs/DSH_CANARY.md#compatibility-evidence>).
 
 ## What you can do from your phone
 
@@ -28,10 +38,10 @@ Models, tools and subscriptions stay on the computer. DSH Mobile has no cloud se
 - **Answer the agent's questions.** Pick one or more options, write your own answer or skip the question. The option the agent recommends is marked but not preselected. Approvals of agent actions stay on the computer.
 - **Rename a chat and change its model.** Both actions are in the ⋯ menu. The new model applies from the next model request, possibly as early as the next step of the running turn; a request that is already in progress is not switched.
 - **Stop a run.** A separate Stop button asks for confirmation.
-- **Get notifications.** For “Answer ready” and “Agent needs your decision” you choose separately between “With sound” (a pop-up banner with sound), “Silent” and “Off”. Each mode has its own Android channel; the app settings link to the system channel settings. Your earlier system choice is kept on update: a disabled channel stays disabled, a silent one stays silent. Sound accompanies every new event, multiple alerts are grouped, and the persistent connection notification is silent. A notification about an agent question opens that question directly. The warning “Some events may have been missed” disappears by itself once the computer confirms full recovery with nothing missed. There are no notifications for the chat that is open on screen. You can turn notifications off for individual projects and chats.
+- **Get notifications for your tasks.** One local switch enables watches for phone-started tasks when the host publishes `promptOutcomes`. Completion, failure and needs-answer alerts open the corresponding chat; a final outcome replaces its waiting alert. Android channels control sound. Desktop-started tasks are not automatically watched. [Contract and limits](<docs/NOTIFICATIONS_0.9.md>).
 - **Come back to the conversation.** Message search, a draft for each chat and copying with a long press.
 
-Attachments, “Steer”, answering questions, renaming, changing the model, viewing and downloading files, as well as the new notification features require companion plugin 0.7.0 or later. The notification-delay and send-admission fixes in the current release require plugin 0.7.2. The app shows each new feature only if the connected plugin reports that it supports it.
+Features are available only when the host reports their capability. Use the 0.9.0/0.9.0 pair for the new notifications; the old notification feed is not a fallback. Attachments, queue/steer, question answers, rename, model choice and file downloads remain available.
 
 The theme follows the system one; you can also choose light or dark manually. The interface is in Russian and English: the language follows the system or is chosen in the app settings. Large font sizes are supported.
 
@@ -40,6 +50,8 @@ The theme follows the system one; you can also choose light or dark manually. Th
 The screenshots were taken in the real app with synthetic demo data. They contain no real chats or connected models.
 
 ## Screenshots
+
+Historical 0.8 screenshots; the notification screen does not describe the 0.9.0 design.
 
 ![DSH Mobile 0.8](docs/images/0.8/hero.png)
 
@@ -98,11 +110,11 @@ You can hand the detailed [setup guide](<docs/SETUP.md>) to your DSH agent. It c
 
 1. **Check the requirements.**
 
-   Computer: Windows, DeepSeek Harness `0.2.0-rc.2` or `0.2.1-alpha.1`, Node.js 24.x, OpenSSL 3. Phone: Android 8.0 or later. Node 24 is also required by the DSH process the plugin runs in — having one suitable version on PATH is not enough.
+   Computer: Windows, DeepSeek Harness `0.2.0-rc.2`, `0.2.1-alpha.1` or `0.2.1-rc.5`, Node.js 24.x, OpenSSL 3. The 0.9.0 target is rc.5 (25 canary checks); the first two are retained on historical full/registry canaries, while rc.4 is unsupported. [Evidence limits](<docs/DSH_CANARY.md#compatibility-evidence>). Phone: Android 8.0+. DSH itself must run on Node 24, not just a suitable executable on PATH.
 
 2. **Download and verify the release files.**
 
-   From [release 0.8.2](https://github.com/pavel-logachev/dsh-mobile/releases/tag/v0.8.2) you need the signed [dsh-mobile-0.8.2.apk](https://github.com/pavel-logachev/dsh-mobile/releases/download/v0.8.2/dsh-mobile-0.8.2.apk), the plugin archive [dsh-mobile-host-0.7.2.zip](https://github.com/pavel-logachev/dsh-mobile/releases/download/v0.8.2/dsh-mobile-host-0.7.2.zip) and their checksums: [dsh-mobile-0.8.2.apk.sha256](https://github.com/pavel-logachev/dsh-mobile/releases/download/v0.8.2/dsh-mobile-0.8.2.apk.sha256), [dsh-mobile-host-0.7.2.zip.sha256](https://github.com/pavel-logachev/dsh-mobile/releases/download/v0.8.2/dsh-mobile-host-0.7.2.zip.sha256). The archive contains companion plugin 0.7.2 for app 0.8.2. All files must come from the same release. `UNSIGNED-verification.apk` is a verification artifact, not a file to install.
+   Open [Releases](https://github.com/pavel-logachev/dsh-mobile/releases). For the selected published release, obtain its signed APK, host ZIP and both SHA-256 sidecars from the same release. Candidate 0.9.0 still requires [final acceptance](<docs/RELEASE_0.9.0.md#verification>); do not invent its asset URLs or substitute an older pair. `UNSIGNED-verification.apk` is verification evidence, not an installable download.
 
    Specify the absolute paths to the downloaded files and compare the hashes with the `.sha256` files. If they do not match, stop.
 
@@ -171,9 +183,9 @@ You can hand the detailed [setup guide](<docs/SETUP.md>) to your DSH agent. It c
 
 **To use it away from home,** install Tailscale on the computer and the phone, connect both to your Tailscale network and specify the computer's name when preparing the plugin. You do not need to open a port on your router. The alternative is [your own relay on a VPS](<docs/RELAY_DEPLOYMENT.md>).
 
-**Upgrading:** APK 0.8.2 is signed with the same key as all previous releases and installs over them without uninstalling the app. On October 24, 2026, installing 0.8.2 over 0.8.1 was verified on a OnePlus with Android 16: pairing was kept. Verification history: on October 23, 2026, installing 0.8.1 over 0.8.0 was verified on a OnePlus CPH2747 phone: app data and pairing were kept. Earlier, installing 0.8.0 over 0.7.1 was verified on the owner's phone: chats and pairing were kept; settings are kept on such an upgrade as well. The 0.6.1 → 0.7.0 and 0.7.0 → 0.7.1 upgrades were verified on the same phone, and installing 0.7.1 over the published 0.7.0 was also verified on an Android 11 emulator. The plugin is upgraded to 0.7.2 by the installer from the new archive with the `-Upgrade -Activate` switches: the installer replaces the plugin block in the DSH profile with a placeholder, waits until the previous plugin releases its port, and only then connects the new version, and DSH picks it up on the fly. Agents keep working, and the phone briefly loses its connection. If hot reload is not enabled in DSH and the previous plugin has not released the port, the installer stops without connecting the new version and leaves the placeholder in the profile. A separately approved DSH restart is then needed, but the restart alone does not complete the upgrade: once the previous plugin has stopped, connecting the new version still has to be finished. A restart ends the agents' running turns, so do it when the agents are not running anything. In the upgrade history, plugin 0.7.1 added a new table to its database (schema 3 → 4); it does not change existing data. The plugin upgrade 0.5.1 → 0.6.0 was verified on a test copy, with the configuration, the TLS key and the rest of the profile contents preserved. The upgrade and rollback procedure is described in the [guide](<docs/SETUP.md>).
+**Upgrading to 0.9.0:** upgrade app and host together after verifying signatures and hashes. An APK update must retain the signing certificate; do not uninstall to bypass a signature mismatch. Use the reviewed host installer with `-Upgrade -Activate`: it unmounts the old plugin, waits for listener closure and mounts the whole immutable build. A DSH restart needs separate approval because it ends running turns. Keep a private state backup and follow [upgrade/rollback instructions](<docs/SETUP.md#10-upgrade-rollback-revoke-and-uninstall>) and [release notes](<docs/RELEASE_0.9.0.md#upgrade-and-rollback>). Previous physical results do not establish the new candidate’s behavior.
 
-The current release pair is app 0.8.2 and plugin 0.7.2. Compatibility history (not a check of the current pair): app 0.8.1 shows new features only if the connected plugin reports them, so with plugin 0.7.0 it keeps the core features, but without the faster notification delivery and the empty-session fix; this combination was not tested separately. App 0.8.0 should work with plugin 0.7.1: the plugin keeps API v1 and the earlier contracts; this combination was not verified either. App 0.8.0 works with plugin 0.6.0 without the 0.8.0 features. App 0.7.0 was also verified on the phone with plugin 0.5.1: without the subagent indicator and with a slower first opening of a chat. App 0.6.1 is protocol-compatible with plugin 0.6.0.
+The current source pair is **0.9.0/0.9.0**. The historical published pair is app **0.8.2** and host **0.7.2** ([historical release](https://github.com/pavel-logachev/dsh-mobile/releases/tag/v0.8.2)); its checks below are not 0.9.0 acceptance.
 
 ## Security
 
@@ -181,7 +193,7 @@ The current release pair is app 0.8.2 and plugin 0.7.2. Compatibility history (n
 - **The invitation is a secret.** The QR code is single-use and valid for no more than 15 minutes. Do not publish it, send it to a chat or save it in shared logs. Pairing checks the computer's certificate, its validity period, the address and the pinned fingerprint.
 - **Provider keys are not sent to the phone.** Pairing data is protected by Android Keystore and excluded from backups. The plugin's private files on Windows are accessible only to the owner of the user account.
 - **Revoke a lost phone on the computer.** Signing out of the app locally deletes the pairing data from the phone but does not revoke access on the DSH side.
-- **Notifications contain no reply text.** The “Answer ready” notification shows only the project and chat names. A notification about an agent question shows the text of the first question on an unlocked phone and only the chat name on the lock screen. Chat content is hidden on the lock screen.
+- **Notifications do not contain the completed answer.** Failure alerts may include a short summary; lock-screen content is private. Chat names use a localized fallback without fetching a transcript. [Details](<docs/NOTIFICATIONS_0.9.md#durable-watch-and-notification-state>).
 - **The relay does not see chat contents.** It forwards encrypted traffic but sees IP addresses, timing and the amount of data transferred.
 
 Do not expose the DSH web port to the outside and do not disable TLS verification. Details are in the [security overview](<docs/SECURITY.md>).
@@ -200,9 +212,9 @@ JDK 21 is recommended; the Windows helper also supports JDK 17. You need Android
 
 A regular release build of the APK is unsigned and cannot be installed as is. Building, packaging the plugin and signing with your own key are described in the [build guide](<docs/BUILD.md>) and the [APK release guide](<docs/ANDROID_RELEASE.md>).
 
-## Release 0.8.2 checks
+## Historical release 0.8.2 checks
 
-Release: app 0.8.2 (versionCode 15) and companion plugin 0.7.2; details are in the [0.8.2 release notes](https://github.com/pavel-logachev/dsh-mobile/releases/tag/v0.8.2). Plugin 0.7.2 runs in the owner's DSH, and app 0.8.2 on his phone. The checks of the previous release are in the [0.8.0 release notes](https://github.com/pavel-logachev/dsh-mobile/releases/tag/v0.8.0).
+Historical release: app 0.8.2 (versionCode 15) and host 0.7.2; [release notes](https://github.com/pavel-logachev/dsh-mobile/releases/tag/v0.8.2). This table describes only that build, not the currently installed pair or 0.9.0.
 
 | Component | What was checked |
 |---|---|
@@ -211,20 +223,22 @@ Release: app 0.8.2 (versionCode 15) and companion plugin 0.7.2; details are in t
 | Plugin 0.7.2 | 282/282 with the Cordis module env; without it, 275 pass and 5 skipped (280 total). Independent re-review of the host code: GO after three blockers were fixed |
 | Installer | 28/28 synthetic scenarios; not a check of installation on a phone |
 | Physical phone | OnePlus, Android 16, APK 3dc0126: the sending status after 0.3–0.7 s; sends in a new and an existing chat and after more than 110 s idle; send → Home ×2 — one delivered prompt each time; the upgrade over 0.8.1 kept pairing |
-| Owner's observation, October 24, 2026, around 11:40 Moscow time | App 0.8.2 + live host 0.7.2: «Ну вроде бы всё приходит, и чат открывается нужный» (“Well, everything seems to arrive, and the right chat opens”). Everyday use, no instrumented latency measurements |
 | Not verified with instruments on a phone | Notification latency and tap routing with host 0.7.2; auto-retry and the “not sent” banner on a real network switch (the send button was disabled during reconnect); delivery under real Doze |
 | APK permissions | INTERNET, CAMERA, POST_NOTIFICATIONS, FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, ACCESS_NETWORK_STATE and the app's own signature-level receiver permission. No telemetry and no Google services |
 
 ## Limitations
 
-- **The computer and DSH must be on.** The phone does not run the agent on its own.
-- **Notifications depend on a background connection.** There is no push through Google (FCM). While notifications are on, a “DSH Mobile connected” entry is visible in the notification shade; Android may stop this connection. After the phone restarts or the app is force-stopped, open the app again.
-- **Battery saving on some manufacturers' phones may delay notifications.** Push through UnifiedPush is planned.
-- **Approvals of agent actions happen on the computer.** DSH does not give plugins access to them. You can answer the agent's questions from the phone if plugin 0.7.0 or later is installed on the computer.
-- **The notification-delay and send-admission fixes in 0.8.2 require plugin 0.7.2.** Older version combinations do not replace a check of the current pair.
-- **One pairing, one computer.** The list includes the first 100 registered projects. The full conversation history is not available without a connection to the computer.
-- **Updating DSH requires a compatibility check.** The plugin checks the version from its settings, not the version actually installed. Only the verified versions listed above are supported.
-- **A dropped connection does not mean the task was not sent.** The app checks its status with the computer. It resends on its own only if the network is known to have failed before the computer answered: up to three attempts with the same request ID. If sending fails, the draft is kept and the app shows a “not sent” banner with a Retry button; this path has not yet been tested on a phone with a real network switch. If delivery is still uncertain, check the result on the computer before sending the task again.
+- **The computer and DSH must stay on.** The phone does not run an agent. One pairing targets one computer; the project list considers the first 100 registered projects.
+- **This is intentionally a native subset, not desktop parity.** Plugin/skill management is not exposed. Action approvals stay on the desktop because there is no verified plugin API for them; they are distinct from answerable agent questions.
+- **Notifications are best effort, without FCM/UnifiedPush.** There is no idle service/permanent connection notification or coverage banner. A pending phone task still uses an FGS: its notification cannot be guaranteed invisible on all OEMs. Valid watches/outbox restore after process death and unlocked reboot subject to pairing, permission and OS guards. After force-stop, launch the app manually. Doze, battery saving, offline devices, 24-hour expiry or eviction from the 32-watch bound can prevent delivery. [Exact limits](<docs/NOTIFICATIONS_0.9.md>).
+- **Offline content is a bounded stale/read-only cache.** At most 8 snapshots, 3500 KiB of serialized snapshot UTF-8, 24-hour age, each snapshot at most 2 MiB; the index is bounded separately. Cache is not authorization, command reconciliation or a full archive. Fresh snapshots contain at most 100 messages/2 MiB; older-history recovery is bounded to 16 pages/16 MiB. Upstream JSONL currently reads the whole log before those limits apply.
+- **Updating DSH requires compatibility verification.** Setup may fill the version from `dsh --version`; the runtime plugin checks the configured declaration, not the installed version. Only the exact [matrix entries](<docs/DSH_CANARY.md#compatibility-evidence>) are supported.
+- **A dropped connection does not prove non-delivery.** Automatic retry requires transport proof that **request headers** were not sent: at most three attempts with the same requestId. Never automatically resend after admission; a lost response or receipt404 never proves non-execution. A proven not-sent failure keeps the draft and offers manual Retry; for `uncertain`, inspect DSH first.
+- **Recovery is not exactly-once.** A witness detects only provable local rollback. Missing/rolled-back DB and witness require a manual hold before reopening admission. Epoch is an operator decision record, not client-visible fencing: after release a lost requestId can be admitted as new. [Procedure](<docs/SETUP.md#restoring-the-command-ledger-from-a-backup>).
+
+### Does the name require a DeepSeek model or subscription?
+
+No. DSH Mobile is a companion to the DeepSeek Harness host, not a purchase of a particular DeepSeek model or plan. Models, providers and billing stay on the computer. This project establishes no cost/task-count comparison with other subscriptions.
 
 ## Documentation
 

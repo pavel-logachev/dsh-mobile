@@ -1,10 +1,10 @@
 # Security and reporting
 
-DSH Mobile is an independent development preview. This document describes the intended boundary and operating assumptions; it is not a security certification or a claim that all acceptance gates have passed. See [Architecture](ARCHITECTURE.md), [Protocol](PROTOCOL.md) and [the acceptance plan](PLAN.md).
+DSH Mobile is an independent companion; 0.9.0 remains subject to the [release verification gates](RELEASE_0.9.0.md#verification). This document describes the intended boundary and operating assumptions; it is not a security certification or a claim that all acceptance gates have passed. See [Architecture](ARCHITECTURE.md), [Protocol](PROTOCOL.md) and [the acceptance plan](PLAN.md).
 
 ## Trust assumptions
 
-- The adapter requires an explicit `dshVersion` declaration from an exact allowlist of inspected releases (`0.2.0-rc.2`, `0.2.1-alpha.1`, `0.2.1-rc.4`, `0.2.1-rc.5`); no semver range is accepted. Setup may read `dsh --version` to fill it, but the plugin itself does not detect the installation. A version declaration is not live compatibility evidence.
+- The adapter requires an explicit `dshVersion` declaration from an exact allowlist of inspected releases (`0.2.0-rc.2`, `0.2.1-alpha.1`, `0.2.1-rc.5`); no semver range is accepted. Setup may read `dsh --version` to fill it, but the plugin itself does not detect the installation. A version declaration is not live compatibility evidence.
 - The owner trusts the host computer, its DSH installation, configured model/providers and the granted device. Host compromise is outside the protection offered by a phone client.
 - Android Keystore protects stored credentials; it is not a guarantee against an unlocked, rooted or compromised device. A trusted user's screenshots, keyboard and screen sharing can disclose chat contents.
 - The companion exposes a narrow session API, not arbitrary RPC, a terminal or a filesystem browser. Read and execute grants are distinct. An operator can explicitly choose permissions for **all current and future registered DSH projects**, represented by `['*']` grants. This intentionally broad trust is not a least-privilege default; explicit-list scope remains available.
@@ -37,7 +37,7 @@ Local **forget/sign-out deletes the phone's credential only**. When the host is 
 
 A timeout is not proof that a prompt or cancellation failed. The original request ID and durable receipt are used for reconciliation; uncertain commands must not be silently replayed under a new ID. Cancellation is a request, not immediate proof of stopped execution. There is no exactly-once execution guarantee across an unverified upstream persistence boundary.
 
-Receipts are local evidence, not a global audit log. Restoring the host database from a backup taken before a command can omit its receipt even though DSH executed it. Host builds after plugin 0.7.2 keep a sidecar witness and enter a recovery hold when the witness proves the database is older; receipts and history remain readable, fresh commands are blocked, and an operator must reconcile them before releasing with a new epoch. Restoring both database and witness together, or losing the witness, defeats automatic detection and falls back to the manual hold procedure. A new epoch records the operator's decision; it does not prove that earlier commands never executed.
+Receipts are local evidence, not a global audit log. Restoring the host database from a backup taken before a command can omit its receipt even though DSH executed it. Host plugin 0.9.0 keeps a sidecar witness and enters a recovery hold when the witness proves the database is older; receipts and history remain readable, fresh commands are blocked, and an operator must reconcile them before releasing with a new epoch. Restoring both database and witness together, or losing the witness, defeats automatic detection and falls back to the manual hold procedure. A new epoch records the operator's decision; it does not prove that earlier commands never executed. There is no client-visible epoch fencing after release: a request whose receipt was lost can be admitted as new, even with the original requestId. Arm a manual hold before reopening command admission if rollback cannot be detected. See [the recovery procedure](SETUP.md#restoring-the-command-ledger-from-a-backup).
 
 ## Bounded history integrity
 

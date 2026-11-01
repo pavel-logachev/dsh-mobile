@@ -1,4 +1,6 @@
-# Phase 1 notification acceptance
+# Historical Phase 1 notification acceptance
+
+This records the retired feed implementation, not 0.9.0 acceptance. Current phone-task watches, permission/reboot semantics and limitations are in [NOTIFICATIONS_0.9.md](NOTIFICATIONS_0.9.md); final release results belong in [RELEASE_0.9.0.md](RELEASE_0.9.0.md#verification). All counts, permissions and no-boot statements below describe the historical runs.
 
 Branch: `feat/notifications`; baseline: `2c6ac63f29c7bbaa9ae881b10a1f90528df5014a`.
 
@@ -39,7 +41,7 @@ The optional Cordis module is the inspected installed 4.0.4 module, read-only. I
 
 ## Permission audit
 
-Both APK variants contain existing INTERNET/CAMERA and AndroidX own-signature dynamic receiver permission. The notification platform permissions are POST_NOTIFICATIONS, FOREGROUND_SERVICE and FOREGROUND_SERVICE_SPECIAL_USE. In 0.8.2, ACCESS_NETWORK_STATE is additionally approved for the default-network reconnect callback (normal install-time permission, no user prompt), bringing the complete permission surface to seven: INTERNET, CAMERA, POST_NOTIFICATIONS, FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, ACCESS_NETWORK_STATE and dev.dshmobile.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION. No RECEIVE_BOOT_COMPLETED, wake lock or battery-exemption request permission. Manifest declares a non-exported specialUse service and rationale; target/min SDK remain unchanged.
+Both APK variants contain existing INTERNET/CAMERA and AndroidX own-signature dynamic receiver permission. The notification platform permissions are POST_NOTIFICATIONS, FOREGROUND_SERVICE and FOREGROUND_SERVICE_SPECIAL_USE. In historical 0.8.2, ACCESS_NETWORK_STATE is additionally approved for the default-network reconnect callback (normal install-time permission, no user prompt), bringing the complete permission surface to seven: INTERNET, CAMERA, POST_NOTIFICATIONS, FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, ACCESS_NETWORK_STATE and dev.dshmobile.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION. No RECEIVE_BOOT_COMPLETED, wake lock or battery-exemption request permission. Manifest declares a non-exported specialUse service and rationale; target/min SDK remain unchanged.
 
 ## Self-review corrections
 

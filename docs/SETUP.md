@@ -37,10 +37,9 @@ Require **Node 24.x** and an exact DSH version in this explicit allowlist:
 
 | DSH | Cordis inspected | Evidence |
 | --- | --- | --- |
-| `0.2.0-rc.2` | `4.0.4` | declarations + compiled JS + isolated full/registry canaries |
-| `0.2.1-alpha.1` | `4.0.5-alpha.1` | declarations + compiled JS + isolated full/registry canaries |
-| `0.2.1-rc.4` | `~4.0.5` | declarations + compiled JS inspected; rc.5 installed-runtime acceptance |
-| `0.2.1-rc.5` | `~4.0.5` | declarations + compiled JS inspected; installed-runtime acceptance |
+| `0.2.0-rc.2` | `4.0.4` | declarations + compiled JS; historical isolated full/registry canaries (`f7c35df`) |
+| `0.2.1-alpha.1` | `4.0.5-alpha.1` | declarations + compiled JS; historical isolated full/registry canaries (`f7c35df`) |
+| `0.2.1-rc.5` | `~4.0.5` | declarations + compiled JS; repaired full isolated canary (`32eb825`), see [evidence matrix](DSH_CANARY.md#compatibility-evidence) |
 
 Do not accept an arbitrary semver range, “latest”, matching method names, or an unverified version string. The plugin requires an explicit `dshVersion` declaration. The installer checks the real `dsh --version`; standalone setup defaults to auto-detection and validates its output. If `dsh` is not on PATH, locate the owner's already-installed trusted launcher and pass `-DshCommand '<absolute launcher>'` to the installer. Do not download another DSH runtime or change a running installation just to make preflight succeed.
 
@@ -251,11 +250,11 @@ Repeat installation/activation/uninstall is idempotent. Immutable payload mismat
 
 ### Restoring the command ledger from a backup
 
-This procedure requires the host build with the ledger witness and `recovery-*` commands (host plugin 0.9.0); the earlier published 0.7.2 does not have them. The command ledger is `<statePath>` (normally `state/host.sqlite`) plus its sidecar witness `<statePath>.ledger.json`. If only the database is restored, the sidecar proves the rollback and the host opens with a recovery hold: new commands are refused, while receipts and history remain readable. If both files are restored together or the sidecar is lost, detection cannot work; use the manual hold below before accepting new commands.
+This procedure requires the host build with the ledger witness and `recovery-*` commands (host plugin 0.9.0); historical published host 0.7.2 does not have them. The command ledger is `<statePath>` (normally `state/host.sqlite`) plus its sidecar witness `<statePath>.ledger.json`. If the surviving sidecar proves that the restored database is older, the host opens with a recovery hold: new commands are refused, while receipts and history remain readable. If both files are restored together or the sidecar is lost, detection cannot work; use the manual hold below before accepting new commands.
 
 1. Stop DSH (or at least the companion listener) so SQLite is closed; do not restore a database while the host is writing it.
 2. Restore `host.sqlite` from the chosen backup. Leave `.ledger.json` in place if it survived; do not edit either file by hand.
-3. If the sidecar is missing or was restored with the database, arm the hold explicitly before or after starting the host:
+3. If the sidecar is missing or was restored with the database, arm the hold **while the companion listener is stopped, before reopening command admission**. Do not start DSH/the companion first:
    ```powershell
    node $cli recovery-hold --config $config --reason 'restored backup of host.sqlite'
    ```
@@ -269,7 +268,7 @@ This procedure requires the host build with the ledger witness and `recovery-*` 
    ```
 6. Reopen the phone app and reconnect. The app treats a held send as not sent and keeps the draft; it does not retry automatically.
 
-`recovery-status` and `recovery-hold` may be run while the host is running; the release is also read by the next admission. The epoch increment is an operator decision record, not proof that the commands lost with the backup never executed. A hold never changes an existing receipt's status and never deletes history.
+`recovery-status` and `recovery-hold` may be run while the host is running; the release is also read by the next admission. The epoch increment is an operator decision record, not proof that the commands lost with the backup never executed. A hold never changes an existing receipt's status and never deletes history. The wire request has no ledger epoch: **after release there is no epoch fencing**. A lost requestId can be admitted as new; reconcile before release and do not blindly resend it. Invalid/unreadable surviving witness data makes release fail closed; preserve it and investigate rather than deleting it to bypass the hold. There is no exactly-once guarantee.
 
 ## 11. Advanced: optional self-hosted relay
 

@@ -12,7 +12,7 @@ export const ERROR_DEFINITIONS = {
   recovery_hold: { status: 503, message: 'The host is in command-ledger recovery mode. Receipts remain readable; new commands are blocked until the operator reconciles them.', retryable: false },
   internal_error: { status: 500, message: 'The host could not complete this request.', retryable: false },
   invalid_config: { status: 500, message: 'Local host configuration is invalid.', retryable: false },
-  unsupported_dsh_version: { status: 500, message: 'Supported DSH versions: 0.2.0-rc.2, 0.2.1-alpha.1, 0.2.1-rc.4, 0.2.1-rc.5. Check dsh --version before declaring dshVersion.', retryable: false },
+  unsupported_dsh_version: { status: 500, message: 'Supported DSH versions: 0.2.0-rc.2, 0.2.1-alpha.1, 0.2.1-rc.5. Check dsh --version before declaring dshVersion.', retryable: false },
   openssl_required: { status: 500, message: 'OpenSSL 3 is required for X.509 generation. Install a trusted copy or supply --openssl <absolute executable>.', retryable: false },
   unsafe_private_path: { status: 500, message: 'Use an owner-only local directory outside Git, with no redirected ancestors. Existing weak ACLs are not repaired.', retryable: false },
   qr_too_large: { status: 400, message: 'Invitation does not fit a QR at error correction M. Use the private JSON output file; nothing is truncated.', retryable: false },
