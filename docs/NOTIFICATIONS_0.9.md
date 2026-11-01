@@ -53,6 +53,11 @@ One service-owned coordinator serializes **all** poll calls and outbox delivery:
   the existing bounded, jittered 0.5–5-second backoff. Without an active network,
   the loop suspends until a network callback restarts it (or watch expiry). A host
   unreachable over an otherwise present network remains an online-error case.
+- A session GET returning 403 or 404 removes only that session's watches, without
+  an alert, and polling continues for the other groups. Device-global failures
+  (for example revoked authentication or TLS failure) stop the owner regardless
+  of session order; a transient error cannot mask them. Storage/posting failures
+  are handled separately from per-session HTTP errors.
 - Cancellation closes and awaits retirement of the old transport before admitting
   the next generation. Watch expiry is a deadline even while offline or held.
 - Notification watches use **no SSE**. Foreground chat SSE remains unrelated to
@@ -65,7 +70,11 @@ One service-owned coordinator serializes **all** poll calls and outbox delivery:
 
 1. An eligible phone send persists `(sessionId, requestId, expiresAt)` **before HTTP
    admission**. Known rejection/proven unsent removes the watch; uncertain delivery
-   retains it. Desktop prompts do not register watches. Capability false/absent
+   retains it. A proven command outcome is persisted independently of optional
+   watch removal: a failed removal is logged, never changes rejection/unsent into
+   uncertain delivery and never blocks the next send. The remaining watch can
+   settle from `rejected` or expire; cleanup does not replay a command.
+   Desktop prompts do not register watches. Capability false/absent
    prevents registration; restore rechecks capability before delivering anything
    and clears watches/outbox when the feature is unsupported.
 2. Watch/outbox state is a separate encrypted atomic no-backup record, not the
@@ -79,13 +88,21 @@ One service-owned coordinator serializes **all** poll calls and outbox delivery:
    with summary. `waiting` queues «Нужен ответ» but **keeps watching**. A repeated
    waiting projection is silent; an observed transition out of waiting and back
    starts a new waiting episode. Changing `updatedAt` alone is not a new episode.
-4. Several requests with the same session/turn share dedupe state. Waiting episode
-   and final outcome have separate durable keys. All phases for a chat use one
+4. Several requests with the same session/turn share dedupe state. Request and
+   supplied turn identities are durable aliases, including in queued alerts and
+   delivered tombstones. Learning an optional turnId for an already alerted
+   request does not re-alert unchanged waiting; later omission does not lose the
+   learned identity. Waiting episode and final outcome have separate durable keys.
+   All phases for a chat use one
    stable device/chat notification tag, so final completion/failure **replaces**
    that chat's waiting item and may alert once in its own right. Tap opens the chat;
    lock-screen content is private, with RU-first titles and English resources.
    The endpoint has no chat title: these alerts use the localized unnamed-chat
-   fallback rather than fetching a transcript just for its title.
+   fallback rather than fetching a transcript just for its title. New alerts keep
+   raw title/summary metadata, not a localized body: language refresh rebuilds
+   title, body, BigText and public copy in the current app locale while preserving
+   host summary text. Already displayed pre-fix alerts lack this raw metadata;
+   their cached body is retained until replacement/dismissal.
 5. The outbox is persisted before platform notify. An attempt marker is persisted
    before crossing NotificationManager; acknowledged delivery then removes the
    outbox entry and writes its tombstone. A process crash after notify but before
@@ -116,11 +133,17 @@ One service-owned coordinator serializes **all** poll calls and outbox delivery:
   tags prevent duplicate visible items, not a mathematical exactly-once sound
   guarantee. User dismissal between notify and crash recovery is also outside
   exactly-once visual delivery. This is not exactly-once host command execution.
-- Active watches still require a foreground service using the existing `specialUse`
-  declaration. The channel requests MIN importance, no sound/vibration/badge and
-  neutral task copy. **An active FGS notification cannot be guaranteed invisible
-  on all OEMs**; Android may promote it or show its own service notice. Idle service
-  has been removed, not Android's foreground-service disclosure requirement.
+- **Release decision (R4):** an active phone task may keep a silent
+  `IMPORTANCE_MIN` foreground notification only while that task is in progress;
+  **idle → none**. The existing `specialUse` service is watch-bound, not a
+  permanent connection monitor. Copy remains short and neutral: «Ждём результат
+  задачи» / «Задача отправлена с этого телефона» (EN: “Waiting for task result” /
+  “Task sent from this phone”). The channel requests no sound/vibration/badge.
+  Last-watch settlement drains any pending result outbox and immediately stops
+  the owner/removes the foreground item; outbox-only crash recovery is transient,
+  not idle monitoring. **An active FGS notification cannot be guaranteed invisible
+  on all OEMs**; Android may promote it or show its own service notice. This
+  decision permits task-bound disclosure, not hiding Android's FGS requirement.
 - No delivery guarantee applies during force-stop, denied notification permission,
   expiry/cap eviction, phone/computer offline, or OS background-work restrictions.
   A durable outcome can be checked on reconnection while its watch remains valid.

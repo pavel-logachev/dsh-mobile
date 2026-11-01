@@ -229,6 +229,8 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             addQueryParameter("waitSeconds", waitSeconds.toString())
         }.build()
         val result = executeOnce(builder.url(url).build(), 128 * 1024, transport = outcomesClient)
+        // A missing watched session is terminal only for this group, not this device.
+        if (result.status == 404) { decodeWire<ErrorEnvelope>(result.text); throw MobileFailure("session_not_found") }
         return decodePromptOutcomes(result.checked(), ids)
     }
 

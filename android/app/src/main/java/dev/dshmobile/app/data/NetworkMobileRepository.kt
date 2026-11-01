@@ -144,6 +144,14 @@ internal class NetworkMobileRepository(
     private var syncing = false
     private var indexJob: Job? = null
     @Volatile private var indexRevision = 0L
+    // Point reads / admitted mutations are newer evidence than an already-started page chain.
+    private var sessionRevision = 0L
+    private fun mergeIndex(index: HostApi.SessionIndex, preserveCurrent: Boolean = index.truncated, preferCurrent: Boolean = false): HostApi.SessionIndex {
+        if (!preserveCurrent) return index
+        val authorized = state.value.sessions.filter { session -> state.value.workspaces.any { it.id == session.workspaceId } }
+        val items = (if (preferCurrent) authorized + index.items else index.items + authorized).distinctBy { it.id }
+        return index.copy(items = items.take(1000), truncated = index.truncated || items.size > 1000)
+    }
     private fun cancelIndex() { indexRevision++; indexJob?.cancel(); indexJob = null }
     private suspend fun saveIndex(workspaces: List<dev.dshmobile.app.model.Workspace>, index: HostApi.SessionIndex) {
         if (!index.truncated) history.retain(index.items.map { it.id }.toSet())
@@ -163,13 +171,15 @@ internal class NetworkMobileRepository(
     private fun loadRemainingIndex(network: HostApi, first: HostApi.SessionIndex) {
         if (first.nextCursor == null || first.pages >= 10) return
         val revision = indexRevision
+        val evidenceRevision = sessionRevision
         indexJob = scope.launch {
             try {
-                val complete = network.sessions(after = first)
+                val result = network.sessions(after = first)
                 action {
                     if (revision != indexRevision || !foreground || !desiredForeground || api !== network) return@action
                     checkHistoryEpoch()
-                    if (complete.items.any { item -> state.value.workspaces.none { it.id == item.workspaceId } }) throw MobileFailure("invalid_response")
+                    if (result.items.any { item -> state.value.workspaces.none { it.id == item.workspaceId } }) throw MobileFailure("invalid_response")
+                    val complete = mergeIndex(result, result.truncated || evidenceRevision != sessionRevision, preferCurrent = evidenceRevision != sessionRevision)
                     saveIndex(state.value.workspaces, complete)
                     if (!complete.truncated && stored.selectedSessionId?.let { id -> complete.items.none { it.id == id } } == true) {
                         stopObserver()
@@ -455,7 +465,11 @@ internal class NetworkMobileRepository(
             RefreshMetadata(negotiated, workspaces.await(), presets.await(), sessions)
         }
         checkHistoryEpoch()
-        val (caps, workspaces, presets, index) = metadata
+        val (caps, workspaces, presets, receivedIndex) = metadata
+        if (receivedIndex.items.any { session -> workspaces.none { it.id == session.workspaceId } }) throw MobileFailure("invalid_response")
+        val index = if (receivedIndex.truncated) mergeIndex(receivedIndex).let { merged ->
+            merged.copy(items = merged.items.filter { session -> workspaces.any { it.id == session.workspaceId } })
+        } else receivedIndex
         val sessions = index.items
         if (sessions.any { session -> workspaces.none { it.id == session.workspaceId } }) throw MobileFailure("invalid_response")
         // Absence in the first page is not revocation or permission to erase cached history.
@@ -468,7 +482,7 @@ internal class NetworkMobileRepository(
         if (foreground) StartupPerf.mark("online")
         StartupPerf.mark("list_fresh")
         saveIndex(workspaces, index)
-        loadRemainingIndex(network, index)
+        loadRemainingIndex(network, receivedIndex)
         var historyError: String? = null
         var retryHistory = false
         val target = requestedSessionId ?: selected
@@ -819,6 +833,13 @@ internal class NetworkMobileRepository(
                 refreshed
             }
         }
+    /** Optional watch storage must never rewrite a proven admission outcome. Failed removal
+     * is logged; the durable watch can still settle from rejected or its existing expiry. */
+    private suspend fun cleanupWatch(requestId: String) {
+        try { unwatchPrompt(requestId) }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (failure: Exception) { runCatching { NotificationPosting.logFailure(failure) } }
+    }
     private suspend fun dispatch(command: StoredCommand, drafts: Map<String, String> = stored.drafts) {
         // Capture mutation transport before persistence can suspend. ON_STOP retires only reads.
         // Only a fresh proof that no headers left permits bounded transport recovery.
@@ -850,7 +871,7 @@ internal class NetworkMobileRepository(
         if (command.kind == "send" && state.value.capabilities?.promptOutcomes == true)
             watchPrompt(requireNotNull(stored.host).deviceId, requireNotNull(command.sessionId), command.requestId)
         try { persist(stored.copy(pending = command, drafts = drafts, notSentSessions = stored.notSentSessions.filterNot { it == command.sessionId }.toSet())) }
-        catch (failure: Exception) { unwatchPrompt(command.requestId); throw failure }
+        catch (failure: Exception) { cleanupWatch(command.requestId); throw failure }
         mutableState.value = state.value.copy(pending = command.presentation(), draft = draftFor(stored.selectedSessionId), busy = true, error = null)
         try {
             val receipt = try { commandWithPreHeaderRecovery(mutation, command) } catch (missing: MobileFailure) {
@@ -880,7 +901,7 @@ internal class NetworkMobileRepository(
                 // the host provably did not dispatch it. Treat it as not sent, never uncertain.
                 persist(stored.copy(pending = null,
                     notSentSessions = if (command.kind == "send" && command.sessionId != null) stored.notSentSessions + command.sessionId else stored.notSentSessions))
-                unwatchPrompt(command.requestId)
+                cleanupWatch(command.requestId)
                 fail(failure.key, failure.retryable)
                 mutableState.value = state.value.copy(error = "recovery_hold", busy = false)
                 return
@@ -889,14 +910,14 @@ internal class NetworkMobileRepository(
                 // Only transport evidence BEFORE requestHeadersStart permits this classification.
                 // Missing receipts, timeouts after headers, and lost responses remain uncertain.
                 persist(stored.copy(pending = null, notSentSessions = if (command.kind == "send" && command.sessionId != null) stored.notSentSessions + command.sessionId else stored.notSentSessions))
-                unwatchPrompt(command.requestId)
+                cleanupWatch(command.requestId)
                 fail(failure.key, failure.retryable)
                 mutableState.value = state.value.copy(error = "offline_no_send", busy = false)
                 return
             }
             if (failure.key == "upload_missing") {
                 persist(stored.copy(pending = null))
-                unwatchPrompt(command.requestId)
+                cleanupWatch(command.requestId)
                 mutableState.value = state.value.copy(error = "attachment_unavailable", busy = false)
                 return
             }
@@ -934,13 +955,14 @@ internal class NetworkMobileRepository(
         receipt.checked(command.requestId)
         when (receipt.status) {
             "accepted" -> {
+                sessionRevision++
                 if (command.kind == "create") {
                     val created = receipt.result?.sessionId ?: throw MobileFailure("invalid_response")
                     persist(stored.copy(pending = null, selectedSessionId = created))
                     mutableAcceptedCreate.value = CreateAcceptance(command.requestId, created)
-                    val index = api().sessions()
+                    val index = mergeIndex(api().sessions())
                     val snapshot = api().snapshot(created)
-                    val sessions = if (index.items.any { it.id == created }) index.items else listOf(snapshot.session) + index.items.take(999)
+                    val sessions = listOf(snapshot.session) + index.items.filterNot { it.id == created }.take(999)
                     mutableState.value = MobileReducer.replaceSnapshot(state.value, snapshot, now()).copy(sessions = sessions,
                         sessionsTruncated = index.truncated, pending = null, draft = draftFor(created), error = null)
                 } else if (command.kind == "send") {
@@ -963,8 +985,8 @@ internal class NetworkMobileRepository(
             }
             "rejected" -> {
                 // Trustworthy rejection releases admission. Exact draft is retained for explicit edits.
-                unwatchPrompt(command.requestId)
                 persist(stored.copy(pending = null))
+                cleanupWatch(command.requestId)
                 mutableState.value = state.value.copy(pending = null, error = "command_rejected")
             }
             else -> {
@@ -984,6 +1006,7 @@ internal class NetworkMobileRepository(
     }
     private suspend fun reconcileSnapshot(snapshot: SessionSnapshot?) {
         if (snapshot == null) return
+        sessionRevision++
         cacheSnapshot(snapshot)
         val observedAt = now()
         val accepted = stored.acceptedPrompts.mapNotNull { local ->

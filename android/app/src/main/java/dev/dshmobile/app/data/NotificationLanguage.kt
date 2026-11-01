@@ -10,8 +10,15 @@ import kotlinx.coroutines.*
 
 private const val ALERT_KIND = "dev.dshmobile.alertKind"
 private const val ALERT_NAMES = "dev.dshmobile.alertNames"
-internal fun alertLanguageExtras(kind: String, names: String?) = Bundle().apply {
-    putString(ALERT_KIND, kind); putString(ALERT_NAMES, names)
+private const val ALERT_SUMMARY = "dev.dshmobile.alertSummary"
+private const val ALERT_RAW = "dev.dshmobile.alertRaw"
+internal fun alertLanguageExtras(kind: String, names: String?, summary: String? = null) = Bundle().apply {
+    putString(ALERT_KIND, kind); putString(ALERT_NAMES, names); putString(ALERT_SUMMARY, summary)
+    putBoolean(ALERT_RAW, true)
+}
+internal fun watchAlertBody(strings: Context, kind: String, name: String?, summary: String?): String {
+    val chat = name.orEmpty().ifBlank { strings.getString(R.string.notif_unnamed_chat) }
+    return if (kind == "error") "$chat · ${summary.orEmpty().ifBlank { strings.getString(R.string.mobile_turn_failed_unknown) }}" else chat
 }
 internal fun refreshNotificationLanguage(context: Context): Job = NotificationPosting.refresh(context)
 internal suspend fun refreshNotificationLanguagePass(context: Context) {
@@ -52,10 +59,12 @@ internal fun translatedNotification(context: Context, id: Int, tag: String?, old
     } else if (id == 2 && old.channelId in notificationChannels.map { it.id }) {
         val kind = old.extras.getString(ALERT_KIND) ?: return null
         val title = strings.getString(when (kind) { "answers" -> R.string.notif_answer_ready; "error" -> R.string.notif_task_failed; else -> R.string.notif_needs_decision })
-        val names = old.extras.getString(ALERT_NAMES) ?: strings.getString(R.string.notif_unnamed_chat)
+        val names = if (old.extras.getBoolean(ALERT_RAW)) watchAlertBody(strings, kind,
+            old.extras.getString(ALERT_NAMES), old.extras.getString(ALERT_SUMMARY))
+            else old.extras.getString(ALERT_NAMES) ?: strings.getString(R.string.notif_unnamed_chat)
         val public = old.publicVersion?.let { Notification.Builder.recoverBuilder(context, it) }
             ?: Notification.Builder(context, old.channelId).setSmallIcon(old.smallIcon)
-        builder.setContentTitle(title).setContentText(names)
+        builder.setContentTitle(title).setContentText(names).setStyle(Notification.BigTextStyle().bigText(names))
             .setPublicVersion(public.setContentTitle(strings.getString(R.string.app_name)).setContentText(title).build())
     } else return null
     @Suppress("DEPRECATION")

@@ -136,7 +136,8 @@ class RepositoryTest {
             try {
                 withTimeout(5000) { entered.await() }
                 assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
-                assertEquals(listOf("other"), repo.state.value.sessions.map { it.id })
+                // An incomplete index merges, rather than erasing already authorized entries.
+                assertEquals(listOf("other", "chat"), repo.state.value.sessions.map { it.id })
                 assertTrue(repo.state.value.sessionsTruncated)
                 withTimeout(750) { refresh.await() }
                 val cachedRead = CompletableDeferred<Unit>(); val releaseChat = java.util.concurrent.CountDownLatch(1)

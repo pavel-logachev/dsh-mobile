@@ -31,14 +31,27 @@ internal class WatchCoordinator(private val read: suspend () -> NotificationLoca
             // A lone group can hold 25 s. Multiple groups get a 1 s slice, preventing a
             // quiet chat from delaying all other tasks by 25 s each. No periodic sleep.
             val seconds = if (wait && since != null) if (sessions.size == 1) 25 else 1 else 0
-            try {
-                val result = poll(session, ids, since, seconds)
+            val result = try { poll(session, ids, since, seconds) }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) {
+                if (failure is MobileFailure && failure.key in setOf("forbidden", "session_not_found")) {
+                    tokens.remove(session)
+                    update { value -> if (value.deviceId == local.deviceId)
+                        value.copy(watches = value.watches.filterNot { it.sessionId == session }) else value }
+                    continue
+                }
+                // Device-global errors dominate transient failures, independent of group order.
+                if (failure is MobileFailure && !notificationRetryable(failure.key)) throw failure
+                if (failed == null) failed = failure
+                continue
+            }
+            // Storage / posting errors are not per-session HTTP failures and must not be masked.
+            run {
                 tokens[session] = Cut(ids, result.token)
                 update { value -> if (value.enabled && value.deviceId == local.deviceId)
                     value.reconcileWatches(session, result, now()) else value }
                 drainLocked()
-            } catch (cancelled: CancellationException) { throw cancelled }
-            catch (failure: Exception) { failed = failure }
+            }
         }
         failed?.let { throw it }
     }

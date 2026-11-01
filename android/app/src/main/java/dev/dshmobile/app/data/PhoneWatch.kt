@@ -7,9 +7,9 @@ private const val WATCH_CAP = 32
 @Serializable internal data class PhoneWatch(val sessionId: String, val requestId: String, val expiresAt: Long)
 @Serializable internal data class WatchAlert(val key: String, val sessionId: String, val turnId: String,
     val kind: String, val title: String, val summary: String? = null, val expiresAt: Long,
-    val attempted: Boolean = false)
+    val attempted: Boolean = false, val aliases: List<String> = emptyList())
 @Serializable internal data class WatchTurnState(val sessionId: String, val turnId: String,
-    val waiting: Boolean, val episode: Int, val expiresAt: Long)
+    val waiting: Boolean, val episode: Int, val expiresAt: Long, val aliases: List<String> = emptyList())
 
 internal fun NotificationLocal.pruneWatches(now: Long) = copy(
     watches = watches.filter { it.expiresAt > now }.takeLast(WATCH_CAP),
@@ -40,22 +40,42 @@ internal fun NotificationLocal.reconcileWatches(session: String, outcomes: Promp
         // Contract permits omitted turnId even on terminal outcomes. Use the request identity
         // in that case; never drop a proven outcome just because this optional field is absent.
         val turn = outcome.turnId ?: "request:${outcome.requestId}"
-        val identity = if (outcome.turnId == null) "request:${outcome.requestId}" else "turn:$turn"
-        val previous = local.watchTurns.firstOrNull { it.sessionId == session && it.turnId == identity }
+        val supplied = listOfNotNull("request:${outcome.requestId}", outcome.turnId?.let { "turn:$it" })
+        val linked = local.watchTurns.filter { it.sessionId == session && (it.turnId in supplied || it.aliases.any { alias -> alias in supplied }) }
+        val identities = (supplied + linked.flatMap { it.aliases } + linked.map { it.turnId }).distinct()
+        val previous = local.watchTurns.filter { it.sessionId == session && it.turnId in identities }
         val waiting = outcome.status == "waiting"
-        val episode = (previous?.episode ?: 0) + if (waiting && previous?.waiting != true) 1 else 0
-        // Unknown supplies no evidence of leaving a waiting episode.
+        val episode = (previous.maxOfOrNull { it.episode } ?: 0) + if (waiting && previous.none { it.waiting }) 1 else 0
+        // Keep both aliases in sync. Unknown supplies no evidence of leaving waiting.
         if (outcome.status != "unknown") local = local.copy(watchTurns = (local.watchTurns.filterNot {
-            it.sessionId == session && it.turnId == identity
-        } + WatchTurnState(session, identity, waiting, episode, maxOf(watch.expiresAt, previous?.expiresAt ?: 0))).takeLast(2048))
+            it.sessionId == session && it.turnId in identities
+        } + identities.map { WatchTurnState(session, it, waiting, episode,
+            maxOf(watch.expiresAt, previous.maxOfOrNull { prior -> prior.expiresAt } ?: 0), identities) }).takeLast(2048))
         if (outcome.status !in setOf("completed", "failed", "waiting")) continue
-        val base = watchTurnKey(session, identity)
-        val key = if (waiting) "$base:waiting:$episode" else "$base:final"
-        if (local.deliveredTurns.any { it.id == key } || local.outbox.any { it.key == key }) continue
+        val keys = identities.map { identity ->
+            val base = watchTurnKey(session, identity)
+            if (waiting) "$base:waiting:$episode" else "$base:final"
+        }
+        val delivered = local.deliveredTurns.firstOrNull { it.id in keys || it.aliases.any { alias -> alias in keys } }
+        val queued = local.outbox.firstOrNull { it.key in keys || it.aliases.any { alias -> alias in keys } }
+        // Learning turnId also teaches the existing alert its new alias, including before ack.
+        if (delivered != null) {
+            local = local.copy(deliveredTurns = local.deliveredTurns.map { if (it == delivered)
+                it.copy(aliases = (it.aliases + keys).distinct()) else it })
+            continue
+        }
+        if (queued != null) {
+            local = local.copy(outbox = local.outbox.map { if (it == queued)
+                it.copy(aliases = (it.aliases + keys).distinct()) else it })
+            continue
+        }
         val kind = when (outcome.status) { "failed" -> "error"; "waiting" -> "attention"; else -> "answer" }
-        local = local.copy(outbox = (local.outbox + WatchAlert(key, session, turn, kind, "", outcome.summary, watch.expiresAt)).takeLast(WATCH_CAP))
+        val key = keys.last()
+        local = local.copy(outbox = (local.outbox + WatchAlert(key, session, turn, kind, "", outcome.summary, watch.expiresAt,
+            aliases = keys)).takeLast(WATCH_CAP))
     }
     return local
 }
 internal fun NotificationLocal.acknowledgeWatchAlert(key: String, now: Long) = copy(outbox = outbox.filterNot { it.key == key },
-    deliveredTurns = (deliveredTurns.filterNot { it.id == key } + ProcessedNotification(key, now)).takeLast(2048))
+    deliveredTurns = (deliveredTurns.filterNot { it.id == key } + ProcessedNotification(key, now,
+        outbox.firstOrNull { it.key == key }?.aliases.orEmpty())).takeLast(2048))

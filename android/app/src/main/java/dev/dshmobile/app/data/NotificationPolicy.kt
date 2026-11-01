@@ -2,7 +2,7 @@ package dev.dshmobile.app.data
 
 import kotlinx.serialization.Serializable
 
-@Serializable internal data class ProcessedNotification(val id: String, val at: Long)
+@Serializable internal data class ProcessedNotification(val id: String, val at: Long, val aliases: List<String> = emptyList())
 /** Local-only policy and encrypted phone outcome delivery state. Old feed fields are ignored
  * by the additive JSON reader during upgrade; no host preference/cursor is retained. */
 @Serializable internal data class NotificationLocal(val enabled: Boolean = true, val deviceId: String? = null,

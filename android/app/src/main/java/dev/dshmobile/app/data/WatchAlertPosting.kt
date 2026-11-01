@@ -19,8 +19,7 @@ internal suspend fun postWatchAlert(context: Context, device: String, alert: Wat
         "error" -> R.string.notif_task_failed
         else -> R.string.notif_answer_ready
     })
-    val chat = alert.title.ifBlank { strings.getString(R.string.notif_unnamed_chat) }
-    val body = if (alert.kind == "error") "$chat · ${alert.summary.orEmpty().ifBlank { strings.getString(R.string.mobile_turn_failed_unknown) }}" else chat
+    val body = watchAlertBody(strings, alert.kind, alert.title, alert.summary)
     val channel = if (attention) "attention_alert_v2" else "answers_alert_v2"
     val tag = watchNotificationTag(device, alert.sessionId)
     val notification = NotificationCompat.Builder(context, channel).setSmallIcon(R.drawable.ic_launcher_foreground)
@@ -29,7 +28,7 @@ internal suspend fun postWatchAlert(context: Context, device: String, alert: Wat
         .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
         .setPublicVersion(NotificationCompat.Builder(context, channel).setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(strings.getString(R.string.app_name)).setContentText(title).build())
-        .setAutoCancel(true).setOnlyAlertOnce(replay).addExtras(alertLanguageExtras(if (alert.kind == "answer") "answers" else alert.kind, body)).build()
+        .setAutoCancel(true).setOnlyAlertOnce(replay).addExtras(alertLanguageExtras(if (alert.kind == "answer") "answers" else alert.kind, alert.title, alert.summary)).build()
     NotificationPosting.paced {
         // No suspension between permission/policy guard and platform notify.
         store.postIfCurrent(device, alert.key) {
