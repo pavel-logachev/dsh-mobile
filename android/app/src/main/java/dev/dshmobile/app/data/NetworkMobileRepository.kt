@@ -30,6 +30,7 @@ import kotlin.random.Random
 fun createMobileRepository(context: Context, scope: CoroutineScope): MobileRepository =
     NetworkMobileRepository(EncryptedStateStore(context.applicationContext), scope, BuildConfig.DEBUG, observeRestoredSession = false,
         historyStore = EncryptedHistoryStore(context.applicationContext), prefetchEnabled = true,
+        networkWake = repositoryNetworkWake(context.applicationContext),
         watchPrompt = { device, session, request -> registerPhoneWatch(context.applicationContext, device, session, request) },
         unwatchPrompt = { request -> NotificationStore(context.applicationContext).update { it.copy(watches = it.watches.filterNot { w -> w.requestId == request }) }; Unit },
         openAttachment = { source -> context.contentResolver.openInputStream(android.net.Uri.parse(source.uri)) ?: throw java.io.IOException("unavailable") })
@@ -62,6 +63,8 @@ internal class NetworkMobileRepository(
     private val openAttachment: ((dev.dshmobile.app.model.DraftAttachment) -> java.io.InputStream)? = null,
     private val watchPrompt: suspend (String, String, String) -> Unit = { _, _, _ -> },
     private val unwatchPrompt: suspend (String) -> Unit = {},
+    private val networkWake: (((() -> Unit)) -> (() -> Unit))? = null,
+    private val firstSnapshotTimeoutMs: Long = 15_000L,
 ) : MobileRepository {
     private val repositoryJob = SupervisorJob(ownerScope.coroutineContext[Job])
     private val scope = CoroutineScope(ownerScope.coroutineContext + repositoryJob)
@@ -115,19 +118,79 @@ internal class NetworkMobileRepository(
     @Volatile private var generation = 0L
     @Volatile private var observer: EventSource? = null
     private var snapshotIngress: SnapshotIngress<SessionSnapshot>? = null
+    private var firstSnapshotRead: kotlinx.coroutines.CompletableDeferred<SessionSnapshot>? = null
     private var reconnectJob: Job? = null
     private var reconnectAttempt = 0
+    private var networkWakeJob: Job? = null
+    private var unregisterNetworkWake: (() -> Unit)? = null
+
+    /** Read-only wake; flaps coalesce and never cancel or replay an admitted command. */
+    fun networkRestored() {
+        synchronized(lifecycle) {
+            if (!foreground || !desiredForeground || closed || state.value.connection != ConnectionState.OFFLINE || networkWakeJob?.isActive == true) return
+            networkWakeJob = scope.launch(start = CoroutineStart.LAZY) {
+                cancelReconnect()
+                reconnectAttempt = 0
+                action {
+                    if (foreground && desiredForeground && state.value.connection == ConnectionState.OFFLINE && stored.host != null)
+                        refreshLocked()
+                }
+            }.also { it.start() }
+        }
+    }
     private var projectionRetryJob: Job? = null
     private var projectionRetryAttempt = 0
     // Connectivity is visible before the fresh metadata/history cut authorizes actions.
     private var syncing = false
+    private var indexJob: Job? = null
+    @Volatile private var indexRevision = 0L
+    private fun cancelIndex() { indexRevision++; indexJob?.cancel(); indexJob = null }
+    private suspend fun saveIndex(workspaces: List<dev.dshmobile.app.model.Workspace>, index: HostApi.SessionIndex) {
+        if (!index.truncated) history.retain(index.items.map { it.id }.toSet())
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            cacheMutex.withLock {
+                try {
+                    checkHistoryEpoch()
+                    stored.host?.let { diskHistory.bindAuthorized(historyBinding(it), historyEpoch) }
+                    if (!index.truncated) diskHistory.retain(index.items.map { it.id }.toSet())
+                    diskHistory.updateIndex(HistoryIndex(workspaces, index.items, index.truncated, now()))
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (failure: MobileFailure) { throw failure }
+                catch (_: Exception) { /* Optional cache cannot gate authenticated reads. */ }
+            }
+        }
+    }
+    private fun loadRemainingIndex(network: HostApi, first: HostApi.SessionIndex) {
+        if (first.nextCursor == null || first.pages >= 10) return
+        val revision = indexRevision
+        indexJob = scope.launch {
+            try {
+                val complete = network.sessions(after = first)
+                action {
+                    if (revision != indexRevision || !foreground || !desiredForeground || api !== network) return@action
+                    checkHistoryEpoch()
+                    if (complete.items.any { item -> state.value.workspaces.none { it.id == item.workspaceId } }) throw MobileFailure("invalid_response")
+                    saveIndex(state.value.workspaces, complete)
+                    if (!complete.truncated && stored.selectedSessionId?.let { id -> complete.items.none { it.id == id } } == true) {
+                        stopObserver()
+                        persist(stored.copy(selectedSessionId = null))
+                        mutableState.value = state.value.copy(snapshot = null, snapshotStale = true, draft = "")
+                    }
+                    mutableState.value = state.value.copy(sessions = complete.items, sessionsTruncated = complete.truncated)
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) {
+                action { if (revision == indexRevision && foreground && api === network) fail(if (failure is MobileFailure) failure.key else "invalid_response") }
+            }
+        }
+    }
     private data class DraftEdit(val revision: Long, val text: String)
     private val draftSequence = java.util.concurrent.atomic.AtomicLong()
     private val liveDrafts = java.util.concurrent.ConcurrentHashMap<String, DraftEdit>()
     private fun draftFor(sessionId: String?): String = sessionId?.let { liveDrafts[it]?.text ?: stored.drafts[it] }.orEmpty()
     init {
         removeHistoryListener = historyStore.authority.listen { key ->
-            history.clear(); diskHistory.invalidateMemory(); prefetch.cancel(); stopObserver(); cancelReconnect()
+            history.clear(); diskHistory.invalidateMemory(); prefetch.cancel(); stopObserver(); cancelReconnect(); cancelIndex()
             api?.close(); api = null
             hideRejectedHistory(key)
         }
@@ -172,6 +235,7 @@ internal class NetworkMobileRepository(
             workspaces = if (key in setOf("revoked", "unauthorized", "forbidden")) emptyList() else state.value.workspaces,
             snapshot = if (key in setOf("revoked", "unauthorized", "forbidden")) null else state.value.snapshot,
             snapshotStale = state.value.snapshotStale || connection != ConnectionState.ONLINE || key == "chat_unavailable")
+        if (connection != ConnectionState.ONLINE) cancelIndex()
         if (connection != ConnectionState.ONLINE || key in setOf("forbidden", "chat_unavailable")) stopObserver()
         if (connection == ConnectionState.OFFLINE) scheduleReconnect()
         if (key == "chat_unavailable" && retryable) scheduleProjectionRetry()
@@ -197,6 +261,7 @@ internal class NetworkMobileRepository(
             retainedAttachmentSources = value.acceptedPrompts.flatMap { it.attachmentSources } + value.pending?.attachmentSources.orEmpty())
     }
     private fun stopObserver() {
+        firstSnapshotRead?.cancel(); firstSnapshotRead = null
         generation++
         snapshotIngress?.close()
         snapshotIngress = null
@@ -366,6 +431,7 @@ internal class NetworkMobileRepository(
     private suspend fun refreshFromHostLocked(readHistory: Boolean) {
         historyEpoch = historyStore.authority.epoch
         val network = api()
+        cancelIndex()
         prefetch.cancel()
         stopObserver()
         syncing = true
@@ -379,7 +445,7 @@ internal class NetworkMobileRepository(
             val workspaces = async { network.workspaces() }
             val presets = async { network.presets() }
             val index = async {
-                try { Result.success(network.sessions()) }
+                try { Result.success(network.sessions(firstPageOnly = true)) }
                 catch (cancelled: CancellationException) { throw cancelled }
                 catch (failure: Exception) { Result.failure(failure) }
             }
@@ -392,18 +458,8 @@ internal class NetworkMobileRepository(
         val (caps, workspaces, presets, index) = metadata
         val sessions = index.items
         if (sessions.any { session -> workspaces.none { it.id == session.workspaceId } }) throw MobileFailure("invalid_response")
-        if (!index.truncated) history.retain(sessions.map { it.id }.toSet())
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            cacheMutex.withLock {
-                try {
-                    stored.host?.let { diskHistory.bindAuthorized(historyBinding(it), historyEpoch) }
-                    if (!index.truncated) diskHistory.retain(sessions.map { it.id }.toSet())
-                    diskHistory.updateIndex(HistoryIndex(workspaces, sessions, index.truncated, now()))
-                } catch (cancelled: CancellationException) { throw cancelled }
-                catch (_: Exception) { /* Optional cache failure does not change authenticated reads. */ }
-            }
-        }
-        val selected = stored.selectedSessionId?.takeIf { id -> sessions.any { it.id == id } }
+        // Absence in the first page is not revocation or permission to erase cached history.
+        val selected = stored.selectedSessionId?.takeIf { id -> index.truncated || sessions.any { it.id == id } }
         // Publish the authorized index before any potentially slow history projection.
         mutableState.value = state.value.copy(hostName = caps.hostName, capabilities = caps.capabilities,
             workspaces = workspaces, presets = presets, sessions = sessions, sessionsTruncated = index.truncated,
@@ -411,6 +467,8 @@ internal class NetworkMobileRepository(
             connection = if (foreground) ConnectionState.ONLINE else ConnectionState.OFFLINE)
         if (foreground) StartupPerf.mark("online")
         StartupPerf.mark("list_fresh")
+        saveIndex(workspaces, index)
+        loadRemainingIndex(network, index)
         var historyError: String? = null
         var retryHistory = false
         val target = requestedSessionId ?: selected
@@ -461,7 +519,8 @@ internal class NetworkMobileRepository(
             cancelProjectionRetry()
             prefetch.cancel()
             val cached = diskHistory.get(sessionId)?.takeIf { entry ->
-                state.value.sessions.any { it.id == sessionId && it.workspaceId == entry.session.workspaceId } &&
+                (state.value.sessions.any { it.id == sessionId && it.workspaceId == entry.session.workspaceId } ||
+                    (state.value.sessionsTruncated && state.value.sessions.none { it.id == sessionId })) &&
                     state.value.workspaces.any { it.id == entry.session.workspaceId }
             }
             mutableState.value = state.value.copy(observingSession = true,
@@ -523,28 +582,29 @@ internal class NetworkMobileRepository(
         restoreLocked()
         if (!foreground) throw MobileFailure("offline_no_send")
         if (!validId(sessionId)) throw MobileFailure("invalid_selection")
-        // Navigation owns the target GET below; metadata recovery must not project the old chat
-        // (or GET this same target twice). Durable receipt recovery inside refresh is unchanged.
-        if (!metadataReady && (state.value.connection != ConnectionState.ONLINE || state.value.sessions.none { it.id == sessionId })) refreshLocked(readHistory = false)
+        // Navigation owns the target snapshot read below; metadata recovery must not project the
+        // old chat or open this target twice. Durable receipt recovery inside refresh is unchanged.
+        if (!metadataReady && (state.value.connection != ConnectionState.ONLINE || (!state.value.sessionsTruncated && state.value.sessions.none { it.id == sessionId }))) refreshLocked(readHistory = false)
         kotlinx.coroutines.currentCoroutineContext().ensureActive()
         if (revision != selectionRevision || !observingSession) return
         stopObserver()
         // Cached history is presentation only. Never reconcile a receipt or use its cursor to stop work.
         val before = state.value
         val cached = (history.get(sessionId) ?: diskHistory.get(sessionId))?.takeIf { entry ->
-            state.value.sessions.any { it.id == sessionId && it.workspaceId == entry.session.workspaceId } &&
+            (state.value.sessions.any { it.id == sessionId && it.workspaceId == entry.session.workspaceId } ||
+                    (state.value.sessionsTruncated && state.value.sessions.none { it.id == sessionId })) &&
                 state.value.workspaces.any { it.id == entry.session.workspaceId }
         }
         mutableState.value = state.value.copy(busy = true, error = null,
             snapshot = cached ?: state.value.snapshot?.takeUnless { it.session.id == sessionId },
             snapshotStale = cached != null, draft = if (cached != null) draftFor(sessionId) else state.value.draft)
         try {
-            val snapshot = api().snapshot(sessionId)
+            val snapshot = readChatFirstSnapshot(api(), sessionId)
             kotlinx.coroutines.currentCoroutineContext().ensureActive()
             if (revision != selectionRevision || !observingSession) return
             if (state.value.workspaces.none { it.id == snapshot.session.workspaceId }) throw MobileFailure("invalid_selection")
             if (state.value.sessions.none { it.id == sessionId }) {
-                // A bounded index may omit a target; one authorized GET is sufficient, not two.
+                // A bounded index may omit a target; a point-authorized snapshot is sufficient.
                 mutableState.value = state.value.copy(sessions = state.value.sessions + snapshot.session)
             }
             persist(stored.copy(selectedSessionId = sessionId))
@@ -554,7 +614,7 @@ internal class NetworkMobileRepository(
             )
             StartupPerf.mark("chat_fresh")
             reconcileSnapshot(snapshot)
-            startObserver()
+            if (observer == null) startObserver()
         } catch (cancelled: CancellationException) {
             // Restore the previous selection only before a durable navigation write took place.
             if (state.value.snapshotStale || stored.selectedSessionId != sessionId) mutableState.value = state.value.copy(
@@ -1045,23 +1105,59 @@ internal class NetworkMobileRepository(
         } else applyReceipt(receipt)
         if (reloadSnapshot) reloadCommandSnapshot(command)
     }
+    /** The first authoritative SSE cut and subsequent ingress share one connection. */
+    private suspend fun readChatFirstSnapshot(network: HostApi, sessionId: String): SessionSnapshot {
+        if (state.value.capabilities?.liveSnapshots != true) return network.snapshot(sessionId)
+        val first = kotlinx.coroutines.CompletableDeferred<SessionSnapshot>()
+        firstSnapshotRead = first
+        val current = generation
+        val ingress = observerIngress(current)
+        snapshotIngress = ingress
+        val firstDelivered = java.util.concurrent.atomic.AtomicBoolean()
+        observer = network.observe(sessionId, onSnapshot = { replacement ->
+            if (firstDelivered.compareAndSet(false, true)) first.complete(replacement)
+            else ingress.offer(replacement)
+        }, onFailure = { failure ->
+            if (!first.isCompleted) first.completeExceptionally(failure)
+            else scope.launch { action { if (current == generation && foreground) fail(failure.key, failure.retryable) } }
+        })
+        return try {
+            val snapshot = kotlinx.coroutines.withTimeoutOrNull(firstSnapshotTimeoutMs) { first.await() }
+            if (snapshot != null) { reconnectAttempt = 0; projectionRetryAttempt = 0; snapshot }
+            else { stopObserver(); network.snapshot(sessionId) }
+        } catch (cancelled: CancellationException) {
+            stopObserver(); throw cancelled
+        } catch (failure: MobileFailure) {
+            stopObserver()
+            // GET is a read-only fallback, never a way to overrule an observed auth rejection.
+            if (failure.key in setOf("unauthorized", "revoked", "forbidden")) {
+                history.clear(); diskHistory.invalidateMemory(); hideRejectedHistory(failure.key)
+                try { network.snapshot(sessionId) } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: MobileFailure) { /* Original authorization failure remains terminal. */ }
+                throw failure
+            }
+            if (failure.key in setOf("network_unavailable", "tls_failed")) network.snapshot(sessionId)
+            else throw failure
+        } finally { if (firstSnapshotRead === first) firstSnapshotRead = null }
+    }
+    private fun observerIngress(current: Long) = SnapshotIngress<SessionSnapshot>(scope) { replacement ->
+        action {
+            if (current != generation || !foreground || !observingSession || stored.selectedSessionId != replacement.session.id) return@action
+            checkHistoryEpoch()
+            if (state.value.workspaces.none { it.id == replacement.session.workspaceId }) throw MobileFailure("invalid_selection")
+            mutableState.value = MobileReducer.replaceSnapshot(state.value, replacement, now())
+            reconnectAttempt = 0
+            projectionRetryAttempt = 0
+            reconcileSnapshot(replacement)
+            if (stored.pending?.kind == "cancel" && !replacement.session.running) resolveLocked(reloadSnapshot = false)
+        }
+    }
     private fun startObserver() {
         stopObserver()
         val snapshot = state.value.snapshot ?: return
         if (!observingSession || state.value.snapshotStale || !foreground || closed || state.value.connection != ConnectionState.ONLINE || state.value.capabilities?.liveSnapshots != true) return
         val current = generation
-        val ingress = SnapshotIngress<SessionSnapshot>(scope) { replacement ->
-            action {
-                if (current != generation || !foreground || stored.selectedSessionId != replacement.session.id) return@action
-                checkHistoryEpoch()
-                mutableState.value = MobileReducer.replaceSnapshot(state.value, replacement, now())
-                reconnectAttempt = 0
-                projectionRetryAttempt = 0
-                reconcileSnapshot(replacement)
-                // Host pending -> accepted may be resolved when a material state change arrives.
-                if (stored.pending?.kind == "cancel" && !replacement.session.running) resolveLocked(reloadSnapshot = false)
-            }
-        }
+        val ingress = observerIngress(current)
         snapshotIngress = ingress
         observer = api().observe(snapshot.session.id, onSnapshot = { ingress.offer(it) }, onFailure = { failure ->
             scope.launch { action { if (current == generation && foreground) fail(failure.key, failure.retryable) } }
@@ -1097,8 +1193,10 @@ internal class NetworkMobileRepository(
             foregroundRevision++
             if (!active) {
                 foreground = false
+                unregisterNetworkWake?.invoke(); unregisterNetworkWake = null
+                networkWakeJob?.cancel(); networkWakeJob = null
                 receiptPoll?.cancel(); receiptPoll = null; receiptPollId = null
-                stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel()
+                stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel(); cancelIndex()
                 api?.close(); api = null
                 pairingTransport?.close()
             }
@@ -1107,7 +1205,10 @@ internal class NetworkMobileRepository(
         action {
             val wasForeground = synchronized(lifecycle) {
                 if (revision != foregroundRevision || desiredForeground != active || closed) return@action
-                foreground.also { foreground = active }
+                foreground.also {
+                    foreground = active
+                    if (active && unregisterNetworkWake == null) unregisterNetworkWake = networkWake?.invoke(::networkRestored)
+                }
             }
             restoreLocked()
             if (!active) {
@@ -1122,7 +1223,7 @@ internal class NetworkMobileRepository(
         }
     }
     override suspend fun forget() = action {
-        stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel()
+        stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel(); cancelIndex()
         // Credentials are the mandatory outcome; optional cache/key failures cannot gate it.
         try { store.clear() }
         catch (_: Exception) { store.reset() }
@@ -1142,7 +1243,8 @@ internal class NetworkMobileRepository(
         synchronized(lifecycle) {
             if (closed) return
             closed = true; desiredForeground = false; foreground = false; foregroundRevision++
-            stopObserver(); cancelReconnect(); prefetch.cancel()
+            unregisterNetworkWake?.invoke(); unregisterNetworkWake = null
+            stopObserver(); cancelReconnect(); prefetch.cancel(); cancelIndex()
             api?.close(); api = null; pairingTransport?.close()
         }
         removeHistoryListener?.invoke(); removeHistoryListener = null

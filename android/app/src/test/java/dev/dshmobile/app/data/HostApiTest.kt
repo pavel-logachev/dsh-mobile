@@ -125,6 +125,27 @@ class HostApiTest {
             } finally { api.close() }
         }
     }
+    @Test fun `first page continuation preserves duplicate and cursor validation at chunk boundary`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val api = api(server)
+            try {
+                for (next in listOf("page2+/=", "страница🌍")) {
+                    server.enqueue(json("""{"items":[${session("chat")}],"nextCursor":"$next"}"""))
+                    val first = api.sessions(firstPageOnly = true)
+                    assertTrue(first.truncated); assertEquals(1, first.pages)
+                    server.enqueue(json("""{"items":[${session("chat")}],"nextCursor":null}"""))
+                    try { api.sessions(after = first); fail("Duplicate across first/background page") }
+                    catch (failure: MobileFailure) { assertEquals("invalid_response", failure.key) }
+                }
+                server.enqueue(json("""{"items":[],"nextCursor":null}"""))
+                assertFalse(api.sessions(firstPageOnly = true).truncated)
+                server.enqueue(json("""{"items":[],"nextCursor":"nonempty"}"""))
+                try { api.sessions(firstPageOnly = true); fail("Empty page cannot continue") }
+                catch (failure: MobileFailure) { assertEquals("invalid_response", failure.key) }
+            } finally { api.close() }
+        }
+    }
     @Test fun `unknown receipt status is uncertain and malformed required fields are not defaulted`() = runBlocking {
         MockWebServer().use { server ->
             server.start()

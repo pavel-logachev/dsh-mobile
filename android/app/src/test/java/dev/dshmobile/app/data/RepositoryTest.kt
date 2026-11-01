@@ -59,6 +59,7 @@ class RepositoryTest {
         val deletedUploads = java.util.concurrent.CopyOnWriteArrayList<String>()
         var uploadCount = 0
         var failIndex = false
+        var sessionPage: ((RecordedRequest) -> MockResponse)? = null
         var stopServer: () -> Int = { 0 }
         var metadataDelayMs = 0L
         var metadataGate: (() -> Unit)? = null
@@ -79,7 +80,7 @@ class RepositoryTest {
             "/v1/workspaces" -> json("""{"items":[{"id":"workspace","name":"Synthetic workspace","canExecute":true}]}""").setBodyDelay(metadataDelayMs, TimeUnit.MILLISECONDS)
             "/v1/presets" -> json("""{"items":[]}""").setBodyDelay(metadataDelayMs, TimeUnit.MILLISECONDS)
             "/v1/sessions" -> if (request.method == "POST") { mutations += request; create?.invoke(request) ?: json("{}", 400) }
-                else if (failIndex) MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST) else json(index)
+                else if (failIndex) MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST) else sessionPage?.invoke(request) ?: json(index)
             "/v1/sessions/other" -> otherSnapshot?.invoke() ?: json(snapshot().replace("\"id\":\"chat\"", "\"id\":\"other\""))
             "/v1/sessions/chat" -> chatSnapshot?.invoke() ?: json(snapshotText)
             "/v1/sessions/chat/uploads" -> { uploadCount++; json("""{"uploadId":"fresh-$uploadCount","expiresAt":9999999999999,"attachment":{"id":"ref","name":"test.txt","size":4,"mime":"text/plain","kind":"file"}}""", 201) }
@@ -89,6 +90,293 @@ class RepositoryTest {
             else -> if (request.requestUrl?.encodedPath?.startsWith("/v1/commands/") == true)
                 receipt(request.requestUrl!!.pathSegments.last()) else json("{}", 404)
             }
+        }
+    }
+    @Test fun `network restored interrupts exhausted backoff without replay and coalesces flaps`() = runBlocking {
+        val store = MemoryStore()
+        val fixture = Fixture()
+        val attempts = CopyOnWriteArrayList<Int>()
+        MockWebServer().use { server ->
+            server.dispatcher = fixture; server.start()
+            val repo = NetworkMobileRepository(store, this, true, retryDelay = { attempts += it; 1L })
+            try {
+                repo.setForeground(true)
+                repo.pair("""{"version":1,"baseUrl":"${server.url("/").newBuilder().host("127.0.0.1").build().toString().removeSuffix("/")}","pairingToken":"synthetic-invitation-token"}""", "Synthetic")
+                fixture.failIndex = true; repo.refresh()
+                withTimeout(5000) { repo.state.first { attempts.size == 6 && it.connection == ConnectionState.OFFLINE } }
+                // Wait for the last scheduled attempt to finish, not just its scheduling.
+                withTimeout(5000) { while (fixture.requests.count { it.path?.startsWith("/v1/sessions?") == true } < 8) kotlinx.coroutines.delay(1) }
+                fixture.failIndex = false
+                val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+                fixture.metadataGate = { entered.complete(Unit); release.await(5, TimeUnit.SECONDS) }
+                val before = fixture.requests.count { it.path == "/v1/capabilities" }
+                val wake = repo.javaClass.methods.find { it.name.startsWith("networkRestored") && it.parameterCount == 0 }
+                assertNotNull("Repository must accept a restored-network wake", wake)
+                wake!!.invoke(repo)
+                try {
+                    withTimeout(1000) { entered.await() }
+                    repeat(20) { wake.invoke(repo) }
+                } finally { release.countDown() }
+                withTimeout(5000) { repo.state.first { it.connection == ConnectionState.ONLINE } }
+                assertEquals(before + 1, fixture.requests.count { it.path == "/v1/capabilities" })
+                assertTrue(fixture.mutations.isEmpty())
+            } finally { repo.close() }
+        }
+    }
+    @Test fun `first authorized page is online while remaining pages load and cached selection survives`() = runBlocking {
+        withRepository { repo, _, fixture, scope ->
+            repo.leaveSession()
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.sessionPage = { request ->
+                if (request.requestUrl!!.queryParameter("cursor") == null)
+                    json("""{"items":[${session().replace("\"id\":\"chat\"", "\"id\":\"other\"")}],"nextCursor":"next"}""")
+                else { entered.complete(Unit); release.await(5, TimeUnit.SECONDS); json("""{"items":[${session()}],"nextCursor":null}""") }
+            }
+            val refresh = scope.async { repo.refresh() }
+            try {
+                withTimeout(5000) { entered.await() }
+                assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
+                assertEquals(listOf("other"), repo.state.value.sessions.map { it.id })
+                assertTrue(repo.state.value.sessionsTruncated)
+                withTimeout(750) { refresh.await() }
+                val cachedRead = CompletableDeferred<Unit>(); val releaseChat = java.util.concurrent.CountDownLatch(1)
+                fixture.chatSnapshot = { cachedRead.complete(Unit); releaseChat.await(5, TimeUnit.SECONDS); json(snapshot()) }
+                val selection = scope.async { repo.selectSession("chat") }
+                try {
+                    withTimeout(1000) { cachedRead.await() }
+                    assertEquals("chat", repo.state.value.snapshot?.session?.id)
+                    assertTrue(repo.state.value.snapshotStale)
+                    assertTrue(repo.state.value.busy)
+                } finally { releaseChat.countDown(); selection.await(); fixture.chatSnapshot = null }
+            } finally { release.countDown() }
+            withTimeout(5000) { repo.state.first { !it.sessionsTruncated && it.sessions.size == 2 } }
+            repo.selectSession("chat")
+            assertNotNull(repo.state.value.snapshot)
+            assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `chat open uses one SSE snapshot and no preceding GET`() = runBlocking {
+        withRepository { repo, _, fixture, scope ->
+            repo.leaveSession()
+            fixture.capabilities = fixture.capabilities.replace("\"liveSnapshots\":false", "\"liveSnapshots\":true")
+            repo.refresh()
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            val initial = "event: snapshot\ndata: ${snapshot(cursor = 7)}\n\n"
+            fixture.events = { entered.complete(Unit); release.await(5, TimeUnit.SECONDS)
+                MockResponse().setHeader("Content-Type", "text/event-stream").setBody(initial + ": held\n\n")
+                    .throttleBody(initial.toByteArray().size.toLong(), 1, TimeUnit.SECONDS) }
+            val gets = fixture.requests.count { it.path == "/v1/sessions/chat" }
+            val open = scope.async { repo.selectSession("chat") }
+            try {
+                withTimeout(5000) { entered.await() }
+                assertNotNull(repo.state.value.snapshot)
+                assertTrue(repo.state.value.snapshotStale)
+                assertEquals(gets, fixture.requests.count { it.path == "/v1/sessions/chat" })
+            } finally { release.countDown() }
+            open.await()
+            assertEquals(7L, repo.state.value.snapshot?.cursor)
+            assertFalse(repo.state.value.snapshotStale)
+            assertEquals(gets, fixture.requests.count { it.path == "/v1/sessions/chat" })
+            repo.leaveSession()
+            assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `stream first preheaders failure falls back once to GET without mutation`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            repo.leaveSession()
+            fixture.capabilities = fixture.capabilities.replace("\"liveSnapshots\":false", "\"liveSnapshots\":true")
+            repo.refresh()
+            var opens = 0
+            fixture.events = { opens++; if (opens == 1) MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST)
+                else MockResponse().setHeader("Content-Type", "text/event-stream").setBody("event: snapshot\ndata: ${snapshot(cursor = 8)}\n\n") }
+            val gets = fixture.requests.count { it.path == "/v1/sessions/chat" }
+            repo.selectSession("chat")
+            assertNotNull(repo.state.value.snapshot)
+            assertEquals(gets + 1, fixture.requests.count { it.path == "/v1/sessions/chat" })
+            repo.leaveSession()
+            assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `stream auth rejection cannot be overruled by successful fallback GET`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            repo.leaveSession()
+            fixture.capabilities = fixture.capabilities.replace("\"liveSnapshots\":false", "\"liveSnapshots\":true")
+            repo.refresh()
+            fixture.events = { json("""{"error":{"code":"unauthorized","message":"Synthetic","retryable":false}}""", 401) }
+            val gets = fixture.requests.count { it.path == "/v1/sessions/chat" }
+            repo.selectSession("chat")
+            assertEquals(gets + 1, fixture.requests.count { it.path == "/v1/sessions/chat" })
+            assertEquals(ConnectionState.REVOKED, repo.state.value.connection)
+            assertNull(repo.state.value.snapshot)
+            assertTrue(repo.state.value.sessions.isEmpty())
+            assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `leaving pending first SSE snapshot cancels selection without GET fallback`() = runBlocking {
+        withRepository { repo, _, fixture, scope ->
+            repo.leaveSession()
+            fixture.capabilities = fixture.capabilities.replace("\"liveSnapshots\":false", "\"liveSnapshots\":true")
+            repo.refresh()
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.events = { entered.complete(Unit); release.await(5, TimeUnit.SECONDS)
+                MockResponse().setHeader("Content-Type", "text/event-stream").setBody(": heartbeat\n\n") }
+            val gets = fixture.requests.count { it.path == "/v1/sessions/chat" }
+            val selection = scope.async { repo.selectSession("chat") }
+            try {
+                withTimeout(5000) { entered.await() }
+                withTimeout(750) { repo.leaveSession(); selection.await() }
+                assertFalse(repo.state.value.observingSession)
+                assertFalse(repo.state.value.busy)
+                assertEquals(gets, fixture.requests.count { it.path == "/v1/sessions/chat" })
+                assertTrue(fixture.mutations.isEmpty())
+            } finally { release.countDown() }
+        }
+    }
+    @Test fun `revocation during background paging clears first page and cached history`() = runBlocking {
+        withRepository { repo, _, fixture, scope ->
+            repo.leaveSession()
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.sessionPage = { request ->
+                if (request.requestUrl!!.queryParameter("cursor") == null) json("""{"items":[${session()}],"nextCursor":"next"}""")
+                else { entered.complete(Unit); release.await(5, TimeUnit.SECONDS)
+                    json("""{"error":{"code":"revoked","message":"Synthetic","retryable":false}}""", 401) }
+            }
+            repo.refresh()
+            try {
+                withTimeout(5000) { entered.await() }
+                assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
+            } finally { release.countDown() }
+            withTimeout(5000) { repo.state.first { it.connection == ConnectionState.REVOKED } }
+            assertTrue(repo.state.value.sessions.isEmpty())
+            assertNull(repo.state.value.snapshot)
+            assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `stream first timeout falls back to GET and background cancels network wake`() = runBlocking {
+        withRepository { original, store, fixture, scope ->
+            original.close()
+            fixture.capabilities = fixture.capabilities.replace("\"liveSnapshots\":false", "\"liveSnapshots\":true")
+            var listener: (() -> Unit)? = null; var registrations = 0; var removals = 0
+            val repo = NetworkMobileRepository(store, scope, true, observeRestoredSession = false, firstSnapshotTimeoutMs = 50,
+                networkWake = { callback -> registrations++; listener = callback; { removals++ } })
+            try {
+                repo.setForeground(true)
+                fixture.events = { MockResponse().setHeader("Content-Type", "text/event-stream").setBody(": no snapshot\n\n").setHeadersDelay(500, TimeUnit.MILLISECONDS) }
+                val gets = fixture.requests.count { it.path == "/v1/sessions/chat" }
+                repo.selectSession("chat")
+                assertEquals(gets + 1, fixture.requests.count { it.path == "/v1/sessions/chat" })
+                assertFalse(repo.state.value.snapshotStale)
+                withTimeout(1000) { while (fixture.requests.count { it.path == "/v1/sessions/chat/events" } < 2) kotlinx.coroutines.delay(1) }
+                repo.setForeground(false)
+                val before = fixture.requests.count { it.path == "/v1/capabilities" }
+                listener!!()
+                kotlinx.coroutines.yield()
+                assertEquals(before, fixture.requests.count { it.path == "/v1/capabilities" })
+                assertEquals(1, registrations); assertEquals(1, removals)
+                assertTrue(fixture.mutations.isEmpty())
+            } finally { repo.close() }
+        }
+    }
+    @Test fun `restored network cancels a long pending backoff and flaps do not queue refresh`() = runBlocking {
+        withRepository { original, store, fixture, scope ->
+            original.close()
+            val scheduled = CompletableDeferred<Unit>()
+            val repo = NetworkMobileRepository(store, scope, true, observeRestoredSession = false,
+                retryDelay = { scheduled.complete(Unit); 30_000L })
+            try {
+                repo.setForeground(true)
+                fixture.failIndex = true; repo.refresh()
+                withTimeout(1000) { scheduled.await() }
+                fixture.failIndex = false
+                val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+                fixture.metadataGate = { entered.complete(Unit); release.await(5, TimeUnit.SECONDS) }
+                val before = fixture.requests.count { it.path == "/v1/capabilities" }
+                repo.networkRestored()
+                try {
+                    withTimeout(1000) { entered.await() }
+                    repeat(20) { repo.networkRestored() }
+                } finally { release.countDown() }
+                withTimeout(5000) { repo.state.first { it.connection == ConnectionState.ONLINE && !it.busy } }
+                repo.networkRestored(); kotlinx.coroutines.yield()
+                assertEquals(before + 1, fixture.requests.count { it.path == "/v1/capabilities" })
+                assertTrue(fixture.mutations.isEmpty())
+            } finally { repo.close() }
+        }
+    }
+    @Test fun `background during first SSE wait releases navigation and metadata admission`() = runBlocking {
+        withRepository { repo, _, fixture, scope ->
+            repo.leaveSession()
+            fixture.capabilities = fixture.capabilities.replace("\"liveSnapshots\":false", "\"liveSnapshots\":true")
+            repo.refresh()
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.events = { entered.complete(Unit); release.await(5, TimeUnit.SECONDS)
+                MockResponse().setHeader("Content-Type", "text/event-stream").setBody(": heartbeat\n\n") }
+            val selection = scope.async { repo.selectSession("chat") }
+            try {
+                withTimeout(5000) { entered.await() }
+                withTimeout(750) { repo.setForeground(false); selection.await() }
+                assertEquals(ConnectionState.OFFLINE, repo.state.value.connection)
+                assertFalse(repo.state.value.busy)
+                assertTrue(fixture.mutations.isEmpty())
+            } finally { release.countDown() }
+        }
+    }
+    @Test fun `new refresh cancels old background page without publishing late entries`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            repo.leaveSession()
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            val oldPage = session().replace("\"id\":\"chat\"", "\"id\":\"obsolete\"")
+            fixture.sessionPage = { request ->
+                if (request.requestUrl!!.queryParameter("cursor") == null) json("""{"items":[${session()}],"nextCursor":"next"}""")
+                else { entered.complete(Unit); release.await(5, TimeUnit.SECONDS); json("""{"items":[$oldPage],"nextCursor":null}""") }
+            }
+            repo.refresh()
+            try {
+                withTimeout(5000) { entered.await() }
+                fixture.sessionPage = null
+                withTimeout(1000) { repo.refresh() }
+                assertEquals(listOf("chat"), repo.state.value.sessions.map { it.id })
+                assertFalse(repo.state.value.sessionsTruncated)
+            } finally { release.countDown() }
+            assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `complete background index omission retires old selected history only after last page`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            repo.leaveSession()
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.sessionPage = { request ->
+                val id = if (request.requestUrl!!.queryParameter("cursor") == null) "other" else "last"
+                val item = session().replace("\"id\":\"chat\"", "\"id\":\"$id\"")
+                if (id == "other") json("""{"items":[$item],"nextCursor":"next"}""")
+                else { entered.complete(Unit); release.await(5, TimeUnit.SECONDS); json("""{"items":[$item],"nextCursor":null}""") }
+            }
+            repo.refresh()
+            try {
+                withTimeout(5000) { entered.await() }
+                assertEquals("chat", store.value.selectedSessionId)
+                assertEquals("chat", repo.state.value.snapshot?.session?.id)
+            } finally { release.countDown() }
+            withTimeout(5000) { repo.state.first { !it.sessionsTruncated } }
+            assertNull(store.value.selectedSessionId)
+            assertNull(repo.state.value.snapshot)
+            assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `network wake reconciles uncertain send by reads without replaying the one POST`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            repo.sendMessage("Synthetic uncertain intent")
+            assertEquals(1, fixture.mutations.size)
+            assertNotNull(store.value.pending)
+            fixture.failIndex = true; repo.refresh()
+            fixture.failIndex = false
+            repo.networkRestored()
+            withTimeout(5000) { repo.state.first { it.connection == ConnectionState.ONLINE && !it.busy } }
+            // ONLINE precedes receipt reconciliation; wait for the read boundary, not UI state alone.
+            withTimeout(5000) { while (fixture.requests.none { it.path?.startsWith("/v1/commands/") == true }) kotlinx.coroutines.delay(1) }
+            assertEquals(1, fixture.mutations.size)
+            assertNotNull(store.value.pending)
+            assertTrue(fixture.requests.any { it.path?.startsWith("/v1/commands/") == true })
         }
     }
     @Test fun `manual refresh stays active after capabilities until slow history finishes`() = runBlocking {
@@ -492,7 +780,7 @@ class RepositoryTest {
             } finally { release.countDown(); navigation.cancel() }
         }
     }
-    @Test fun `notification for last chat after Home resumes GET and SSE without commands`() = runBlocking {
+    @Test fun `notification for last chat after Home resumes SSE without duplicate GET or commands`() = runBlocking {
         withRepository { repo, _, fixture, _ ->
             repo.leaveSession()
             fixture.capabilities = fixture.capabilities.replace("\"liveSnapshots\":false", "\"liveSnapshots\":true")
@@ -507,7 +795,7 @@ class RepositoryTest {
                 .setBody("event: snapshot\ndata: $replacement\n\n") }
             repo.selectSession("chat")
             withTimeout(5_000) { repo.state.first { it.snapshot?.cursor == 2L } }
-            assertEquals(getCount + 1, fixture.requests.count { it.path == "/v1/sessions/chat" })
+            assertEquals(getCount, fixture.requests.count { it.path == "/v1/sessions/chat" })
             assertTrue(fixture.requests.count { it.path == "/v1/sessions/chat/events" } > eventsCount)
             assertTrue(repo.state.value.observingSession)
             assertFalse(repo.state.value.snapshotStale)
@@ -1127,7 +1415,7 @@ class RepositoryTest {
                 assertEquals(listOf(0, 1, 2, 3, 4, 5), attempts.take(6))
                 val seventh = kotlinx.coroutines.withTimeoutOrNull(150) { repo.state.first { attempts.size > 6 } }
                 assertNull(seventh)
-                assertEquals(7, fixture.requests.count { it.path == "/v1/sessions/chat/events" })
+                assertEquals("Initial stream-first + GET-fallback observer, then six scheduled retries", 8, fixture.requests.count { it.path == "/v1/sessions/chat/events" })
             } finally { repo.close() }
         }
     }

@@ -161,31 +161,53 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             else if (it.relayAccess != null) throw MobileFailure("invalid_response")
         }
     }
-    suspend fun capabilities(): CapabilitiesResponse = decodeWire<CapabilitiesResponse>(execute(request("capabilities").build()).checked()).also {
-        if (it.protocolVersion != 1) throw MobileFailure("incompatible_protocol")
-        if (it.hostName.isBlank() || it.hostName.length > 512 || it.upstreamVersion.isBlank() || it.upstreamVersion.length > 128) throw MobileFailure("invalid_response")
+    suspend fun capabilities(): CapabilitiesResponse {
+        val result = execute(request("capabilities").build())
+        return withContext(Dispatchers.Default) {
+            decodeWire<CapabilitiesResponse>(result.checked()).also {
+                if (it.protocolVersion != 1) throw MobileFailure("incompatible_protocol")
+                if (it.hostName.isBlank() || it.hostName.length > 512 || it.upstreamVersion.isBlank() || it.upstreamVersion.length > 128) throw MobileFailure("invalid_response")
+            }
+        }
     }
-    suspend fun workspaces(): List<dev.dshmobile.app.model.Workspace> = decodeWire<WorkspaceResponse>(execute(request("workspaces").build()).checked()).items.also {
-        if (it.size > 100 || it.map { item -> item.id }.distinct().size != it.size || it.any { item -> !validId(item.id) || item.name.length > 512 }) throw MobileFailure("invalid_response")
+    suspend fun workspaces(): List<dev.dshmobile.app.model.Workspace> {
+        val result = execute(request("workspaces").build())
+        return withContext(Dispatchers.Default) {
+            decodeWire<WorkspaceResponse>(result.checked()).items.also {
+                if (it.size > 100 || it.map { item -> item.id }.distinct().size != it.size || it.any { item -> !validId(item.id) || item.name.length > 512 }) throw MobileFailure("invalid_response")
+            }
+        }
     }
-    suspend fun presets(): List<dev.dshmobile.app.model.Preset> = decodeWire<PresetResponse>(execute(request("presets").build()).checked()).items.also {
-        if (it.size > 100 || it.map { item -> item.id }.distinct().size != it.size || it.any { item -> !validId(item.id) || item.name.length > 512 }) throw MobileFailure("invalid_response")
+    suspend fun presets(): List<dev.dshmobile.app.model.Preset> {
+        val result = execute(request("presets").build())
+        return withContext(Dispatchers.Default) {
+            decodeWire<PresetResponse>(result.checked()).items.also {
+                if (it.size > 100 || it.map { item -> item.id }.distinct().size != it.size || it.any { item -> !validId(item.id) || item.name.length > 512 }) throw MobileFailure("invalid_response")
+            }
+        }
     }
-    suspend fun sessions(): SessionIndex {
-        val items = mutableListOf<dev.dshmobile.app.model.SessionSummary>()
-        val ids = mutableSetOf<String>()
-        val cursors = mutableSetOf<String>()
-        var cursor: String? = null
-        repeat(10) {
+    suspend fun sessions(firstPageOnly: Boolean = false, after: SessionIndex? = null): SessionIndex {
+        val items = after?.items.orEmpty().toMutableList()
+        val ids = items.map { it.id }.toMutableSet()
+        val cursors = after?.cursors.orEmpty().toMutableSet()
+        var cursor: String? = after?.nextCursor
+        if (after != null && cursor == null) return after
+        repeat(10 - (after?.pages ?: 0)) { offset ->
             val url = request("sessions").build().url.newBuilder().addQueryParameter("limit", "100")
                 .apply { cursor?.let { addQueryParameter("cursor", it) } }.build()
-            val page = decodeWire<SessionResponse>(execute(request("sessions").url(url).build(), SNAPSHOT_LIMIT).checked())
-            if (page.items.size > 100 || page.items.any { !ids.add(it.id) }) throw MobileFailure("invalid_response")
-            page.items.forEach { it.checked() }
+            val result = execute(request("sessions").url(url).build(), SNAPSHOT_LIMIT)
+            val page = withContext(Dispatchers.Default) {
+                decodeWire<SessionResponse>(result.checked()).also { page ->
+                    if (page.items.size > 100 || page.items.any { !ids.add(it.id) }) throw MobileFailure("invalid_response")
+                    page.items.forEach { it.checked() }
+                }
+            }
             items += page.items
-            val next = page.nextCursor ?: return SessionIndex(items, false)
+            val pages = (after?.pages ?: 0) + offset + 1
+            val next = page.nextCursor ?: return SessionIndex(items, false, pages = pages)
             if (next.isBlank() || next.length > 4096 || next.any { it.isISOControl() } || !cursors.add(next) || page.items.isEmpty()) throw MobileFailure("invalid_response")
             cursor = next
+            if (firstPageOnly || pages == 10) return SessionIndex(items, true, next, cursors.toSet(), pages)
         }
         return SessionIndex(items, true)
     }
@@ -227,8 +249,13 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
         }
         throw result.errorFailure()
     }
-    suspend fun models(): dev.dshmobile.app.model.ModelCatalog = decodeWire<dev.dshmobile.app.model.ModelCatalog>(execute(request("models").build(), SNAPSHOT_LIMIT).checked()).also { catalog ->
-        if (catalog.items.size > 1000 || catalog.items.any { !validId(it.provider) || !validId(it.id) || it.name.length > 1024 }) throw MobileFailure("invalid_response")
+    suspend fun models(): dev.dshmobile.app.model.ModelCatalog {
+        val result = execute(request("models").build(), SNAPSHOT_LIMIT)
+        return withContext(Dispatchers.Default) {
+            decodeWire<dev.dshmobile.app.model.ModelCatalog>(result.checked()).also { catalog ->
+                if (catalog.items.size > 1000 || catalog.items.any { !validId(it.provider) || !validId(it.id) || it.name.length > 1024 }) throw MobileFailure("invalid_response")
+            }
+        }
     }
 
     suspend fun discardUpload(sessionId: String, uploadId: String) {
@@ -393,7 +420,8 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
     suspend fun awaitClosed() = io.awaitClosed()
     suspend fun closeAndAwait() { close(); awaitClosed() }
 
-    internal data class SessionIndex(val items: List<dev.dshmobile.app.model.SessionSummary>, val truncated: Boolean)
+    internal data class SessionIndex(val items: List<dev.dshmobile.app.model.SessionSummary>, val truncated: Boolean,
+        val nextCursor: String? = null, val cursors: Set<String> = emptySet(), val pages: Int = 0)
     private data class HttpResult(val status: Int, val text: String, val retryAfterMs: Long = 0)
     /** Internal category only: never retain the raw exception, its message, cause or request. */
     private class ReadConnectionClosed(val call: Call) : Exception("network_unavailable")
