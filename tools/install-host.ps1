@@ -162,7 +162,7 @@ $patchPath=Assert-LocalPath (Join-Path $profile 'cordis.patch.yml')
 if ((& node --version) -notmatch '^v24\.') { throw 'Node 24.x required.' }
 $global:LASTEXITCODE=0
 $version=((& $DshCommand --version) | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $version -cnotin @('0.2.0-rc.2','0.2.1-alpha.1','0.2.1-rc.4','0.2.1-rc.5')) { throw 'Supported DSH versions: 0.2.0-rc.2, 0.2.1-alpha.1, 0.2.1-rc.4, 0.2.1-rc.5. Check dsh --version.' }
+if ($LASTEXITCODE -ne 0 -or $version -cnotin @('0.2.0-rc.2','0.2.1-alpha.1','0.2.1-rc.5')) { throw 'Supported DSH versions: 0.2.0-rc.2, 0.2.1-alpha.1, 0.2.1-rc.5. Check dsh --version.' }
 $current=Read-Patch; $oldBlock=Marked-Block $current
 $placeholder="$begin`n# Unmounted companion; immutable plugin/private credentials retained.`n$end"
 $receipt=$null
