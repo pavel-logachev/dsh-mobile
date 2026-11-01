@@ -35,12 +35,18 @@ class RepositoryTest {
         var value = StoredState()
         var gate: CompletableDeferred<Unit>? = null
         var failWrites = false
+        @Volatile var failClear = false
+        @Volatile var resetCalls = 0
         override suspend fun read() = value
         override suspend fun write(value: StoredState) {
             if (failWrites) throw java.io.IOException("Synthetic storage failure")
             gate?.await(); this.value = value
         }
-        override suspend fun clear() { value = StoredState() }
+        override suspend fun clear() {
+            if (failClear) throw java.io.IOException("Synthetic clear failure")
+            value = StoredState()
+        }
+        override suspend fun reset() { resetCalls++; value = StoredState() }
     }
     private class Fixture : Dispatcher() {
         val mutations = CopyOnWriteArrayList<RecordedRequest>()
@@ -200,20 +206,41 @@ class RepositoryTest {
         }
     }
 
-    @Test fun `host is online before history while cached commands remain gated`() = runBlocking {
+    @Test fun `retryable SSE projection failure reopens automatically`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            fixture.capabilities = fixture.capabilities.replace("\"liveSnapshots\":false", "\"liveSnapshots\":true")
+            var opens = 0
+            fixture.events = {
+                opens++
+                if (opens == 1) json("""{"error":{"code":"unavailable","message":"Synthetic","retryable":true}}""", 503)
+                else MockResponse().setHeader("Content-Type", "text/event-stream")
+                    .setBody("event: snapshot\ndata: ${snapshot(cursor = 9)}\n\n")
+            }
+            repo.refresh()
+            withTimeout(5_000) { repo.state.first { it.error == "chat_unavailable" } }
+            val recovered = withTimeout(5_000) {
+                repo.state.first { it.error == null && it.snapshot?.cursor == 9L && opens >= 2 }
+            }
+            assertFalse(recovered.snapshotStale)
+            assertEquals(ConnectionState.ONLINE, recovered.connection)
+            assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `host is not online before authoritative metadata completes`() = runBlocking {
         withRepository { repo, _, fixture, scope ->
             val requested = CompletableDeferred<Unit>()
             val release = java.util.concurrent.CountDownLatch(1)
-            fixture.chatSnapshot = { requested.complete(Unit); release.await(5, TimeUnit.SECONDS); json(snapshot()) }
+            fixture.metadataGate = { requested.complete(Unit); release.await(5, TimeUnit.SECONDS) }
             val refresh = scope.async { repo.refresh() }
             try {
                 withTimeout(5000) { requested.await() }
-                assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
+                assertEquals(ConnectionState.SYNCING, repo.state.value.connection)
                 assertTrue(repo.state.value.busy)
-                assertTrue(repo.state.value.snapshotStale)
                 assertFalse(dev.dshmobile.app.model.MobileReducer.canSend(repo.state.value, "Synthetic"))
                 assertFalse(dev.dshmobile.app.ui.components.canCancel(repo.state.value))
             } finally { release.countDown(); refresh.await() }
+            assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
+            assertFalse(repo.state.value.busy)
         }
     }
     @Test fun `session index starts before capability negotiation completes and unsupported results are discarded`() = runBlocking {
@@ -328,6 +355,23 @@ class RepositoryTest {
                 assertEquals("unconfirmed", repo.state.value.acceptedPrompts.single().status)
                 assertEquals(1, fixture.mutations.size) // Only the explicit synthetic send; no cached replay.
             } finally { release.countDown(); navigation.cancel() }
+        }
+    }
+    @Test fun `identical idle cuts are not separate expiry evidence`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true)
+            repo.refresh()
+            fixture.message = { request -> json("""{"requestId":"${requestId(request)}","status":"accepted","updatedAt":20}""") }
+            repo.sendMessage("Synthetic queued inbox")
+            fixture.snapshotText = snapshot(cursor = 7)
+            repo.refresh()
+            assertEquals(1, store.value.acceptedPrompts.single().idleSnapshots)
+            assertEquals("queued", repo.state.value.acceptedPrompts.single().status)
+
+            repo.refresh() // Same durable cut delivered again: no new evidence.
+            assertEquals(1, store.value.acceptedPrompts.single().idleSnapshots)
+            assertEquals("queued", repo.state.value.acceptedPrompts.single().status)
+            assertNull(repo.state.value.error)
         }
     }
     @Test fun `cached display is replaced by the first SSE cut even when its cursor goes backwards`() = runBlocking {
@@ -624,7 +668,8 @@ class RepositoryTest {
             repo.close()
             val restarted = NetworkMobileRepository(store, scope, true)
             try {
-                restarted.setForeground(true) // Second fresh idle snapshot.
+                fixture.snapshotText = snapshot(running = false, cursor = 2)
+                restarted.setForeground(true) // Second distinct idle cut.
                 assertEquals(listOf("unconfirmed", "unconfirmed", "unconfirmed"), restarted.state.value.acceptedPrompts.map { it.status })
                 restarted.sendMessage("Wake retained inbox")
                 assertEquals(5, fixture.mutations.size)
@@ -658,7 +703,9 @@ class RepositoryTest {
             assertTrue(store.value.acceptedPrompts.isEmpty())
             repo.sendMessage("Dismiss expired")
             fixture.snapshotText = snapshot(running = false)
-            repo.refresh(); repo.refresh()
+            repo.refresh()
+            fixture.snapshotText = snapshot(running = false, cursor = 2)
+            repo.refresh()
             val local = repo.state.value.acceptedPrompts.single()
             assertEquals("unconfirmed", local.status)
             val afterExpiry = fixture.requests.size
@@ -679,7 +726,9 @@ class RepositoryTest {
             repo.sendMessage("Explicit repeat")
             val originalId = repo.state.value.acceptedPrompts.single().requestId
             fixture.snapshotText = snapshot(running = false)
-            repo.refresh(); repo.refresh()
+            repo.refresh()
+            fixture.snapshotText = snapshot(running = false, cursor = 2)
+            repo.refresh()
             assertEquals("unconfirmed", repo.state.value.acceptedPrompts.single().status)
             repo.state.value.localPromptActions!!.resend(originalId)
             assertEquals(2, fixture.mutations.size)
@@ -708,7 +757,9 @@ class RepositoryTest {
             repo.sendMessage("Explicit repeated lost response")
             val original = repo.state.value.acceptedPrompts.single().requestId
             fixture.snapshotText = snapshot(running = false)
-            repo.refresh(); repo.refresh()
+            repo.refresh()
+            fixture.snapshotText = snapshot(running = false, cursor = 2)
+            repo.refresh()
             fixture.message = { MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST) }
             repo.state.value.localPromptActions!!.resend(original)
             assertEquals("uncertain", repo.state.value.pending!!.status)
@@ -725,10 +776,10 @@ class RepositoryTest {
             repo.sendMessage("Retained inbox")
             val id = repo.state.value.acceptedPrompts.single().requestId
             fixture.snapshotText = snapshot(running = false); repo.refresh()
-            fixture.snapshotText = snapshot(running = true); repo.refresh()
-            fixture.snapshotText = snapshot(running = false); repo.refresh()
+            fixture.snapshotText = snapshot(running = true, cursor = 2); repo.refresh()
+            fixture.snapshotText = snapshot(running = false, cursor = 3); repo.refresh()
             assertEquals("queued", repo.state.value.acceptedPrompts.single().status)
-            repo.refresh()
+            fixture.snapshotText = snapshot(running = false, cursor = 4); repo.refresh()
             assertEquals("unconfirmed", repo.state.value.acceptedPrompts.single().status)
             fixture.snapshotText = snapshot("""[{"id":"canonical","role":"user","text":"Retained inbox","createdAt":30,"requestId":"$id"}]""")
             repo.refresh()
@@ -882,6 +933,19 @@ class RepositoryTest {
             val restored = NetworkMobileRepository(store, scope, true)
             try { restored.restore(); assertTrue(restored.state.value.sendNotSent) } finally { restored.close() }
             assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+    @Test fun `host recovery hold is a definite pre-admission refusal that keeps the draft and never becomes uncertain`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            fixture.message = { json("""{"error":{"code":"recovery_hold","message":"Synthetic","retryable":false}}""", 503) }
+            repo.updateDraft("Synthetic during recovery")
+            repo.sendMessage("Synthetic during recovery")
+            assertNull(store.value.pending)
+            assertEquals("recovery_hold", repo.state.value.error)
+            assertEquals("Synthetic during recovery", repo.state.value.draft)
+            assertTrue(repo.state.value.sendNotSent)
+            assertEquals(1, fixture.mutations.size)
+            assertTrue("a held command must not be looked up or replayed", fixture.requests.none { it.path?.startsWith("/v1/commands/") == true })
         }
     }
     @Test fun `send accepted after Home while response is in flight is not cancelled`() = runBlocking {
@@ -1083,6 +1147,16 @@ class RepositoryTest {
             assertFalse(repo.state.value.paired)
             assertNull(store.value.host)
         } finally { repo.close(); scope.cancel() }
+    }
+    @Test fun `forget falls back to a destructive reset when clear cannot use the key`() = runBlocking {
+        withRepository { repo, store, _, _ ->
+            store.failClear = true
+            repo.forget()
+            assertEquals(1, store.resetCalls)
+            assertFalse(repo.state.value.paired)
+            assertNull(store.value.host)
+            assertNull(repo.state.value.error)
+        }
     }
     @Test fun `background closes observation only and foreground replaces with new authoritative snapshot`() = runBlocking {
         withRepository { repo, _, fixture, _ ->

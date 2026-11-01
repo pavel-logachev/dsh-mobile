@@ -110,8 +110,11 @@ internal class NetworkMobileRepository(
     @Volatile private var closed = false
     @Volatile private var generation = 0L
     @Volatile private var observer: EventSource? = null
+    private var snapshotIngress: SnapshotIngress<SessionSnapshot>? = null
     private var reconnectJob: Job? = null
     private var reconnectAttempt = 0
+    private var projectionRetryJob: Job? = null
+    private var projectionRetryAttempt = 0
     // Connectivity is visible before the fresh metadata/history cut authorizes actions.
     private var syncing = false
     private data class DraftEdit(val revision: Long, val text: String)
@@ -139,13 +142,13 @@ internal class NetworkMobileRepository(
             try { block(); checkHistoryEpoch() }
             catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: Exception) {
-                fail(if (failure is MobileFailure) failure.key else "storage_failed")
+                fail(if (failure is MobileFailure) failure.key else "storage_failed", failure is MobileFailure && failure.retryable)
             } finally {
                 if (historyEpoch != historyStore.authority.epoch) hideRejectedHistory("revoked")
             }
         }
     }
-    private suspend fun fail(key: String) {
+    private suspend fun fail(key: String, retryable: Boolean = false) {
         val connection = when (key) {
             "revoked", "unauthorized" -> ConnectionState.REVOKED
             "incompatible_protocol" -> ConnectionState.INCOMPATIBLE
@@ -167,6 +170,7 @@ internal class NetworkMobileRepository(
             snapshotStale = state.value.snapshotStale || connection != ConnectionState.ONLINE || key == "chat_unavailable")
         if (connection != ConnectionState.ONLINE || key in setOf("forbidden", "chat_unavailable")) stopObserver()
         if (connection == ConnectionState.OFFLINE) scheduleReconnect()
+        if (key == "chat_unavailable" && retryable) scheduleProjectionRetry()
     }
     private fun protectUploads(value: StoredState): StoredState {
         val instant = now()
@@ -190,6 +194,8 @@ internal class NetworkMobileRepository(
     }
     private fun stopObserver() {
         generation++
+        snapshotIngress?.close()
+        snapshotIngress = null
         observer?.cancel()
         observer = null
     }
@@ -364,13 +370,7 @@ internal class NetworkMobileRepository(
         // Speculate only a read. Unsupported hosts may reject it; discard both result and failure.
         val metadata = coroutineScope {
             val caps = async {
-                network.capabilities().also {
-                    checkHistoryEpoch()
-                    if (foreground && desiredForeground && !closed) {
-                        mutableState.value = state.value.copy(connection = ConnectionState.ONLINE)
-                        StartupPerf.mark("online")
-                    }
-                }
+                network.capabilities().also { checkHistoryEpoch() }
             }
             val workspaces = async { network.workspaces() }
             val presets = async { network.presets() }
@@ -403,7 +403,9 @@ internal class NetworkMobileRepository(
         // Publish the authorized index before any potentially slow history projection.
         mutableState.value = state.value.copy(hostName = caps.hostName, capabilities = caps.capabilities,
             workspaces = workspaces, presets = presets, sessions = sessions, sessionsTruncated = index.truncated,
-            demo = caps.upstreamVersion == "fixture", lastSyncedAt = now())
+            demo = caps.upstreamVersion == "fixture", lastSyncedAt = now(),
+            connection = if (foreground) ConnectionState.ONLINE else ConnectionState.OFFLINE)
+        if (foreground) StartupPerf.mark("online")
         StartupPerf.mark("list_fresh")
         var historyError: String? = null
         val refreshed = try {
@@ -445,6 +447,7 @@ internal class NetworkMobileRepository(
             val revision = ++selectionRevision
             requestedSessionId = sessionId
             observingSession = true
+            cancelProjectionRetry()
             prefetch.cancel()
             val cached = diskHistory.get(sessionId)?.takeIf { entry ->
                 state.value.sessions.any { it.id == sessionId && it.workspaceId == entry.session.workspaceId } &&
@@ -479,6 +482,7 @@ internal class NetworkMobileRepository(
         synchronized(selectionGuard) {
             if (!observingSession && selection == null && historyRead == null && observer == null) return
             observingSession = false
+            cancelProjectionRetry()
             mutableState.value = state.value.copy(observingSession = false, snapshotStale = state.value.snapshot != null,
                 error = state.value.error?.takeUnless { it == "chat_unavailable" })
             selectionRevision++; requestedSessionId = null
@@ -795,6 +799,15 @@ internal class NetworkMobileRepository(
             // 15-second transcript GET must not hold admission ahead of the first receipt GET.
             if (stored.pending?.status != "pending") reloadCommandSnapshot(command)
         } catch (failure: MobileFailure) {
+            if (failure.key == "recovery_hold") {
+                // The pinned host refused the command before admission: no receipt exists and
+                // the host provably did not dispatch it. Treat it as not sent, never uncertain.
+                persist(stored.copy(pending = null,
+                    notSentSessions = if (command.kind == "send" && command.sessionId != null) stored.notSentSessions + command.sessionId else stored.notSentSessions))
+                fail(failure.key)
+                mutableState.value = state.value.copy(error = "recovery_hold", busy = false)
+                return
+            }
             if (failure.requestNotSent) {
                 // Only transport evidence BEFORE requestHeadersStart permits this classification.
                 // Missing receipts, timeouts after headers, and lost responses remain uncertain.
@@ -898,10 +911,17 @@ internal class NetworkMobileRepository(
                 (local.sessionId == snapshot.session.id && snapshot.pendingQueue.any { it.requestId == local.requestId }) ||
                 (local.sessionId == snapshot.session.id && local.itemId != null && snapshot.pendingQueue.none { it.id == local.itemId })) return@mapNotNull null
             if (local.sessionId != snapshot.session.id || local.status == "unconfirmed") return@mapNotNull local
-            val idle = if (snapshot.activity == "idle" && !snapshot.session.running) local.idleSnapshots + 1 else 0
+            val idleCut = snapshot.activity == "idle" && !snapshot.session.running
+            val advancedIdleCut = idleCut && local.lastIdleCursor != snapshot.cursor
+            val idle = when {
+                !idleCut -> 0
+                advancedIdleCut -> local.idleSnapshots + 1
+                else -> local.idleSnapshots
+            }
             val since = local.acceptedAt ?: observedAt // Migrate legacy accepted records without inventing admission time.
             val expired = idle >= 2 || observedAt - since >= MobileReducer.ACCEPTED_PROMPT_TIMEOUT_MS
-            local.copy(status = if (expired) "unconfirmed" else local.status, acceptedAt = since, idleSnapshots = minOf(idle, 2))
+            local.copy(status = if (expired) "unconfirmed" else local.status, acceptedAt = since, idleSnapshots = minOf(idle, 2),
+                lastIdleCursor = if (idleCut) snapshot.cursor else null)
         }
         val command = stored.pending
         val prompt = command?.let { MobileReducer.reconcilesPrompt(it.presentation(), snapshot) } == true
@@ -911,7 +931,7 @@ internal class NetworkMobileRepository(
         val drafts = stored.drafts.toMutableMap()
         if (prompt && drafts[command.sessionId] == command.text) drafts.remove(command.sessionId)
         persist(stored.copy(pending = if (prompt || cancelled) null else command, acceptedPrompts = boundedLocalPrompts(accepted), drafts = drafts,
-            attachmentDrafts = if (prompt && command != null) withoutConfirmedAttachments(command) else stored.attachmentDrafts))
+            attachmentDrafts = if (prompt) withoutConfirmedAttachments(command) else stored.attachmentDrafts))
         if (prompt && command?.sessionId != null && liveDrafts[command.sessionId]?.text == command.text) liveDrafts.remove(command.sessionId)
         mutableState.value = state.value.copy(draft = draftFor(stored.selectedSessionId), error = if (prompt || cancelled) null else state.value.error)
     }
@@ -1011,20 +1031,21 @@ internal class NetworkMobileRepository(
         val snapshot = state.value.snapshot ?: return
         if (!observingSession || state.value.snapshotStale || !foreground || closed || state.value.connection != ConnectionState.ONLINE || state.value.capabilities?.liveSnapshots != true) return
         val current = generation
-        observer = api().observe(snapshot.session.id, onSnapshot = { replacement ->
-            scope.launch {
-                action {
-                    if (current != generation || !foreground || stored.selectedSessionId != replacement.session.id) return@action
-                    checkHistoryEpoch()
-                    mutableState.value = MobileReducer.replaceSnapshot(state.value, replacement, now())
-                    reconnectAttempt = 0
-                    reconcileSnapshot(replacement)
-                    // Host pending -> accepted may be resolved when a material state change arrives.
-                    if (stored.pending?.kind == "cancel" && !replacement.session.running) resolveLocked(reloadSnapshot = false)
-                }
+        val ingress = SnapshotIngress<SessionSnapshot>(scope) { replacement ->
+            action {
+                if (current != generation || !foreground || stored.selectedSessionId != replacement.session.id) return@action
+                checkHistoryEpoch()
+                mutableState.value = MobileReducer.replaceSnapshot(state.value, replacement, now())
+                reconnectAttempt = 0
+                projectionRetryAttempt = 0
+                reconcileSnapshot(replacement)
+                // Host pending -> accepted may be resolved when a material state change arrives.
+                if (stored.pending?.kind == "cancel" && !replacement.session.running) resolveLocked(reloadSnapshot = false)
             }
-        }, onFailure = { failure ->
-            scope.launch { action { if (current == generation && foreground) fail(failure.key) } }
+        }
+        snapshotIngress = ingress
+        observer = api().observe(snapshot.session.id, onSnapshot = { ingress.offer(it) }, onFailure = { failure ->
+            scope.launch { action { if (current == generation && foreground) fail(failure.key, failure.retryable) } }
         })
     }
     private fun scheduleReconnect() {
@@ -1035,6 +1056,20 @@ internal class NetworkMobileRepository(
             action { if (foreground && state.value.connection == ConnectionState.OFFLINE) refreshLocked() }
         }
     }
+    /** A retryable projection failure (5xx/429) gets a bounded fresh cut; a 4xx payload failure does not. */
+    private fun scheduleProjectionRetry() {
+        if (!foreground || closed || stored.host == null || projectionRetryJob?.isActive == true || projectionRetryAttempt >= 6) return
+        projectionRetryJob = scope.launch {
+            delay(retryDelay(projectionRetryAttempt++))
+            projectionRetryJob = null
+            action {
+                if (foreground && !closed && state.value.connection == ConnectionState.ONLINE && state.value.snapshot != null) refreshLocked()
+            }
+        }
+    }
+    private fun cancelProjectionRetry() {
+        projectionRetryJob?.cancel(); projectionRetryJob = null; projectionRetryAttempt = 0
+    }
     override suspend fun setForeground(active: Boolean) {
         val revision = synchronized(lifecycle) {
             if (closed) return
@@ -1043,7 +1078,7 @@ internal class NetworkMobileRepository(
             if (!active) {
                 foreground = false
                 receiptPoll?.cancel(); receiptPoll = null; receiptPollId = null
-                stopObserver(); cancelReconnect(); prefetch.cancel()
+                stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel()
                 api?.close(); api = null
                 pairingTransport?.close()
             }
@@ -1069,7 +1104,8 @@ internal class NetworkMobileRepository(
     override suspend fun forget() = action {
         stopObserver(); cancelReconnect(); prefetch.cancel()
         cacheMutex.withLock { diskHistory.clear() }
-        store.clear() // If this fails, report storage_failed and never claim the device was forgotten.
+        try { store.clear() }
+        catch (_: Exception) { store.reset() } // Explicit forget must not strand a broken key/record.
         val abandonedDrafts = stored.attachmentDrafts
         stored = stored.copy(attachmentDrafts = emptyMap())
         abandonedDrafts.forEach { (session, sources) -> discardStaging(session, sources) }

@@ -63,6 +63,8 @@ internal fun SessionSummary.checked(): SessionSummary {
 internal fun SessionSnapshot.checked(expectedId: String): SessionSnapshot {
     session.checked()
     if (session.id != expectedId || cursor < -1 || messages.size > 100 || notice.orEmpty().length > 4096 ||
+        (failure != null && (failure.message.toByteArray().size > 2048 || failure.message.any { it.isISOControl() } ||
+            (failure.code != null && (failure.code.length > 64 || !Regex("[A-Za-z0-9_.:-]{1,64}").matches(failure.code))))) ||
         messages.map { it.id }.distinct().size != messages.size || messages.any {
             !validId(it.id) || it.createdAt < 0 ||
                 (it.requestId != null && !validRequestId(it.requestId))
@@ -113,6 +115,7 @@ internal fun hostErrorKey(code: String): String = when (code) {
     "conflict", "request_conflict", "request_id_conflict", "idempotency_conflict" -> "request_conflict"
     "unsupported", "unsupported_operation" -> "unsupported"
     "invalid_text", "text_too_large" -> "invalid_text"
+    "recovery_hold" -> "recovery_hold"
     "unavailable" -> "network_unavailable"
     else -> "host_error"
 }

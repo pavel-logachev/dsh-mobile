@@ -146,6 +146,15 @@ test('uninspectable pre-upgrade receipt inventory fails closed without reading u
   assert.equal(reads, 0);
 });
 
+test('post-ACK bookkeeping failure cannot turn an admitted prompt into a rejection', async t => {
+  const { adapter, row, signal } = await setup(t, {
+    fileUploads: { resolve() { return {}; }, async uploadStream() { throw new Error('must not upload'); } } as any,
+    resolveAgent: async () => { throw new Error('synthetic post-ACK failure'); },
+  });
+  // Upstream prompt already resolved; receipt retirement failing afterwards is not a rejection.
+  await adapter.prompt(row.sessionId, 'Synthetic admitted prompt', requestId, signal, 'w');
+});
+
 test('receipt budget survives module reimport and fresh cordis tracing wrappers', async t => {
   const original = { stagedFiles: new WeakMap(), ctx: { sessions: { list: () => [] } } }, live = new Set<string>(); let serial = 0;
   const service = () => ({ [Symbol.for('cordis.original')]: original, resolve(_a: unknown, id: string) { return live.has(id) ? {} : undefined; }, async uploadStream(r: any) { for await (const _chunk of r.data) {} const receiptId = 'reload-' + serial++; live.add(receiptId); return { receiptId, file: { attachmentId: 'file', name: 'test.txt', bytes: 3 } }; } });

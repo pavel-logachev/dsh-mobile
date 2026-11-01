@@ -19,6 +19,8 @@ export interface HostSnapshot {
   pendingQueue?: QueueItem[]; pendingQuestions?: PendingQuestion[];
   model?: SessionModel | null; resolvedQuestions?: ResolvedQuestion[];
   activity: 'idle' | 'running' | 'waiting' | 'unknown'; notice?: string;
+  /** The latest turn ended with an upstream error instead of an answer. */
+  failure?: { code?: string; message: string };
   runningSubagents?: number;
   activityDetail?: { turnStartedAt: number; tool?: string };
 }

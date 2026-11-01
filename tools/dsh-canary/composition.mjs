@@ -6,7 +6,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createDeterministicAdapter, ephemeralBrowserCredentials, PROVIDER, MODEL } from './deterministic.mts';
 
-const VERIFIED_VERSIONS = ['0.2.0-rc.2', '0.2.1-alpha.1'];
+const VERIFIED_VERSIONS = ['0.2.0-rc.2', '0.2.1-alpha.1', '0.2.1-rc.4', '0.2.1-rc.5'];
 const COMPONENTS = [
   ['cordis-plugin-timer', {}], ['dsh-typert-registry', {}],
   ['dsh-llm', {}], ['dsh-session', {}], ['dsh-session-projection', {}],

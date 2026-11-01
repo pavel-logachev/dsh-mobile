@@ -12,6 +12,8 @@ import java.util.Base64
 class MobileFailure(val key: String, val retryAfterMs: Long = 0,
     /** Transport proof only: no application request headers were attempted on any connection. */
     val requestNotSent: Boolean = false,
+    /** Host explicitly marks this failure as safe to retry later; never used for mutations. */
+    val retryable: Boolean = false,
 ) : Exception(key)
 
 @Serializable

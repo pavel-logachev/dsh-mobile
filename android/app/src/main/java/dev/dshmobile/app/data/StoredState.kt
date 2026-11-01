@@ -44,6 +44,7 @@ internal data class StoredCommand(
     val queuedWhileRunning: Boolean = false,
     val acceptedAt: Long? = null,
     val idleSnapshots: Int = 0,
+    val lastIdleCursor: Long? = null,
     val delivery: String? = null,
     val uploadIds: List<String>? = null,
     val itemId: String? = null, val action: String? = null,
@@ -160,4 +161,6 @@ internal interface SecureStateStore {
     suspend fun read(): StoredState
     suspend fun write(value: StoredState)
     suspend fun clear()
+    /** Destructive last resort: delete the record even when the key cannot encrypt/decrypt. */
+    suspend fun reset() { clear() }
 }

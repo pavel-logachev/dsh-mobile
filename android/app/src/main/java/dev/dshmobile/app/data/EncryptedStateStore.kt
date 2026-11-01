@@ -115,4 +115,13 @@ internal class EncryptedStateStore internal constructor(private val file: Atomic
             }
         }
     }
+
+    override suspend fun reset() = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            // This path exists precisely because cipher/key operations may be broken. Delete the
+            // credential record first; then best-effort remove the key without requiring encryption.
+            try { file.delete() } catch (_: Exception) { throw MobileFailure("storage_failed") }
+            try { deleteKey() } catch (_: Exception) { /* The record is already gone; a stale key is inert. */ }
+        }
+    }
 }

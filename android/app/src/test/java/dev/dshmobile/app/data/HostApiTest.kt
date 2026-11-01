@@ -157,6 +157,19 @@ class HostApiTest {
             } finally { source.cancel(); api.close() }
         }
     }
+    @Test fun `ledger recovery hold is a distinct host decision, not a transport outage`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            server.enqueue(json("""{"error":{"code":"recovery_hold","message":"Synthetic","retryable":false}}""", 503))
+            val api = api(server)
+            try {
+                try {
+                    api.command(StoredCommand("00000000-0000-4000-8000-000000000001", "send", "chat", "Synthetic"))
+                    fail("A held command must not produce a receipt")
+                } catch (failure: MobileFailure) { assertEquals("recovery_hold", failure.key) }
+            } finally { api.close() }
+        }
+    }
     @Test fun `snapshot HTTP service failure is chat scoped and not a transport outage`() = runBlocking {
         MockWebServer().use { server ->
             server.start()

@@ -75,6 +75,29 @@ test('point observation resolves its fresh opening header without catalog I/O an
   assert.equal(h.cleanup().resumed, 0);
 });
 
+test('a failed turn is surfaced without inventing an assistant answer', async t => {
+  const h = await harness(t);
+  (h.frame.records as any[]).push({
+    type: 'event',
+    event: { seq: 8, time: 1700000000008, type: 'turn/end', data: { turn: 2, reason: { kind: 'error', error: { code: 'HTTP_400', message: 'messages: text content blocks must be non-empty' } } } },
+  });
+  h.frame.cursor = 8; h.frame.projections.asOfSeq = 8;
+  const snap = await h.adapter.snapshot('session-fixture', new AbortController().signal);
+  assert.deepEqual(snap.failure, { code: 'HTTP_400', message: 'messages: text content blocks must be non-empty' });
+  assert.equal(snap.messages.some(message => message.role === 'assistant' && message.text.includes('non-empty')), false);
+});
+
+test('an attempt failure is surfaced even when no turn/end record is delivered', async t => {
+  const h = await harness(t);
+  (h.frame.records as any[]).push({
+    type: 'event',
+    event: { seq: 8, time: 1700000000008, type: 'assistant/attempt', data: { turn: 2, step: 1, stream: [{ type: 'chunk', chunk: { type: 'finish', reason: { kind: 'error', failure: { code: 'HTTP_502', message: 'Provider connection failed' } } } }] } },
+  });
+  h.frame.cursor = 8; h.frame.projections.asOfSeq = 8;
+  const snap = await h.adapter.snapshot('session-fixture', new AbortController().signal);
+  assert.deepEqual(snap.failure, { code: 'HTTP_502', message: 'Provider connection failed' });
+});
+
 test('concurrent GET-style snapshot and watch share one cold opening with independent cancellation', async t => {
   const h = await harness(t), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   let openings = 0;
@@ -716,11 +739,15 @@ test('request-local cwd dedup is bounded and retries missing paths on the next l
 test('operator-declared unsupported versions are rejected and no preset registry means host default only', async (t) => {
   const h = await harness(t);
   const options = { sessionController: h.controller, workspaces: [{ id: 'alpha', name: 'Alpha', path: h.alpha }] };
-  await assert.rejects(createDshAdapter({ ...options, dshVersion: '0.2.0-rc.3' }), { code: 'unsupported_dsh_version', message: 'Supported DSH versions: 0.2.0-rc.2, 0.2.1-alpha.1. Check dsh --version before declaring dshVersion.' });
+  await assert.rejects(createDshAdapter({ ...options, dshVersion: '0.2.0-rc.3' }), { code: 'unsupported_dsh_version', message: 'Supported DSH versions: 0.2.0-rc.2, 0.2.1-alpha.1, 0.2.1-rc.4, 0.2.1-rc.5. Check dsh --version before declaring dshVersion.' });
   const alpha = await createDshAdapter({ ...options, dshVersion: '0.2.1-alpha.1' });
   t.after(async () => { alpha.dispose(); });
   assert.equal(alpha.upstreamVersion, '0.2.1-alpha.1');
   assert.equal((await alpha.listSessions(new AbortController().signal)).length, 1);
+  const rc5 = await createDshAdapter({ ...options, dshVersion: '0.2.1-rc.5' });
+  t.after(async () => { rc5.dispose(); });
+  assert.equal(rc5.upstreamVersion, '0.2.1-rc.5');
+  assert.equal((await rc5.listSessions(new AbortController().signal)).length, 1);
   const noPresets = await createDshAdapter({ ...options, dshVersion: '0.2.0-rc.2' });
   t.after(async () => { noPresets.dispose(); });
   assert.deepEqual(await noPresets.listPresets(new AbortController().signal), []);

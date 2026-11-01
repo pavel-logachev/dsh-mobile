@@ -42,6 +42,22 @@ test('irrelevant events do no catalog IO but preserve sequence gaps for the next
   assert.equal(f.feed.coverage, 'degraded', 'a gap in skipped types still resets an admitted session');
 });
 
+test('disabled and revoked notification devices stay out of the event hot path', async t => {
+  const f = await fixture(t); await f.feed.idle();
+  const disabled = f.state.consumePairing(f.state.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Disabled phone');
+  const revoked = f.state.consumePairing(f.state.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Revoked phone');
+  const journal = (enabled: boolean) => ({ epoch: 'epoch', sequence: 0, settings: { revision: 1, enabled, projects: [], chats: [] }, items: [] });
+  f.state.writeNotificationState('device:' + disabled.deviceId, journal(false));
+  f.state.writeNotificationState('device:' + revoked.deviceId, journal(true));
+  assert.equal(f.state.revokeDevice(revoked.deviceId), true);
+  assert.equal(f.state.notificationEnabledDeviceCount(), 1);
+  const reads: string[] = [], read = f.state.readNotificationState.bind(f.state);
+  f.state.readNotificationState = (id: string) => { reads.push(id); return read(id); };
+  f.proof.completed = [{ turn: 1, sourceSeq: 0 }]; await f.event(0, 'turn/end', { turn: 1, completed: true });
+  assert.equal(reads.some(id => id === 'device:' + disabled.deviceId || id === 'device:' + revoked.deviceId), false);
+  assert.equal((await f.feed.page(f.device.deviceId, f.head)).items[0]?.kind, 'answer-finished');
+});
+
 test('a gap among initial irrelevant envelopes suppresses a completion without inventing authority', async t => {
   const f = await fixture(t); await f.feed.idle();
   await f.event(0, 'turn/start'); await f.event(2, 'assistant/message');
@@ -77,6 +93,68 @@ test('journal listeners observe only committed events and stop after unsubscribe
   assert.equal(committed, true); assert.ok(wakes > 0); const before = wakes;
   await f.feed.page(f.device.deviceId, f.head); assert.equal(wakes, before, 'read-only page bookkeeping must not create a wake loop');
   stop(); f.proof.pending = true; await f.event(1, 'tool/call'); assert.equal(wakes, before);
+});
+
+test('unprovable idle history alone does not create a delivery gap', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const f = await fixture(t); await f.feed.idle(); assert.equal(f.feed.coverage, 'ready');
+  f.proof.valid = false;
+  for (let pass = 0; pass < 9; pass++) { t.mock.timers.tick(60000); await f.feed.idle(); }
+  assert.equal(f.feed.coverage, 'ready', 'no alertable event was involved');
+});
+
+test('a running session with unprovable history remains ready without an alertable gap', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const f = await fixture(t); await f.feed.idle(); assert.equal(f.feed.coverage, 'ready');
+  f.listed([{ id: 'chat', workspaceId: 'alpha', running: true }]);
+  f.proof.valid = false;
+  for (let pass = 0; pass < 9; pass++) { t.mock.timers.tick(60000); await f.feed.idle(); }
+  assert.equal(f.feed.coverage, 'ready');
+});
+
+test('a non-alerting event with invalid history does not degrade coverage', async t => {
+  const f = await fixture(t); await f.feed.idle();
+  f.proof.valid = false;
+  await f.event(0, 'tool/call');
+  assert.equal(f.feed.coverage, 'ready');
+  assert.equal((await f.feed.page(f.device.deviceId, f.head)).items.length, 0);
+  assert.equal(f.state.readNotificationState<any>('producer').chat, undefined);
+});
+
+test('a running source with invalid non-alerting history also stays ready', async t => {
+  const f = await fixture(t); await f.feed.idle();
+  f.listed([{ id: 'chat', workspaceId: 'alpha', running: true }]);
+  f.proof.valid = false;
+  await f.event(0, 'tool/call');
+  assert.equal(f.feed.coverage, 'ready');
+});
+
+test('an attention-flagged event with invalid proof stays degraded', async t => {
+  const f = await fixture(t); await f.feed.idle();
+  f.proof.valid = false;
+  await f.event(0, 'tool/call', { attention: true });
+  assert.equal(f.feed.coverage, 'degraded');
+});
+
+test('continuous invalid non-alerting events do not hide a later exact completion', async t => {
+  const f = await fixture(t); await f.feed.idle();
+  await f.event(0, 'tool/call');
+  f.proof.valid = false; await f.event(1, 'tool/call'); await f.event(2, 'tool/call');
+  f.proof.valid = true; f.proof.completed = [{ turn: 1, sourceSeq: 3 }];
+  await f.event(3, 'turn/end', { turn: 1, completed: true });
+  const page = await f.feed.page(f.device.deviceId, f.head);
+  assert.deepEqual(page.items.map(e => e.kind), ['answer-finished']);
+  assert.equal(f.feed.coverage, 'ready');
+});
+
+test('a live terminal without an exact completed pair remains a sticky gap', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const f = await fixture(t); await f.feed.idle();
+  f.proof.valid = false;
+  await f.event(0, 'turn/end', { turn: 1, completed: true });
+  assert.equal((await f.feed.page(f.device.deviceId, f.head)).items.length, 0);
+  for (let pass = 0; pass < 9; pass++) { t.mock.timers.tick(60000); await f.feed.idle(); }
+  assert.equal(f.feed.coverage, 'degraded', 'a rejected live event is not forgotten by retry counting');
 });
 
 test('coverage recovers from a sequence gap only after a successful authoritative reconcile', async t => {
@@ -374,6 +452,16 @@ test('completion requires completed terminal event and a committed answer in tha
   assert.equal(page.items[0].turn, 3);
 });
 
+test('invalid evidence cannot clear an attention episode', async t => {
+  const f = await fixture(t); f.proof.pending = true;
+  await f.event(0, 'approval/asked');
+  f.proof.pending = false; f.proof.valid = false;
+  await f.event(1, 'tool/result');
+  const page = await f.feed.page(f.device.deviceId, f.head);
+  assert.deepEqual(page.items.map(e => e.kind), ['attention-needed']);
+  assert.equal(f.feed.coverage, 'degraded');
+});
+
 test('proved attention coalesces and authoritative resolution clears the same episode', async t => {
   const f = await fixture(t); f.proof.pending = true;
   await f.event(0, 'approval/asked'); await f.event(1, 'tool/call');
@@ -416,7 +504,7 @@ test('point page does not consume a new-session commit that races its authority 
 
 test('disable cancels a held live proof and persists a safe degraded reason across feed instances', async t => {
   const f = await fixture(t); await f.feed.idle();
-  f.proof.valid = false; await f.event(0, 'tool/call');
+  f.proof.valid = false; await f.event(0, 'turn/end', { turn: 1, completed: true });
   assert.equal(f.state.readNotificationState<any>('diagnostics').lastReason, 'proof_invalid');
   const entered = Promise.withResolvers<void>(), gate = Promise.withResolvers<void>();
   f.source.evidence = async () => { entered.resolve(); await gate.promise; return { ...f.proof, valid: true, completed: [{ turn: 1, sourceSeq: 1 }] }; };

@@ -5,6 +5,101 @@ import org.junit.Test
 import java.util.concurrent.TimeUnit
 
 class MarkdownParserTest {
+    @Test fun `block chunks keep emoji before across and after the UTF16 boundary intact`() {
+        for (offset in listOf(8190, 8191, 8192)) {
+            val value = "x".repeat(offset) + "\uD83D\uDE00tail"
+            for (source in listOf(value, "```kotlin\n$value\n```", "- $value", "> $value")) {
+                val document = parseMarkdown(source)
+                val texts = document.blocks.flatMap(::blockTexts)
+                assertEquals(value, texts.joinToString(""))
+                assertEquals(if (offset == 8190) 8192 else offset, texts.first().length)
+                assertTrue(texts.all { it.length <= 8192 })
+                assertFalse(document.truncated)
+                assertWellFormedSurrogates(document)
+                document.blocks.filterIsInstance<MarkdownBlock.Code>().forEach {
+                    assertEquals(value, it.copyText)
+                    assertTrue(it.closed)
+                }
+            }
+        }
+    }
+
+    @Test fun `overall text cap keeps emoji before across and after its boundary intact`() {
+        for ((value, expected) in emojiCutCases(131_072)) {
+            val document = parseMarkdown(value)
+            assertEquals(expected, document.blocks.flatMap(::blockTexts).joinToString(""))
+            assertTrue(document.truncated)
+            assertWellFormedSurrogates(document)
+        }
+        val exact = "x".repeat(131_070) + "\uD83D\uDE00"
+        val document = parseMarkdown(exact)
+        assertEquals(exact, document.blocks.flatMap(::blockTexts).joinToString(""))
+        assertFalse(document.truncated)
+        assertWellFormedSurrogates(document)
+    }
+
+    @Test fun `heading cap keeps emoji before across and after its boundary intact`() {
+        for ((value, expected) in emojiCutCases(8192)) {
+            val document = parseMarkdown("# $value")
+            assertEquals(MarkdownBlock.Heading(1, expected), document.blocks.single())
+            assertTrue(document.truncated)
+            assertWellFormedSurrogates(document)
+        }
+    }
+
+    @Test fun `table header and row cell caps keep emoji before across and after their boundary intact`() {
+        for ((value, expected) in emojiCutCases(8192)) {
+            val document = parseMarkdown("$value | header\n--- | ---\n$value | row")
+            assertEquals(
+                MarkdownBlock.Table(listOf(expected, "header"), listOf(listOf(expected, "row"))),
+                document.blocks.single(),
+            )
+            assertTrue(document.truncated)
+            assertWellFormedSurrogates(document)
+        }
+    }
+
+    @Test fun `fence language cap keeps emoji before across and after its boundary intact`() {
+        for ((value, expected) in emojiCutCases(40)) {
+            val document = parseMarkdown("```$value\ncode\n```")
+            assertEquals(MarkdownBlock.Code(expected, "code", true), document.blocks.single())
+            assertFalse(document.truncated)
+            assertWellFormedSurrogates(document)
+        }
+    }
+
+    private fun emojiCutCases(limit: Int): List<Pair<String, String>> = listOf(
+        ("x".repeat(limit - 2) + "\uD83D\uDE00tail") to ("x".repeat(limit - 2) + "\uD83D\uDE00"),
+        ("x".repeat(limit - 1) + "\uD83D\uDE00tail") to "x".repeat(limit - 1),
+        ("x".repeat(limit) + "\uD83D\uDE00tail") to "x".repeat(limit),
+    )
+
+    private fun blockTexts(block: MarkdownBlock): List<String> = when (block) {
+        is MarkdownBlock.Heading -> listOf(block.text)
+        is MarkdownBlock.Paragraph -> listOf(block.text)
+        is MarkdownBlock.Code -> listOf(block.text)
+        is MarkdownBlock.ListEntry -> listOf(block.text)
+        is MarkdownBlock.Quote -> listOf(block.text)
+        is MarkdownBlock.Table -> block.header + block.rows.flatten()
+        MarkdownBlock.Rule -> emptyList()
+    }
+
+    private fun assertWellFormedSurrogates(document: MarkdownDocument) {
+        val texts = document.blocks.flatMap { block ->
+            blockTexts(block) + if (block is MarkdownBlock.Code) listOf(block.language, block.copyText) else emptyList()
+        }
+        texts.forEach { text ->
+            text.forEachIndexed { index, char ->
+                if (char.isHighSurrogate()) {
+                    assertTrue("Unpaired high surrogate at $index", text.getOrNull(index + 1)?.isLowSurrogate() == true)
+                }
+                if (char.isLowSurrogate()) {
+                    assertTrue("Unpaired low surrogate at $index", text.getOrNull(index - 1)?.isHighSurrogate() == true)
+                }
+            }
+        }
+    }
+
     @Test fun `table pipes inside escapes or matching code spans stay in their cell`() {
         val table = parseMarkdown("| Name | Value |\n| --- | --- |\n| a\\|b | `c|d` |\n| ``a`|b`` | end\\| |\n| a\\\\| b |") .blocks.single() as MarkdownBlock.Table
         assertEquals(listOf("a\\|b", "`c|d`"), table.rows[0])

@@ -192,6 +192,7 @@ internal fun safeErrorResource(key: String): Int = when (key) {
     "network_unavailable" -> R.string.mobile_error_network_unavailable
     "tls_failed" -> R.string.mobile_error_tls_failed
     "rate_limited" -> R.string.mobile_error_rate_limited
+    "recovery_hold" -> R.string.mobile_error_recovery_hold
     "host_error" -> R.string.mobile_error_host_error
     "chat_unavailable" -> R.string.mobile_chat_unavailable_title
     "storage_failed" -> R.string.mobile_error_storage_failed

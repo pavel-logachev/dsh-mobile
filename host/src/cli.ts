@@ -48,7 +48,7 @@ async function waitPublication(state: HostState, routeId: string, accessId: stri
   }
   throw new HostError('unavailable');
 }
-const HELP = `DSH Mobile local administration (no remote admin listener)\n\nsetup-direct --config <new-private-dir/host.json> --host <DNS-or-IP> [--host <SAN>...]\n     [--port 19445] [--bind 0.0.0.0] [--dsh-version auto|<verified-version>] [--openssl <executable>]\ninit --config <private.json> --workspace <directory> [--dev-http]\n     [--host-name <name>] [--bind <IP>] [--port <port>]\n     [--cert <PEM> --key <PEM>] [--url <HTTPS URL>] [--include-certificate]\npair --config <private.json> --read all|<ids> [--execute all|<ids>] [--ttl <seconds>] [--url <URL>] (--qr and/or --output <private-invitations/file.json>)\nremote-pair --config <private.json> --read all|<ids> [--execute all|<ids>] --output <private-invitations/file.json> [--qr]\ngrant --config <private.json> --device <id> --read all|<ids> [--execute all|<ids>]\nremote-status --config <private.json>\ndevices --config <private.json>\nrevoke --config <private.json> --device <id>\n\nRegistry mode accepts all only; explicit IDs require explicit-list mode.\nOmitted --execute means read-only, including grant replacement.\nPair requires explicit --qr and/or --output; remote-pair requires --output. No offer is created without opt-in.\nInvitation JSON is never printed to stdout. QR/private files contain one-use secrets; keep them private.\nsetup-direct requires OpenSSL 3 for P-256 X.509; Node 24 alone cannot create certificates.\nQR uses dshm1 zlib/base64url, correction M. No OS trust or networking is changed.\n`;
+const HELP = `DSH Mobile local administration (no remote admin listener)\n\nsetup-direct --config <new-private-dir/host.json> --host <DNS-or-IP> [--host <SAN>...]\n     [--port 19445] [--bind 0.0.0.0] [--dsh-version auto|<verified-version>] [--openssl <executable>]\ninit --config <private.json> --workspace <directory> [--dev-http]\n     [--host-name <name>] [--bind <IP>] [--port <port>]\n     [--cert <PEM> --key <PEM>] [--url <HTTPS URL>] [--include-certificate]\npair --config <private.json> --read all|<ids> [--execute all|<ids>] [--ttl <seconds>] [--url <URL>] (--qr and/or --output <private-invitations/file.json>)\nremote-pair --config <private.json> --read all|<ids> [--execute all|<ids>] --output <private-invitations/file.json> [--qr]\ngrant --config <private.json> --device <id> --read all|<ids> [--execute all|<ids>]\nremote-status --config <private.json>\ndevices --config <private.json>\nrevoke --config <private.json> --device <id>\nrecovery-status --config <private.json>\nrecovery-hold --config <private.json> [--reason <text>]\nrecovery-release --config <private.json> --new-epoch\n\nRegistry mode accepts all only; explicit IDs require explicit-list mode.\nOmitted --execute means read-only, including grant replacement.\nPair requires explicit --qr and/or --output; remote-pair requires --output. No offer is created without opt-in.\nInvitation JSON is never printed to stdout. QR/private files contain one-use secrets; keep them private.\nrecovery-hold blocks new commands while receipts and history stay readable; recovery-release requires --new-epoch\nand records an operator decision, never proof that earlier commands did not execute.\nsetup-direct requires OpenSSL 3 for P-256 X.509; Node 24 alone cannot create certificates.\nQR uses dshm1 zlib/base64url, correction M. No OS trust or networking is changed.\n`;
 function argumentsFor(argv: string[]) {
   const command = argv[0] ?? 'help';
   const flags = new Map<string, string | true>();
@@ -57,7 +57,7 @@ function argumentsFor(argv: string[]) {
     const flag = argv[index]!;
     if (flag === '--host' && command === 'setup-direct') { const host = argv[++index]; if (!host || host.startsWith('--')) throw new HostError('invalid_request'); hosts.push(host); continue; }
     if (!flag.startsWith('--') || flags.has(flag)) throw new HostError('invalid_request');
-    if (['--dev-http', '--include-certificate', '--qr'].includes(flag)) flags.set(flag, true);
+    if (['--dev-http', '--include-certificate', '--qr', '--new-epoch'].includes(flag)) flags.set(flag, true);
     else { const value = argv[++index]; if (!value || value.startsWith('--')) throw new HostError('invalid_request'); flags.set(flag, value); }
   }
   return { command, flags, hosts };
@@ -90,7 +90,7 @@ export async function runAdminCli(argv: string[], io: AdminIo = { out: text => p
   try {
     const { command, flags, hosts } = argumentsFor(argv);
     if (command === 'help' || command === '--help') { io.out(HELP); return 0; }
-    const known = command === 'verify-config' ? ['--config'] : command === 'setup-direct' ? ['--config', '--port', '--bind', '--host-name', '--dsh-version', '--openssl'] : command === 'init' ? ['--config', '--workspace', '--dev-http', '--host-name', '--bind', '--port', '--cert', '--key', '--url', '--include-certificate'] : command === 'pair' ? ['--config', '--read', '--execute', '--ttl', '--url', '--qr', '--output'] : command === 'remote-pair' ? ['--config', '--read', '--execute', '--ttl', '--output', '--qr'] : command === 'grant' ? ['--config', '--device', '--read', '--execute'] : command === 'remote-status' ? ['--config'] : command === 'devices' ? ['--config'] : command === 'revoke' ? ['--config', '--device'] : [];
+    const known = command === 'verify-config' ? ['--config'] : command === 'setup-direct' ? ['--config', '--port', '--bind', '--host-name', '--dsh-version', '--openssl'] : command === 'init' ? ['--config', '--workspace', '--dev-http', '--host-name', '--bind', '--port', '--cert', '--key', '--url', '--include-certificate'] : command === 'pair' ? ['--config', '--read', '--execute', '--ttl', '--url', '--qr', '--output'] : command === 'remote-pair' ? ['--config', '--read', '--execute', '--ttl', '--output', '--qr'] : command === 'grant' ? ['--config', '--device', '--read', '--execute'] : command === 'remote-status' ? ['--config'] : command === 'devices' ? ['--config'] : command === 'revoke' ? ['--config', '--device'] : command === 'recovery-status' ? ['--config'] : command === 'recovery-hold' ? ['--config', '--reason'] : command === 'recovery-release' ? ['--config', '--new-epoch'] : [];
     if (!known.length || [...flags.keys()].some(flag => !known.includes(flag))) throw new HostError('invalid_request');
     // Refuse implicit secret output before loading config or creating state/offers/grants.
     if ((command === 'pair' && flags.get('--qr') !== true && !flags.has('--output')) || (command === 'remote-pair' && !flags.has('--output'))) throw new HostError('invitation_output_required');
@@ -134,9 +134,22 @@ export async function runAdminCli(argv: string[], io: AdminIo = { out: text => p
       const checked = await prepareConfiguration(raw);
       io.out(JSON.stringify({ valid: true, baseUrl: checked.config.publicUrl, workspaceSource: checked.config.workspaceSource ?? 'explicit', port: checked.config.port }) + '\n'); return 0;
     }
-    const config = await loadConfiguration(configPath, { administrationOnly: command === 'devices' || command === 'revoke' || command === 'remote-status' || command === 'grant', allowInsecureRelayLoopback: options.allowInsecureRelayLoopback === true });
+    const config = await loadConfiguration(configPath, { administrationOnly: command === 'devices' || command === 'revoke' || command === 'remote-status' || command === 'grant' || command === 'recovery-status' || command === 'recovery-hold' || command === 'recovery-release', allowInsecureRelayLoopback: options.allowInsecureRelayLoopback === true });
     if (!isAbsolute(config.statePath)) throw new HostError('invalid_config');
     state = new HostState(config.statePath);
+    if (command === 'recovery-status') {
+      io.out(JSON.stringify({ ...state.ledgerStatus(), recentCommands: state.recentCommands(20) }) + '\n'); return 0;
+    }
+    if (command === 'recovery-hold') {
+      const status = state.setRecoveryHold(flags.has('--reason') ? value(flags, '--reason') : 'operator_request');
+      io.out(JSON.stringify(status) + '\n'); return 0;
+    }
+    if (command === 'recovery-release') {
+      if (flags.get('--new-epoch') !== true) throw new HostError('invalid_request');
+      const status = state.releaseRecovery();
+      io.error('Ledger released with a new epoch. This records the operator decision; it does not prove earlier commands never executed.\n');
+      io.out(JSON.stringify(status) + '\n'); return 0;
+    }
     if (command === 'remote-status') {
       if (!config.relay) {
         io.out(JSON.stringify({ mode: 'direct', baseUrl: config.publicUrl, bind: config.bind, port: config.port, workspaceSource: config.workspaceSource ?? 'explicit', message: 'Configuration only; use Get-NetTCPConnection to verify listener readiness.' }) + '\n'); return 0;

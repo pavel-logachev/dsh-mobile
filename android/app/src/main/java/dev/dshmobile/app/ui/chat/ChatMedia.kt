@@ -41,24 +41,130 @@ import dev.dshmobile.app.ui.theme.IconSize
 import dev.dshmobile.app.ui.theme.Motion
 import dev.dshmobile.app.ui.theme.Spacing
 import dev.dshmobile.app.ui.theme.motionEnabled
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.launch
 
 /** Screen-owned, bounded memory cache. Nothing private is persisted in cleartext. */
-internal class ImageMemoryCache(private val fetch: suspend (String) -> ByteArray) {
-    private val lane = Mutex()
+internal class ImageMemoryCache(
+    dispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val fetch: suspend (String) -> ByteArray,
+) : RememberObserver {
+    // This monitor protects metadata only: never fetch, await or decode under it.
+    private val lane = Any()
     private val entries = LinkedHashMap<String, ByteArray>(16, 0.75f, true)
-    suspend fun get(id: String): ByteArray = lane.withLock {
-        entries[id]?.let { return@withLock it }
-        val bytes = fetch(id)
-        while (entries.isNotEmpty() && entries.values.sumOf { it.size.toLong() } + bytes.size > 40L * 1024 * 1024) entries.remove(entries.keys.first())
-        entries[id] = bytes
-        bytes
+    private var entryBytes = 0L
+    private val flights = mutableMapOf<String, Flight>()
+    private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+    private val downloads = Semaphore(2)
+    private var closed = false
+
+    private class Flight {
+        lateinit var task: Deferred<ByteArray>
+        var waiters = 0
     }
+
+    suspend fun get(id: String): ByteArray {
+        currentCoroutineContext().ensureActive()
+        val flight = synchronized(lane) {
+            if (closed) throw CancellationException("Image cache closed")
+            entries[id]?.let { return it }
+            flights.getOrPut(id) {
+                Flight().also { flight ->
+                    // Lazy start keeps even an immediate dispatcher outside the monitor.
+                    flight.task = scope.async(start = CoroutineStart.LAZY) {
+                        try {
+                            downloads.withPermit {
+                                ensureActive()
+                                val bytes = fetch(id)
+                                ensureActive()
+                                synchronized(lane) {
+                                    if (closed || flights[id] !== flight) throw CancellationException("Image request released")
+                                    // Oversized responses can be viewed, but must not exceed the cache budget.
+                                    if (bytes.size <= MAX_BYTES) {
+                                        while (entries.isNotEmpty() && entryBytes + bytes.size > MAX_BYTES) {
+                                            entryBytes -= entries.remove(entries.keys.first())!!.size
+                                        }
+                                        entries[id] = bytes
+                                        entryBytes += bytes.size
+                                    }
+                                }
+                                bytes
+                            }
+                        } finally {
+                            synchronized(lane) { if (flights[id] === flight) flights.remove(id) }
+                        }
+                    }
+                }
+            }.also { it.waiters++ }
+        }
+        try {
+            flight.task.start()
+            return flight.task.await()
+        } finally {
+            val cancel = synchronized(lane) {
+                flight.waiters--
+                (flight.waiters == 0).also { last ->
+                    if (last && flights[id] === flight) flights.remove(id)
+                }
+            }
+            if (cancel) flight.task.cancel()
+        }
+    }
+
+    fun close() {
+        synchronized(lane) {
+            closed = true
+            entries.clear()
+            entryBytes = 0
+            flights.clear()
+        }
+        scope.cancel()
+    }
+
+    override fun onRemembered() = Unit
+    override fun onForgotten() = close()
+    override fun onAbandoned() = close()
+
+    private companion object { const val MAX_BYTES = 40L * 1024 * 1024 }
 }
+
+/** A relay or upstream image read can stall; keep the preview spinner bounded and retry once. */
+internal suspend fun fetchImagePreview(fetch: suspend () -> ByteArray): ByteArray {
+    var last: Throwable? = null
+    repeat(2) { attempt ->
+        try {
+            return withTimeout(PREVIEW_FETCH_TIMEOUT_MS) { fetch() }
+        } catch (timeout: TimeoutCancellationException) {
+            last = timeout
+            if (attempt == 0) delay(PREVIEW_RETRY_DELAY_MS)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            last = failure
+            if (attempt == 0) delay(PREVIEW_RETRY_DELAY_MS)
+        }
+    }
+    throw last ?: IllegalStateException("image unavailable")
+}
+
+private const val PREVIEW_FETCH_TIMEOUT_MS = 12_000L
+private const val PREVIEW_RETRY_DELAY_MS = 750L
 
 @Composable
 private fun MediaImage(ref: AttachmentRef, cache: ImageMemoryCache, modifier: Modifier, description: String, onOpen: () -> Unit) {
@@ -66,7 +172,7 @@ private fun MediaImage(ref: AttachmentRef, cache: ImageMemoryCache, modifier: Mo
     var failed by remember(ref.id) { mutableStateOf(false) }
     val bitmap by produceState<Bitmap?>(null, ref.id, retry) {
         failed = false
-        try { value = decodeImage(cache.get(ref.id), 1024) } catch (_: Exception) { failed = true }
+        try { value = decodeImage(fetchImagePreview { cache.get(ref.id) }, 1024) } catch (_: Exception) { failed = true }
     }
     val retryLabel = stringResource(R.string.mobile_media_retry)
     Box(modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest).clickable { if (failed) retry++ else if (bitmap != null) onOpen() }

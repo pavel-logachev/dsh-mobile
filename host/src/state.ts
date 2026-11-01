@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync, openSync, closeSync, chmodSync } from 'node:fs';
+import { mkdirSync, openSync, closeSync, chmodSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { HostError } from './errors.ts';
@@ -12,11 +12,18 @@ export interface PairingResult { deviceId: string; deviceToken: string }
 export interface RemotePairingOffer extends PairingOffer { relayAccess: RelayAccess }
 export interface RemotePairingResult extends PairingResult { relayAccess: RelayAccess }
 export interface RelayPublication { published: boolean; generation: string | null; revoked: boolean; expiresAt: number }
-export interface StoredCommand { receipt: CommandReceipt; httpStatus: number; workspaceId: string | null }
+export interface StoredCommand { receipt: CommandReceipt; httpStatus: number; workspaceId: string | null; sessionId: string | null }
 export interface CommandAdmission extends StoredCommand { fresh: boolean }
+export interface LedgerStatus {
+  ledgerId: string; epoch: number; hold: boolean; holdReason: string | null;
+  admittedCount: number; completedCount: number; newestAt: number; updatedAt: number;
+  witnessPresent: boolean; witnessProblem: 'none' | 'missing' | 'witness_corrupt' | 'ledger_replaced' | 'rollback';
+}
+export interface RecentCommand { requestId: string; operation: string; status: string; updatedAt: number; workspaceId: string | null; sessionId: string | null }
 export interface StateOptions { now?: () => number }
 
 type Row = Record<string, unknown>;
+type LedgerWitness = { version: 1; ledgerId: string; epoch: number; admittedCount: number; completedCount: number; newestAt: number };
 const TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export function isRequestId(value: unknown): value is string { return typeof value === 'string' && UUID.test(value); }
@@ -62,17 +69,25 @@ export class HostState {
       ) STRICT;
       CREATE TABLE IF NOT EXISTS commands (
         device_id TEXT NOT NULL REFERENCES devices(id), request_id TEXT NOT NULL,
-        operation TEXT NOT NULL, payload_hash TEXT NOT NULL, workspace_id TEXT,
+        operation TEXT NOT NULL, payload_hash TEXT NOT NULL, workspace_id TEXT, session_id TEXT,
         status TEXT NOT NULL CHECK(status IN ('pending','dispatching','accepted','rejected','uncertain')),
         result TEXT, error TEXT, http_status INTEGER NOT NULL, updated_at INTEGER NOT NULL,
         PRIMARY KEY(device_id, request_id)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS ledger_meta (
+        id INTEGER PRIMARY KEY CHECK(id=1), ledger_id TEXT NOT NULL, epoch INTEGER NOT NULL CHECK(epoch >= 1),
+        hold INTEGER NOT NULL CHECK(hold IN (0,1)), hold_reason TEXT,
+        admitted_count INTEGER NOT NULL CHECK(admitted_count >= 0), completed_count INTEGER NOT NULL CHECK(completed_count >= 0),
+        newest_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      ) STRICT;
       CREATE TABLE IF NOT EXISTS mobile_created_sessions (id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS notification_state (id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+      CREATE TABLE IF NOT EXISTS notification_settings (device_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), settings TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS runtime_lock (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, pid INTEGER NOT NULL) STRICT;
     `);
     // Early development databases have no scope column; unknown prior scope fails closed.
     if (!this.db.prepare('PRAGMA table_info(commands)').all().some(column => column.name === 'workspace_id')) this.db.exec('ALTER TABLE commands ADD COLUMN workspace_id TEXT');
+    if (!this.db.prepare('PRAGMA table_info(commands)').all().some(column => column.name === 'session_id')) this.db.exec('ALTER TABLE commands ADD COLUMN session_id TEXT');
     if (!this.db.prepare('PRAGMA table_info(devices)').all().some(column => column.name === 'publication_pending')) this.db.exec('ALTER TABLE devices ADD COLUMN publication_pending INTEGER NOT NULL DEFAULT 0');
     this.db.exec(`CREATE TABLE IF NOT EXISTS relay_grants (
       access_id TEXT PRIMARY KEY, route_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
@@ -83,6 +98,21 @@ export class HostState {
     ) STRICT;
     CREATE TABLE IF NOT EXISTS relay_status (route_id TEXT PRIMARY KEY, connected INTEGER NOT NULL, ready INTEGER NOT NULL, generation TEXT, updated_at INTEGER NOT NULL) STRICT;
     `);
+    // Upgrade from journals written before the separate settings table existed. This
+    // is one bounded startup scan, never part of an event hot path.
+    this.transaction(() => {
+      const rows = this.db.prepare("SELECT id,value FROM notification_state WHERE id LIKE 'device:%'").all();
+      const upsert = this.db.prepare(`INSERT INTO notification_settings(device_id,enabled,settings) VALUES (?,?,?)
+        ON CONFLICT(device_id) DO UPDATE SET enabled=excluded.enabled, settings=excluded.settings`);
+      for (const row of rows) {
+        try {
+          const journal = JSON.parse(String(row.value)) as { settings?: { enabled?: unknown } } | undefined;
+          const settings = journal?.settings;
+          if (!settings || typeof settings.enabled !== 'boolean') continue;
+          upsert.run(String(row.id).slice(7), settings.enabled ? 1 : 0, JSON.stringify(settings));
+        } catch { /* A malformed old journal stays inert; it cannot enable notifications. */ }
+      }
+    });
     this.transaction(() => {
       const version = Number(this.db.prepare('PRAGMA user_version').get()?.user_version);
       if (version < 4) {
@@ -100,6 +130,13 @@ export class HostState {
         this.db.exec('PRAGMA user_version = 4');
       }
     });
+    this.transaction(() => {
+      if (this.db.prepare('SELECT id FROM ledger_meta WHERE id=1').get()) return;
+      const counts = this.db.prepare("SELECT count(*) AS total, coalesce(sum(CASE WHEN status IN ('accepted','rejected','uncertain') THEN 1 ELSE 0 END),0) AS completed, coalesce(max(updated_at),0) AS newest FROM commands").get();
+      this.db.prepare('INSERT INTO ledger_meta (id,ledger_id,epoch,hold,hold_reason,admitted_count,completed_count,newest_at,updated_at) VALUES (1,?,1,0,NULL,?,?,?,?)')
+        .run(randomUUID(), Number(counts?.total ?? 0), Number(counts?.completed ?? 0), Number(counts?.newest ?? 0), this.now());
+    });
+    this.verifyLedgerWitness();
   }
 
   private transaction<T>(fn: () => T): T {
@@ -108,16 +145,142 @@ export class HostState {
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
+  private ledgerRow(): Row {
+    const row = this.db.prepare('SELECT * FROM ledger_meta WHERE id=1').get();
+    if (!row) throw new HostError('internal_error');
+    return row;
+  }
+  private ledgerWitnessPath(): string { return this.path + '.ledger.json'; }
+  private readLedgerWitness(): { present: boolean; invalid: boolean; value: LedgerWitness | undefined } {
+    let text: string;
+    try { text = readFileSync(this.ledgerWitnessPath(), 'utf8'); }
+    catch (error) { return { present: (error as NodeJS.ErrnoException).code !== 'ENOENT', invalid: (error as NodeJS.ErrnoException).code !== 'ENOENT', value: undefined }; }
+    try {
+      const candidate = JSON.parse(text) as Record<string, unknown>;
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate) || candidate.version !== 1 ||
+        typeof candidate.ledgerId !== 'string' || !isRequestId(candidate.ledgerId) ||
+        !Number.isSafeInteger(candidate.epoch) || Number(candidate.epoch) < 1 ||
+        !Number.isSafeInteger(candidate.admittedCount) || Number(candidate.admittedCount) < 0 ||
+        !Number.isSafeInteger(candidate.completedCount) || Number(candidate.completedCount) < 0 ||
+        !Number.isSafeInteger(candidate.newestAt) || Number(candidate.newestAt) < 0) return { present: true, invalid: true, value: undefined };
+      return { present: true, invalid: false, value: {
+        version: 1, ledgerId: candidate.ledgerId, epoch: Number(candidate.epoch), admittedCount: Number(candidate.admittedCount),
+        completedCount: Number(candidate.completedCount), newestAt: Number(candidate.newestAt),
+      } };
+    } catch { return { present: true, invalid: true, value: undefined }; }
+  }
+  /**
+   * The witness is a small sidecar outside the SQLite backup. A witness that knows more
+   * admissions/completions than the database proves that the database was restored from
+   * an older copy. It is deliberately best-effort: losing the witness degrades detection.
+   */
+  private witnessProblem(row: Row): LedgerStatus['witnessProblem'] {
+    const witness = this.readLedgerWitness();
+    if (!witness.present) return 'missing';
+    if (witness.invalid || !witness.value) return 'witness_corrupt';
+    if (witness.value.ledgerId !== String(row.ledger_id)) return 'ledger_replaced';
+    if (witness.value.epoch > Number(row.epoch) || witness.value.admittedCount > Number(row.admitted_count) ||
+      witness.value.completedCount > Number(row.completed_count)) return 'rollback';
+    return 'none';
+  }
+  private writeLedgerWitness(row: Row): void {
+    const target = this.ledgerWitnessPath(), temporary = `${target}.tmp-${process.pid}-${randomUUID()}`;
+    const value: LedgerWitness = { version: 1, ledgerId: String(row.ledger_id), epoch: Number(row.epoch),
+      admittedCount: Number(row.admitted_count), completedCount: Number(row.completed_count), newestAt: Number(row.newest_at) };
+    const current = this.readLedgerWitness().value;
+    // Concurrent settlements can finish out of order; never let an older snapshot overwrite a newer witness.
+    if (current && current.ledgerId === value.ledgerId && current.epoch === value.epoch &&
+      (current.admittedCount > value.admittedCount || current.completedCount > value.completedCount)) return;
+    try {
+      writeFileSync(temporary, JSON.stringify(value) + '\n', { encoding: 'utf8', mode: 0o600 });
+      renameSync(temporary, target);
+      if (process.platform !== 'win32') chmodSync(target, 0o600);
+    } catch { /* A failed witness write degrades rollback detection; it never blocks admitted work. */ }
+  }
+  private verifyLedgerWitness(): void {
+    const row = this.ledgerRow(), problem = this.witnessProblem(row);
+    // Seed a first run or an upgraded database. A merely stale (lower) witness is safe and
+    // must not be rewritten by a concurrent read-only admin open; runtime sync does that.
+    if (problem === 'missing') { this.writeLedgerWitness(row); return; }
+    if (problem === 'none') return;
+    // Keep the contradictory witness as evidence; an operator must release the ledger explicitly.
+    if (Number(row.hold) === 0) this.db.prepare('UPDATE ledger_meta SET hold=1,hold_reason=?,updated_at=? WHERE id=1').run(problem, this.now());
+  }
+  private syncLedgerWitness(): void {
+    const row = this.ledgerRow(), problem = this.witnessProblem(row);
+    if (problem === 'none' || problem === 'missing') this.writeLedgerWitness(row);
+  }
+  /** Reads without changing state; safe for CLI status while a runtime owns the host. */
+  ledgerStatus(): LedgerStatus {
+    const row = this.ledgerRow(), witness = this.readLedgerWitness();
+    return {
+      ledgerId: String(row.ledger_id), epoch: Number(row.epoch), hold: Number(row.hold) === 1,
+      holdReason: row.hold_reason === null ? null : String(row.hold_reason),
+      admittedCount: Number(row.admitted_count), completedCount: Number(row.completed_count),
+      newestAt: Number(row.newest_at), updatedAt: Number(row.updated_at),
+      witnessPresent: witness.present, witnessProblem: this.witnessProblem(row),
+    };
+  }
+  recentCommands(limit = 20): RecentCommand[] {
+    const bounded = Math.min(Math.max(Math.trunc(limit), 1), 100);
+    return this.db.prepare('SELECT request_id,operation,status,updated_at,workspace_id,session_id FROM commands ORDER BY updated_at DESC, rowid DESC LIMIT ?')
+      .all(bounded).map(row => ({
+        requestId: String(row.request_id), operation: String(row.operation), status: String(row.status), updatedAt: Number(row.updated_at),
+        workspaceId: row.workspace_id === null ? null : String(row.workspace_id), sessionId: row.session_id === null ? null : String(row.session_id),
+      }));
+  }
+  /** Blocks only fresh admissions; known receipts remain readable and replayable. */
+  assertMutationAllowed(): void { if (Number(this.ledgerRow().hold) === 1) throw new HostError('recovery_hold'); }
+  setRecoveryHold(reason = 'operator_request'): LedgerStatus {
+    if (typeof reason !== 'string' || !reason.trim() || Buffer.byteLength(reason, 'utf8') > 256 || /[\x00-\x1f\x7f]/.test(reason)) throw new HostError('invalid_request');
+    this.transaction(() => { this.db.prepare('UPDATE ledger_meta SET hold=1,hold_reason=?,updated_at=? WHERE id=1').run(reason.trim(), this.now()); });
+    const row = this.ledgerRow(), problem = this.witnessProblem(row);
+    if (problem === 'none' || problem === 'missing') this.writeLedgerWitness(row);
+    return this.ledgerStatus();
+  }
+  /**
+   * Explicit operator acknowledgement after reconciling uncertain receipts against DSH.
+   * The epoch rotation is bookkeeping, not proof that earlier commands never executed.
+   */
+  releaseRecovery(): LedgerStatus {
+    this.transaction(() => {
+      if (Number(this.ledgerRow().hold) !== 1) throw new HostError('conflict');
+      this.db.prepare('UPDATE ledger_meta SET hold=0,hold_reason=NULL,epoch=epoch+1,updated_at=? WHERE id=1').run(this.now());
+    });
+    // A release intentionally resets the witness to the restored cut; the epoch records the decision.
+    this.writeLedgerWitness(this.ledgerRow());
+    return this.ledgerStatus();
+  }
+
   /** Notification metadata only; bounded by the feed before committing. Uses this same SQLite DB. */
   readNotificationState<T>(id: string): T | undefined {
     const row = this.db.prepare('SELECT value FROM notification_state WHERE id=?').get(id);
     return row ? JSON.parse(String(row.value)) as T : undefined;
   }
+  private readonly notificationRevisions = new Map<string, number>();
+  notificationRevision(id: string): number { return this.notificationRevisions.get(id) ?? 0; }
+  notificationEnabledDeviceIds(): string[] {
+    return this.db.prepare(`SELECT s.device_id FROM notification_settings s
+      JOIN devices d ON d.id=s.device_id WHERE s.enabled=1 AND d.revoked_at IS NULL`).all().map(row => String(row.device_id));
+  }
+  notificationEnabledDeviceCount(): number {
+    return Number(this.db.prepare(`SELECT count(*) AS total FROM notification_settings s
+      JOIN devices d ON d.id=s.device_id WHERE s.enabled=1 AND d.revoked_at IS NULL`).get()?.total ?? 0);
+  }
   writeNotificationState(id: string, value: unknown): void { this.writeNotificationStates([[id, value]]); }
   writeNotificationStates(values: [string, unknown][]): void {
     this.transaction(() => {
       const insert = this.db.prepare('INSERT INTO notification_state(id,value) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value');
-      for (const [id, value] of values) insert.run(id, JSON.stringify(value));
+      for (const [id, value] of values) {
+        insert.run(id, JSON.stringify(value)); this.notificationRevisions.set(id, (this.notificationRevisions.get(id) ?? 0) + 1);
+        if (!id.startsWith('device:')) continue;
+        const settings = (value as { settings?: { enabled?: unknown } } | undefined)?.settings;
+        if (settings && typeof settings.enabled === 'boolean') {
+          this.db.prepare(`INSERT INTO notification_settings(device_id,enabled,settings) VALUES (?,?,?)
+            ON CONFLICT(device_id) DO UPDATE SET enabled=excluded.enabled, settings=excluded.settings`)
+            .run(id.slice(7), settings.enabled ? 1 : 0, JSON.stringify(settings));
+        } else this.db.prepare('DELETE FROM notification_settings WHERE device_id=?').run(id.slice(7));
+      }
     });
   }
 
@@ -293,21 +456,26 @@ export class HostState {
   }
   onRevoke(listener: (deviceId: string) => void): () => void { this.revokeListeners.add(listener); return () => this.revokeListeners.delete(listener); }
 
-  admitCommand(deviceId: string, requestId: string, operation: string, payloadHash: string, workspaceId: string | null = null): CommandAdmission {
+  admitCommand(deviceId: string, requestId: string, operation: string, payloadHash: string, workspaceId: string | null = null, sessionId: string | null = null): CommandAdmission {
     if (!isRequestId(requestId) || !/^[a-f0-9]{64}$/.test(payloadHash)) throw new HostError('invalid_request');
     requestId = requestId.toLowerCase();
-    return this.transaction(() => {
+    const admission = this.transaction(() => {
       if (!this.getDevice(deviceId)) throw new HostError('unauthorized');
       const prior = this.db.prepare('SELECT * FROM commands WHERE device_id=? AND request_id=?').get(deviceId, requestId);
       if (prior) {
         if (prior.operation !== operation || prior.payload_hash !== payloadHash) throw new HostError('conflict');
         return { ...this.command(prior), fresh: false };
       }
+      if (Number(this.ledgerRow().hold) === 1) throw new HostError('recovery_hold');
       const updatedAt = this.now();
       // Dispatch intent is committed before any adapter call, including across a process crash.
-      this.db.prepare('INSERT INTO commands (device_id,request_id,operation,payload_hash,workspace_id,status,http_status,updated_at) VALUES (?,?,?,?,?,\'dispatching\',202,?)').run(deviceId, requestId, operation, payloadHash, workspaceId, updatedAt);
-      return { fresh: true, receipt: { requestId, status: 'pending', updatedAt }, httpStatus: 202, workspaceId };
+      this.db.prepare('INSERT INTO commands (device_id,request_id,operation,payload_hash,workspace_id,session_id,status,http_status,updated_at) VALUES (?,?,?,?,?,?,\'dispatching\',202,?)')
+        .run(deviceId, requestId, operation, payloadHash, workspaceId, sessionId, updatedAt);
+      this.db.prepare('UPDATE ledger_meta SET admitted_count=admitted_count+1,newest_at=?,updated_at=? WHERE id=1').run(updatedAt, updatedAt);
+      return { fresh: true, receipt: { requestId, status: 'pending' as const, updatedAt }, httpStatus: 202, workspaceId, sessionId };
     });
+    if (admission.fresh) this.syncLedgerWitness();
+    return admission;
   }
   /** Bounded recent prompt identities; no text or foreign-device IDs are read. */
   promptCommandIds(deviceId: string): string[] {
@@ -321,17 +489,25 @@ export class HostState {
     const receipt: CommandReceipt = { requestId: String(row.request_id), status: row.status === 'dispatching' ? 'pending' : row.status as CommandReceipt['status'], updatedAt: Number(row.updated_at) };
     if (row.result !== null) receipt.result = JSON.parse(String(row.result)) as NonNullable<CommandReceipt['result']>;
     if (row.error !== null) receipt.error = JSON.parse(String(row.error)) as NonNullable<CommandReceipt['error']>;
-    return { receipt, httpStatus: Number(row.http_status), workspaceId: row.workspace_id === null ? null : String(row.workspace_id) };
+    return { receipt, httpStatus: Number(row.http_status), workspaceId: row.workspace_id === null ? null : String(row.workspace_id), sessionId: row.session_id === null ? null : String(row.session_id) };
   }
   finishCommand(deviceId: string, requestId: string, status: Exclude<CommandReceipt['status'], 'pending'>, options: { result?: CommandReceipt['result']; error?: CommandReceipt['error']; httpStatus?: number } = {}): StoredCommand {
     const httpStatus = options.httpStatus ?? (status === 'uncertain' ? 202 : status === 'accepted' ? 200 : 400);
-    this.db.prepare("UPDATE commands SET status=?,result=?,error=?,http_status=?,updated_at=? WHERE device_id=? AND request_id=? AND status IN ('pending','dispatching')").run(status, options.result ? JSON.stringify(options.result) : null, options.error ? JSON.stringify(options.error) : null, httpStatus, this.now(), deviceId, requestId.toLowerCase());
-    const result = this.getCommand(deviceId, requestId);
-    if (!result) throw new HostError('not_found');
+    const result = this.transaction(() => {
+      const changed = Number(this.db.prepare("UPDATE commands SET status=?,result=?,error=?,http_status=?,updated_at=? WHERE device_id=? AND request_id=? AND status IN ('pending','dispatching')")
+        .run(status, options.result ? JSON.stringify(options.result) : null, options.error ? JSON.stringify(options.error) : null, httpStatus, this.now(), deviceId, requestId.toLowerCase()).changes);
+      if (changed) this.db.prepare('UPDATE ledger_meta SET completed_count=completed_count+?,newest_at=?,updated_at=? WHERE id=1').run(changed, this.now(), this.now());
+      const stored = this.getCommand(deviceId, requestId);
+      if (!stored) throw new HostError('not_found');
+      return stored;
+    });
+    this.syncLedgerWitness();
     return result;
   }
   recoverUnfinished(): void {
-    this.db.prepare("UPDATE commands SET status='uncertain',http_status=202,updated_at=? WHERE status IN ('pending','dispatching')").run(this.now());
+    const updatedAt = this.now();
+    const changed = Number(this.db.prepare("UPDATE commands SET status='uncertain',http_status=202,updated_at=? WHERE status IN ('pending','dispatching')").run(updatedAt).changes);
+    if (changed) this.db.prepare('UPDATE ledger_meta SET completed_count=completed_count+?,newest_at=?,updated_at=? WHERE id=1').run(changed, updatedAt, updatedAt);
   }
 
   /** A local admin connection never claims this lock or recovers active dispatches. */
@@ -355,6 +531,7 @@ export class HostState {
       });
       this.runtimeLockDb = lock;
       this.runtimeId = owner;
+      this.syncLedgerWitness();
     } catch {
       lock?.close();
       throw new HostError('conflict');

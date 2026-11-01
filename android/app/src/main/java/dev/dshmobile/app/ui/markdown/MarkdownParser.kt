@@ -15,6 +15,20 @@ internal data class InlineSpan(val text: String, val bold: Boolean = false, val 
 private const val MAX_TEXT = 131_072
 private const val MAX_BLOCKS = 512
 private const val BLOCK_TEXT = 8192
+// Limits remain UTF-16 units; move a cut back rather than separating a surrogate pair.
+private fun String.codePointSafeEnd(end: Int): Int =
+    if (end > 0 && end < length && this[end - 1].isHighSurrogate() && this[end].isLowSurrogate()) end - 1 else end
+private fun String.takeCodePointSafe(limit: Int): String = substring(0, codePointSafeEnd(minOf(limit, length)))
+private fun String.chunkedCodePointSafe(): List<String> {
+    val chunks = mutableListOf<String>()
+    var start = 0
+    while (start < length) {
+        val end = codePointSafeEnd(minOf(start + BLOCK_TEXT, length))
+        chunks += substring(start, end)
+        start = end
+    }
+    return chunks
+}
 private data class HeadingMatch(val level: Int, val text: String)
 private fun regexSpace(char: Char): Boolean = char in " \t\u000b\u000c\r\n"
 private fun horizontalSpace(char: Char): Boolean = char == ' ' || char == '\t'
@@ -75,7 +89,7 @@ private fun fence(line: String): FenceMatch? {
     val start = index
     while (index < line.length && line[index] == marker) index++
     if (index - start < 3 || (index until line.length).any { dotLineSeparator(line[it]) }) return null
-    return FenceMatch(marker, index - start, line.substring(index).trim().take(40))
+    return FenceMatch(marker, index - start, line.substring(index).trim().takeCodePointSafe(40))
 }
 private fun rule(line: String): Boolean {
     var index = 0
@@ -145,13 +159,13 @@ private fun tableStart(lines: List<String>, index: Int): Boolean = index + 1 < l
 
 /** Bounded native presentation. HTML is literal, URLs are inert, parsing never performs I/O. */
 internal fun parseMarkdown(text: String): MarkdownDocument {
-    val bounded = text.take(MAX_TEXT).replace("\r\n", "\n").replace('\r', '\n')
+    val bounded = text.takeCodePointSafe(MAX_TEXT).replace("\r\n", "\n").replace('\r', '\n')
     val lines = bounded.split('\n')
     val blocks = mutableListOf<MarkdownBlock>()
     var index = 0
     var truncated = text.length > MAX_TEXT
     fun addChunks(value: String, make: (String) -> MarkdownBlock) {
-        value.chunked(BLOCK_TEXT).ifEmpty { listOf("") }.forEach { chunk ->
+        value.chunkedCodePointSafe().ifEmpty { listOf("") }.forEach { chunk ->
             if (blocks.size < MAX_BLOCKS) blocks += make(chunk) else truncated = true
         }
     }
@@ -180,7 +194,7 @@ internal fun parseMarkdown(text: String): MarkdownDocument {
             }
             heading != null -> {
                 if (heading.text.length > BLOCK_TEXT) truncated = true
-                blocks += MarkdownBlock.Heading(heading.level, heading.text.take(BLOCK_TEXT)); index++
+                blocks += MarkdownBlock.Heading(heading.level, heading.text.takeCodePointSafe(BLOCK_TEXT)); index++
             }
             rule(line) -> { blocks += MarkdownBlock.Rule; index++ }
             list != null -> {
@@ -198,7 +212,7 @@ internal fun parseMarkdown(text: String): MarkdownDocument {
             tableStart(lines, index) -> {
                 val headerCells = tableCells(line)
                 if (headerCells.size > 12) truncated = true
-                val header = headerCells.take(12).map { if (it.length > BLOCK_TEXT) truncated = true; it.take(BLOCK_TEXT) }
+                val header = headerCells.take(12).map { if (it.length > BLOCK_TEXT) truncated = true; it.takeCodePointSafe(BLOCK_TEXT) }
                 val rows = mutableListOf<List<String>>()
                 index += 2
                 while (index < lines.size && lines[index].isNotBlank() && lines[index].contains('|') && rows.size < 64) {
@@ -207,7 +221,7 @@ internal fun parseMarkdown(text: String): MarkdownDocument {
                         List(header.size) {
                             val cell = cells.getOrNull(it).orEmpty()
                             if (cell.length > BLOCK_TEXT) truncated = true
-                            cell.take(BLOCK_TEXT)
+                            cell.takeCodePointSafe(BLOCK_TEXT)
                         }
                     }
                 }

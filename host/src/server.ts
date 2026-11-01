@@ -30,6 +30,8 @@ export interface HostServerOptions {
   state?: HostState;
   /** Tests may shorten this; production heartbeats never exceed twenty seconds. */
   heartbeatMs?: number;
+  /** Test-only bound for one admitted dispatch; production defaults to ten minutes. */
+  dispatchTimeoutMs?: number;
   /** Test-only loopback outer WS. Inner listener always remains HTTPS in relay mode. */
   allowInsecureRelayLoopback?: boolean;
 }
@@ -101,6 +103,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
   const config = prepared.config, adapter = options.adapter;
   const workspaceSource = options.workspaceSource ?? await createWorkspaceSource(config);
   if (options.heartbeatMs !== undefined && (!Number.isInteger(options.heartbeatMs) || options.heartbeatMs < 10 || options.heartbeatMs > 20_000)) throw new HostError('invalid_config');
+  if (options.dispatchTimeoutMs !== undefined && (!Number.isInteger(options.dispatchTimeoutMs) || options.dispatchTimeoutMs < 10 || options.dispatchTimeoutMs > 600_000)) throw new HostError('invalid_config');
   const state = options.state ?? new HostState(config.statePath);
   if (state.path !== config.statePath) { if (!options.state) state.close(); throw new HostError('invalid_config'); }
   const relay = config.relay ? createRelayConnector({ relay: config.relay, state, targetPort: config.port, allowInsecureLoopback: options.allowInsecureRelayLoopback === true }) : undefined;
@@ -115,7 +118,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
   const files = new FileStaging(config.statePath);
   type StagedUpload = { deviceId: string; sessionId: string; workspaceId: string; expiresAt: number; value: UploadedAttachment; filePath?: string; claimed?: boolean };
   const uploads = new Map<string, StagedUpload>();
-  let claimedImageBytes = 0, attachmentDispatches = 0;
+  let claimedImageBytes = 0, attachmentDispatches = 0, activeDispatches = 0;
   const cleanups = new Set<Promise<void>>();
   function removeUpload(id: string): void {
     const upload = uploads.get(id); if (!upload) return; uploads.delete(id);
@@ -166,6 +169,8 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
   }
   function dispatch(deviceId: string, command: Command): Promise<StoredCommand | undefined> {
     const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(new Error('dispatch_timeout')), options.dispatchTimeoutMs ?? 600_000);
+    deadline.unref();
     return (async () => {
       let dispatched = false;
       try {
@@ -182,10 +187,12 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         dispatched = true;
         let result: { sessionId?: string } | undefined;
         if (command.operation === 'create') {
-          // Record the requested ID before upstream admission, and the returned ID
-          // too: a future upstream may adopt a blank desktop session.
-          state.rememberMobileSession('session-' + command.requestId.toLowerCase());
+          // Record both the requested and returned IDs only after the adapter
+          // settles: a host stop closes SQLite, and a failed create must not leave
+          // a phantom blank-session exception behind.
           result = await adapter.createSession({ workspaceId: command.workspaceId, requestId: command.requestId, ...(command.presetId ? { presetId: command.presetId } : {}) }, controller.signal, command.workspaceId);
+          if (closing) return undefined;
+          state.rememberMobileSession('session-' + command.requestId.toLowerCase());
           state.rememberMobileSession(result.sessionId!);
         }
         else if (command.operation === 'prompt') {
@@ -210,18 +217,20 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         }
         else await adapter.cancel(command.sessionId, controller.signal, command.expectedCursor, command.workspaceId);
         if (closing) return undefined;
-        if (command.operation === 'prompt') await Promise.all((command.staged ?? []).flatMap(u => u.filePath ? [files.remove(u.filePath)] : []));
+        if (command.operation === 'prompt') await Promise.all((command.staged ?? []).flatMap(u => { if (!u.filePath) return []; files.release(u.filePath); return [files.remove(u.filePath)]; })).catch(() => {});
         return state.finishCommand(deviceId, command.requestId, 'accepted', { ...(result?.sessionId ? { result: { sessionId: result.sessionId } } : {}), httpStatus: command.operation === 'create' ? 201 : 200 });
       } catch (error) {
         if (closing) return undefined;
-        if (command.operation === 'prompt') await Promise.all((command.staged ?? []).flatMap(u => u.filePath ? [files.remove(u.filePath)] : [])).catch(() => {});
+        if (command.operation === 'prompt') await Promise.all((command.staged ?? []).flatMap(u => { if (!u.filePath) return []; files.release(u.filePath); return [files.remove(u.filePath)]; })).catch(() => {});
         if ((!dispatched || error instanceof HostError) && error instanceof HostError && error.status >= 400 && error.status < 500) {
           return state.finishCommand(deviceId, command.requestId, 'rejected', { error: { code: error.code, message: error.message }, httpStatus: error.status });
         }
         return state.finishCommand(deviceId, command.requestId, 'uncertain', { error: { code: 'delivery_uncertain', message: 'Delivery could not be confirmed. Do not automatically resend this action.' }, httpStatus: 202 });
       } finally {
+        clearTimeout(deadline);
+        activeDispatches--;
         if (command.operation === 'prompt') command.fileReservation?.release();
-        if (command.operation === 'prompt') await Promise.all((command.staged ?? []).flatMap(u => u.filePath ? [files.remove(u.filePath)] : [])).catch(() => {});
+        if (command.operation === 'prompt') await Promise.all((command.staged ?? []).flatMap(u => { if (!u.filePath) return []; files.release(u.filePath); return [files.remove(u.filePath)]; })).catch(() => {});
         if (command.operation === 'prompt' && command.staged?.length) {
           attachmentDispatches--; claimedImageBytes -= command.staged.reduce((n, u) => n + (u.value.ref.kind === 'image' ? u.value.ref.size : 0), 0);
           command.staged = [];
@@ -237,7 +246,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     } finally { if (timer) clearTimeout(timer); }
   }
 
-  const cursors = new Map<string, { deviceId: string; workspaceId: string | undefined; offset: number; expiresAt: number }>();
+  const cursors = new Map<string, { deviceId: string; workspaceId: string | undefined; after: { updatedAt: number; id: string }; expiresAt: number }>();
   function freshDevice(deviceId: string): AuthorizedDevice {
     const device = state.getDevice(deviceId);
     if (!device) throw new HostError('unauthorized');
@@ -296,7 +305,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     const runningSubagents = childCount(snapshot.runningSubagents);
     if (runningSubagents !== undefined && session.runningSubagents !== undefined && runningSubagents !== session.runningSubagents) throw new HostError('internal_error');
     const count = runningSubagents ?? session.runningSubagents;
-    const result = { ...(snapshot.model !== undefined ? { model: sessionModel(snapshot.model) } : {}), ...(snapshot.resolvedQuestions !== undefined ? { resolvedQuestions: settledQuestions(snapshot.resolvedQuestions) } : {}), ...(snapshot.pendingQueue ? { pendingQueue: safeQueue(snapshot.pendingQueue).map(q => ({ ...q, ...(q.requestId ? { requestId: mobileId(q.requestId) } : {}) })) } : {}), ...(snapshot.pendingQuestions ? { pendingQuestions: questionsOf(snapshot.pendingQuestions) } : {}), ...(count !== undefined ? { runningSubagents: count } : {}), ...(activityDetail ? { activityDetail } : {}), session, messages, cursor: snapshot.cursor, hasMore: snapshot.hasMore === true || snapshot.messages.length > 100, activity: snapshot.activity, ...(snapshot.notice === HISTORY_CUT_NOTICE ? { notice: HISTORY_CUT_NOTICE } : snapshot.activity === 'unknown' || (snapshot.activity === 'waiting' && !snapshot.pendingQuestions?.length) ? { notice: 'Return to the desktop to check this task.' } : {}) };
+    const result = { ...(snapshot.model !== undefined ? { model: sessionModel(snapshot.model) } : {}), ...(snapshot.resolvedQuestions !== undefined ? { resolvedQuestions: settledQuestions(snapshot.resolvedQuestions) } : {}), ...(snapshot.pendingQueue ? { pendingQueue: safeQueue(snapshot.pendingQueue).map(q => ({ ...q, ...(q.requestId ? { requestId: mobileId(q.requestId) } : {}) })) } : {}), ...(snapshot.pendingQuestions ? { pendingQuestions: questionsOf(snapshot.pendingQuestions) } : {}), ...(count !== undefined ? { runningSubagents: count } : {}), ...(activityDetail ? { activityDetail } : {}), session, messages, cursor: snapshot.cursor, hasMore: snapshot.hasMore === true || snapshot.messages.length > 100, activity: snapshot.activity, ...(snapshot.notice === HISTORY_CUT_NOTICE ? { notice: HISTORY_CUT_NOTICE } : snapshot.activity === 'unknown' || (snapshot.activity === 'waiting' && !snapshot.pendingQuestions?.length) ? { notice: 'Return to the desktop to check this task.' } : {}), ...(snapshot.failure ? { failure: snapshot.failure } : {}) };
     // Keep complete messages and Unicode intact. Observation is a bounded latest-history view.
     while (Buffer.byteLength(JSON.stringify(result), 'utf8') > 2 * 1024 * 1024) {
       if (result.messages.length <= 1) throw new HostError('payload_too_large');
@@ -421,21 +430,28 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       // Republish cached authoritative text when canExecute changes, even on an idle watch.
       let rechecking = false;
       timer = setInterval(() => {
-        if (rechecking || closed) return;
+        if (closed) return;
+        // Liveness is independent of registry/SQLite scope I/O: a held check must not
+        // starve the heartbeat that keeps the phone's stream open.
+        if (!blockedSince && Date.now() - lastHeartbeat >= heartbeatMs) {
+          lastHeartbeat = Date.now();
+          if (!res.write(': heartbeat\n\n')) blockedSince = Date.now();
+        }
+        if (rechecking) return;
         rechecking = true;
         void (async () => {
+          let deadline: ReturnType<typeof setTimeout> | undefined;
           try {
-            await checkScope(deviceId, first.session.workspaceId, false, true);
+            const timedOut = new Promise<never>((_, reject) => {
+              deadline = setTimeout(() => reject(new HostError('unavailable')), 10_000);
+            });
+            await Promise.race([checkScope(deviceId, first.session.workspaceId, false, true), timedOut]);
             if (workspaceSource.archivedSessionIds().has(sessionId)) throw new HostError('not_found');
             if (blockedSince && Date.now() - blockedSince >= 5_000) { stop(); return; }
             if (latest && !blockedSince) await frame(latest, true);
             if (closed) return;
-            if (Date.now() - lastHeartbeat >= heartbeatMs && !blockedSince) {
-              lastHeartbeat = Date.now();
-              if (!res.write(': heartbeat\n\n')) blockedSince = Date.now();
-            }
           } catch { stop(); }
-          finally { rechecking = false; }
+          finally { if (deadline) clearTimeout(deadline); rechecking = false; }
         })();
       }, Math.min(heartbeatMs, 1000));
       timer.unref();
@@ -600,7 +616,8 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       sendJson(res, 200, { items: workspaces.filter(workspace => allowsWorkspace(current.grants.readWorkspaceIds, workspace.id)).map(workspace => ({ id: workspace.id, name: workspace.name, canExecute: allowsWorkspace(current.grants.executeWorkspaceIds, workspace.id) })) }); return;
     }
     if (req.method === 'GET' && url.pathname === '/v1/capabilities') {
-      sendJson(res, 200, { protocolVersion: 1, hostVersion: HOST_VERSION, hostName: config.hostName, upstreamVersion: adapter.upstreamVersion, capabilities: { sessions: true, textPrompt: true, cancel: true, liveSnapshots: true, questionSkip: false, fileDownload: false, ...(adapter.phoneCapabilities?.() ?? { attachments: false, questions: false, steer: false, queue: false, rename: false, models: false }), approvals: false, push: false, notifications: !!notifications }, notificationCapabilities: { version: 1, coverage: notifications?.coverage ?? 'degraded', feed: !!notifications, unifiedPush: false, retentionMs: 604800000 } }); return;
+      const cleanup = files.cleanupStats();
+      sendJson(res, 200, { protocolVersion: 1, hostVersion: HOST_VERSION, hostName: config.hostName, upstreamVersion: adapter.upstreamVersion, capabilities: { sessions: true, textPrompt: true, cancel: true, liveSnapshots: true, questionSkip: false, fileDownload: false, ...(adapter.phoneCapabilities?.() ?? { attachments: false, questions: false, steer: false, queue: false, rename: false, models: false }), approvals: false, push: false, notifications: !!notifications }, notificationCapabilities: { version: 1, coverage: notifications?.coverage ?? 'degraded', feed: !!notifications, unifiedPush: false, retentionMs: 604800000 }, storage: { pendingCleanups: cleanup.pending, cleanupFailures: cleanup.failures } }); return;
     }
     if (req.method === 'GET' && url.pathname === '/v1/models') {
       if (!adapter.models) throw new HostError('unavailable');
@@ -617,23 +634,28 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       const rawLimit = url.searchParams.get('limit') ?? '50';
       if (!/^[1-9][0-9]{0,2}$/.test(rawLimit) || Number(rawLimit) > 100) throw new HostError('invalid_request');
       const limit = Number(rawLimit), cursor = url.searchParams.get('cursor');
-      let offset = 0;
+      let after: { updatedAt: number; id: string } | undefined;
       if (cursor !== null) {
         const stored = cursors.get(cursor);
         if (!stored || stored.deviceId !== device.deviceId || stored.workspaceId !== workspaceId || stored.expiresAt <= Date.now()) throw new HostError('invalid_request');
-        offset = stored.offset;
+        after = stored.after;
       }
       const sessions = await adapter.listSessions(signal); signal.throwIfAborted();
       const ids = await workspaceIds(); signal.throwIfAborted();
       const archived = workspaceSource.archivedSessionIds(), current = freshDevice(device.deviceId);
       const scoped = sessions.filter(session => state.mobileSessionVisible(session.id, session.blank) && ids.has(session.workspaceId) && !archived.has(session.id) && allowsWorkspace(current.grants.readWorkspaceIds, session.workspaceId) && (workspaceId === undefined || session.workspaceId === workspaceId)).sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
-      const items = scoped.slice(offset, offset + limit).map(session => sessionForDevice(session, current.deviceId, ids));
+      // Keyset, not a numeric offset: concurrent updatedAt changes must not repeat a
+      // previous page item. A session that moves above the cut is left for a refresh.
+      const start = after ? scoped.findIndex(session => session.updatedAt < after.updatedAt || (session.updatedAt === after.updatedAt && session.id > after.id)) : 0;
+      const from = start < 0 ? scoped.length : start;
+      const items = scoped.slice(from, from + limit).map(session => sessionForDevice(session, current.deviceId, ids));
       let nextCursor: string | null = null;
-      if (offset + limit < scoped.length) {
+      if (from + limit < scoped.length) {
         for (const [id, value] of cursors) if (value.expiresAt <= Date.now()) cursors.delete(id);
         if (cursors.size >= 1024) cursors.delete(cursors.keys().next().value!);
+        const last = scoped[from + limit - 1]!;
         nextCursor = randomBytes(24).toString('base64url');
-        cursors.set(nextCursor, { deviceId: current.deviceId, workspaceId, offset: offset + limit, expiresAt: Date.now() + 300_000 });
+        cursors.set(nextCursor, { deviceId: current.deviceId, workspaceId, after: { updatedAt: last.updatedAt, id: last.id }, expiresAt: Date.now() + 300_000 });
       }
       sendJson(res, 200, { items, nextCursor }); return;
     }
@@ -762,6 +784,8 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         canonicalPayload = { sessionId: segments[1], mutation };
       } else throw new HostError('not_found');
       const payloadHash = hashSecret(JSON.stringify(canonicalPayload));
+      // Refuse a fresh command before any expensive preparation; known receipts still replay below.
+      if (!state.getCommand(device.deviceId, requestId)) state.assertMutationAllowed();
       const replay = async (): Promise<void> => {
         const prior = state.getCommand(device.deviceId, requestId)!;
         const repeated = state.admitCommand(device.deviceId, requestId, operation, payloadHash);
@@ -814,15 +838,20 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         }
       }
       if (state.getCommand(device.deviceId, requestId)) { await replay(); return; }
+      if (closing) throw new HostError('unavailable');
+      // Bound every admitted-but-unsettled dispatch, including commands without
+      // attachments. A refused admission creates no receipt and never dispatches.
+      if (activeDispatches >= 32) throw new HostError('rate_limited');
       if (command.operation === 'prompt' && command.staged?.length && attachmentDispatches >= 16) throw new HostError('rate_limited');
       if (command.operation === 'prompt' && command.staged?.some(u => u.claimed || ![...uploads.values()].includes(u) || u.expiresAt <= Date.now())) throw new HostError('conflict');
-      const admitted = state.admitCommand(device.deviceId, requestId, command.operation, payloadHash, command.workspaceId);
+      const admitted = state.admitCommand(device.deviceId, requestId, command.operation, payloadHash, command.workspaceId, command.operation === 'create' ? null : command.sessionId);
       if (!admitted.fresh) { sendJson(res, admitted.httpStatus, admitted.receipt); return; }
       admittedHere = true;
       if (command.operation === 'prompt') correlationCache.delete(device.deviceId);
       if (command.operation === 'prompt' && command.staged?.length) { attachmentDispatches++; claimedImageBytes += command.staged.reduce((n, u) => n + (u.value.ref.kind === 'image' ? u.value.ref.size : 0), 0); }
-      if (command.operation === 'prompt') for (const u of command.staged ?? []) { u.claimed = true; for (const [id, candidate] of uploads) if (candidate === u) uploads.delete(id); }
+      if (command.operation === 'prompt') for (const u of command.staged ?? []) { if (u.filePath) files.claim(u.filePath); u.claimed = true; for (const [id, candidate] of uploads) if (candidate === u) uploads.delete(id); }
       transferred = true;
+      activeDispatches++;
       const completion = dispatch(device.deviceId, command);
       const key = `${device.deviceId}:${requestId}`;
       dispatches.set(key, { deviceId: device.deviceId, requestId, completion });

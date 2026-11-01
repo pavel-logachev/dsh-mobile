@@ -1,6 +1,6 @@
 # Isolated real-DSH canary
 
-This canary executes the **actual DSH SessionController from an exact verified runtime: 0.2.0-rc.2 or 0.2.1-alpha.1** and the companion's in-process adapter, with a deterministic implementation of the official `LlmAdapter` interface. It is not a replacement SessionController, RPC stub, or fixture host. Its model output is synthetic; it does not prove an external model, the user's running DSH profile, a production plugin mount, or physical-phone network acceptance.
+This canary executes the **actual DSH SessionController from an exact verified runtime: 0.2.0-rc.2, 0.2.1-alpha.1, 0.2.1-rc.4 or 0.2.1-rc.5** and the companion's in-process adapter, with a deterministic implementation of the official `LlmAdapter` interface. It is not a replacement SessionController, RPC stub, or fixture host. Its model output is synthetic; it does not prove an external model, the user's running DSH profile, a production plugin mount, or physical-phone network acceptance.
 
 ## Run
 
@@ -41,7 +41,7 @@ The canary asserts that the companion and registry share a realm, the required s
 
 The installed `sdk-minimal` template includes an external model adapter and shell/tool plugins. The normal base/profile graph also has live credential/account, configuration and telemetry services. A template name therefore cannot establish a credential-free canary.
 
-The harness imports the installed official package exports and composes a new Cordis Context directly. It does not start the CLI, copy a profile, load a home patch, start a replacement DSH GUI, or inject into the user's running process. Installed DSH manifests are checked against the exact allowlist `0.2.0-rc.2`, `0.2.1-alpha.1`, and every DSH component must match the selected verified runtime; entry SHA-256 hashes are written to the receipt. Cordis and timer packages retain their independently versioned versions.
+The harness imports the installed official package exports and composes a new Cordis Context directly. It does not start the CLI, copy a profile, load a home patch, start a replacement DSH GUI, or inject into the user's running process. Installed DSH manifests are checked against the exact allowlist `0.2.0-rc.2`, `0.2.1-alpha.1`, `0.2.1-rc.4`, `0.2.1-rc.5`, and every DSH component must match the selected verified runtime; entry SHA-256 hashes are written to the receipt. Cordis and timer packages retain their independently versioned versions.
 
 Actual services include the LLM registry, Agent registry/factory/loop, default-model selection, Session store, JSONL persistence, query/projection services, workspace registry, JSON/domain storage, local FS/attachments, Typert registry, commands, client connection/file uploads, system-prompt service, empty native ToolRuntime and SessionController. The optional preset registry is absent: the companion reports an empty preset catalog, not a fabricated preset. No tools are advertised or executable.
 

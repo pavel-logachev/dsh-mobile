@@ -448,6 +448,35 @@ test('watch keeps provisional and durable tail updates after unresolved old ance
   } finally { active.abort(); await watch.return?.(); }
 });
 
+test('oversized live provisional chunk invalidates the attempt before joining it', { timeout: 3000 }, async t => {
+  const h = await recovered(t, overBudgetRecords(), 1702, true, 60000);
+  const active = new AbortController(), watch = h.adapter.watch('synthetic-session', active.signal)[Symbol.asyncIterator]();
+  try {
+    assert.equal((await watch.next()).value!.messages.length, 100);
+    const pending = watch.next();
+    h.emit({ type: 'assistant-stream', frame: { type: 'start', revision: 1, attemptId: 'synthetic-overflow', turn: 901, step: 1 } });
+    h.emit({ type: 'assistant-stream', frame: { type: 'chunk', revision: 2, attemptId: 'synthetic-overflow', index: 0, time: 1700000001803, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(2 * 1024 * 1024 + 1) } } });
+    const bounded = (await pending).value!;
+    assert.equal(bounded.messages.filter(m => m.provisional).length, 0);
+    assert.equal(bounded.activity, 'unknown');
+    assert.ok(bounded.notice);
+  } finally { active.abort(); await watch.return?.(); }
+});
+
+test('provisional block count is bounded before snapshot assembly', { timeout: 3000 }, async t => {
+  const h = await recovered(t, overBudgetRecords(), 1702, true, 60000);
+  const active = new AbortController(), watch = h.adapter.watch('synthetic-session', active.signal)[Symbol.asyncIterator]();
+  try {
+    assert.equal((await watch.next()).value!.messages.length, 100);
+    const pending = watch.next();
+    h.emit({ type: 'assistant-stream', frame: { type: 'start', revision: 1, attemptId: 'synthetic-blocks', turn: 902, step: 1 } });
+    for (let index = 0; index < 1025; index++) h.emit({ type: 'assistant-stream', frame: { type: 'chunk', revision: index + 2, attemptId: 'synthetic-blocks', index, time: 1700000001900 + index, chunk: { type: 'text-delta', index, text: 'x' } } });
+    const bounded = (await pending).value!;
+    assert.equal(bounded.messages.filter(m => m.provisional).length, 0);
+    assert.equal(bounded.activity, 'unknown');
+  } finally { active.abort(); await watch.return?.(); }
+});
+
 test('page budget exhaustion still preserves a newest running turn and its activity detail', async t => {
   const records = overBudgetRecords();
   records[1799] = { type: 'event', event: { seq: 1799, time: 1700000001799, type: 'turn/start', data: { turn: 900 } } };

@@ -3,7 +3,11 @@ import { HostError } from './errors.ts';
 import { allowsWorkspace, HostState } from './state.ts';
 
 export type Coverage = 'initializing' | 'ready' | 'degraded';
-export interface NotificationSource { seq: number; type: string; time: number; turn?: number; completed?: boolean }
+export interface NotificationSource {
+  seq: number; type: string; time: number; turn?: number; completed?: boolean;
+  /** Metadata only: this event can open an attention episode. */
+  attention?: boolean;
+}
 export interface NotificationEvidence { sessionId: string; workspaceId: string; cursor: number; pending: boolean; valid?: boolean; completed: { turn: number; sourceSeq: number }[] }
 export interface NotificationSources {
   subscribe(listener: (id: string, event: NotificationSource) => void): () => void;
@@ -60,6 +64,18 @@ export class NotificationFeed {
   private coverageRevision = 0;
   private recoveryScan = false;
   private readonly recoveryPending = new Set<string>();
+  // Only a source whose proof is still needed for a current running or
+  // attention-bearing session can keep the bounded recovery pass pending.
+  private readonly blockingRecovery = new Set<string>();
+  // A real sequence discontinuity is a delivery gap and stays sticky until a
+  // valid authoritative proof succeeds. It is separate from an unprovable old
+  // history, which cannot produce a new notification by itself.
+  private readonly deliveryGaps = new Set<string>();
+  // Last delivered envelope per source, including ignored/non-alerting kinds.
+  // This is the continuity checkpoint, not the proven producer watermark.
+  private readonly observed = new Map<string, number>();
+  // A sequence discontinuity seen on any envelope, including ignored kinds.
+  private readonly gaps = new Set<string>();
   // Irrelevant envelopes are not membership evidence. Bounded, transient sequence cuts are
   // reconciled only after the next relevant event passes a fresh membership check.
   private readonly skipped = new Map<string, { first: number; last: number; gap: boolean }>();
@@ -76,10 +92,10 @@ export class NotificationFeed {
     if (process.env.DSH_MOBILE_NOTIFICATION_TRACE !== '1') return;
     for (const event of items) notificationTrace(stage, { event: createHash('sha256').update(event.eventId).digest('hex').slice(0, 12), seq: event.sequence });
   }
-  private degrade(reason: string): void {
+  private degrade(reason: string, detail?: { type?: string; seq?: number; previous?: number | undefined; valid?: boolean | undefined; pending?: boolean; cursor?: number; completed?: number; running?: boolean | undefined }): void {
     const diagnostic = this.state.readNotificationState<{ counts: Record<string, number> }>('diagnostics') ?? { counts: {} };
     diagnostic.counts[reason] = (diagnostic.counts[reason] ?? 0) + 1;
-    this.state.writeNotificationState('diagnostics', { ...diagnostic, lastReason: reason, lastAt: Date.now(), queueDepth: this.queue.length });
+    this.state.writeNotificationState('diagnostics', { ...diagnostic, lastReason: reason, lastAt: Date.now(), queueDepth: this.queue.length, ...(detail ? { lastDetail: detail } : {}) });
     const previous = this.coverage; this.coverage = 'degraded'; this.coverageRevision++; this.recoveryScan = true;
     if (previous !== this.coverage) this.changed();
   }
@@ -111,12 +127,19 @@ export class NotificationFeed {
     }, 60_000);
     this.timer.unref();
   }
-  private enabledDevices(): boolean { return this.state.listDevices().some(d => !!this.state.getDevice(d.deviceId) && this.state.readNotificationState<Journal>('device:' + d.deviceId)?.settings.enabled); }
+  private enabledCache: { value: boolean; at: number } | undefined;
+  private readonly journalCache = new Map<string, { revision: number; value: Journal }>();
+  private enabledDevices(): boolean {
+    const now = Date.now();
+    if (this.enabledCache && now - this.enabledCache.at < 1_000) return this.enabledCache.value;
+    const value = this.state.notificationEnabledDeviceCount() > 0;
+    this.enabledCache = { value, at: now }; return value;
+  }
   private activate(): void {
     if (this.activated || !this.started || !this.enabledDevices()) return;
     const activation = this.activation = new AbortController();
     this.activated = true; this.initializing = true; this.baselineReady = false; this.baselineAt = Date.now();
-    this.lazyIdle = []; this.lazyRetry.clear(); this.recoveryPass = 0; this.recoveryPending.clear(); this.recoveryScan = false;
+    this.lazyIdle = []; this.lazyRetry.clear(); this.recoveryPass = 0; this.recoveryPending.clear(); this.blockingRecovery.clear(); this.deliveryGaps.clear(); this.observed.clear(); this.gaps.clear(); this.recoveryScan = false;
     this.coverage = 'initializing';
     this.work = this.work.then(async () => {
       if (activation.signal.aborted) return;
@@ -137,7 +160,10 @@ export class NotificationFeed {
           if (!session.running && !this.watermarks[session.id]?.attentionId) { delete this.watermarks[session.id]; continue; }
           const evidence = await this.source.evidence(session.id, budget, session);
           budget.throwIfAborted();
-          if (evidence.valid === false) { this.degrade('baseline_proof_invalid'); continue; }
+          if (evidence.valid === false) {
+            if (this.watermarks[session.id]?.attentionId) this.degrade('baseline_proof_invalid');
+            continue;
+          }
           const queued = this.queue.filter(e => e.id === session.id).map(e => e.event.seq);
           this.watermarks[session.id] = { seq: queued.length ? Math.min(...queued) - 1 : evidence.cursor, ...(evidence.pending ? { attentionId: this.watermarks[session.id]?.attentionId ?? randomUUID() } : {}) };
         }
@@ -195,12 +221,16 @@ export class NotificationFeed {
     if (event.time < this.baselineAt) return;
     const previous = this.watermarks[id];
     if (previous && event.seq <= previous.seq) return;
+    const seen = this.observed.get(id);
+    const continuityGap = seen !== undefined && event.seq !== seen + 1;
+    this.observed.set(id, event.seq);
     if (!relevant.has(event.type)) {
       const skipped = this.skipped.get(id);
+      if (continuityGap || skipped?.gap) this.gaps.add(id);
       if (!skipped) {
         if (this.skipped.size >= 10000) { this.skippedEvicted = true; this.skipped.delete(this.skipped.keys().next().value!); }
-        this.skipped.set(id, { first: event.seq, last: event.seq, gap: false });
-      } else if (event.seq > skipped.last) { skipped.gap ||= event.seq !== skipped.last + 1; skipped.last = event.seq; }
+        this.skipped.set(id, { first: event.seq, last: event.seq, gap: continuityGap });
+      } else if (event.seq > skipped.last) { skipped.gap ||= continuityGap || event.seq !== skipped.last + 1; skipped.last = event.seq; }
       return;
     }
     // Only relevant events pay for fresh membership/permission authority. Excluded
@@ -212,8 +242,11 @@ export class NotificationFeed {
     const old = this.watermarks[id];
     if (event.time < this.baselineAt || (old && event.seq <= old.seq)) return;
     const skipped = this.skipped.get(id); this.skipped.delete(id);
-    const gap = (this.skippedEvicted && !old) || !!skipped?.gap || (skipped ? (event.seq !== skipped.last + 1 || (!!old && skipped.first !== old.seq + 1)) : !!old && event.seq !== old.seq + 1);
-    if (gap) { this.degrade('sequence_gap'); this.resetJournals(); }
+    const gap = this.gaps.has(id) || (seen !== undefined
+      ? continuityGap || !!skipped?.gap
+      : (this.skippedEvicted && !old) || !!skipped?.gap
+        || (skipped ? (event.seq !== skipped.last + 1 || (!!old && skipped.first !== old.seq + 1)) : !!old && event.seq !== old.seq + 1));
+    if (gap) { this.deliveryGaps.add(id); this.degrade('sequence_gap', { type: event.type, seq: event.seq, previous: old?.seq }); this.resetJournals(); }
     if (!old && Object.keys(this.watermarks).length >= 10000) { this.degrade('watermark_limit'); return; }
     let proof = proofs.get(id);
     if (!proof || proof.workspaceId !== listed.workspaceId || proof.cursor < event.seq || (this.source.evidenceCurrent && !this.source.evidenceCurrent(proof))) {
@@ -225,10 +258,15 @@ export class NotificationFeed {
     }
     this.lifetime.signal.throwIfAborted();
     if (activation !== this.activation || activation?.signal.aborted) return;
-    if (proof.valid === false || proof.sessionId !== id || proof.workspaceId !== listed.workspaceId || proof.cursor < event.seq || (this.source.evidenceCurrent && !this.source.evidenceCurrent(proof))) { this.degrade('proof_invalid'); return; }
+    if (proof.valid === false || proof.sessionId !== id || proof.workspaceId !== listed.workspaceId || proof.cursor < event.seq || (this.source.evidenceCurrent && !this.source.evidenceCurrent(proof))) {
+      const alerting = (event.type === 'turn/end' && event.completed === true) || event.attention === true
+        || (old?.attentionId !== undefined && (event.type === 'approval/decided' || event.type === 'tool/result' || event.type === 'user/message'));
+      if (!alerting) return;
+      this.deliveryGaps.add(id); this.degrade('proof_invalid', { type: event.type, seq: event.seq, previous: old?.seq, valid: proof.valid, pending: proof.pending, cursor: proof.cursor, completed: proof.completed.length }); return;
+    }
     // Other lanes may have filled the bounded watermark set during evidence IO.
     if (!this.watermarks[id] && Object.keys(this.watermarks).length >= 10000) { this.degrade('watermark_limit'); return; }
-    if (this.source.lookupCurrent && !this.source.lookupCurrent(listed)) { this.degrade('proof_invalid'); return; }
+    if (this.source.lookupCurrent && !this.source.lookupCurrent(listed)) { this.deliveryGaps.add(id); this.degrade('proof_invalid'); return; }
     this.batch = new Map();
     try {
     // Unknown newly-created sessions are eligible by a fresh cold opening, not phone pagination.
@@ -258,9 +296,16 @@ export class NotificationFeed {
     const visible = new Set(sessions.map(s => s.id));
     // Capture a whole authoritative recovery set once per new failure, not just
     // the eight lazy sources probed in this bounded pass. Removed sources retire.
-    if (this.recoveryScan) { for (const id of visible) this.recoveryPending.add(id); this.recoveryScan = false; }
+    if (this.recoveryScan) {
+      for (const id of visible) this.recoveryPending.add(id);
+      this.recoveryScan = false;
+    }
     for (const id of this.recoveryPending) if (!visible.has(id)) this.recoveryPending.delete(id);
     for (const id of this.lazyRetry.keys()) if (!visible.has(id)) this.lazyRetry.delete(id);
+    for (const id of this.blockingRecovery) if (!visible.has(id)) this.blockingRecovery.delete(id);
+    for (const id of this.deliveryGaps) if (!visible.has(id)) this.deliveryGaps.delete(id);
+    for (const id of this.gaps) if (!visible.has(id)) this.gaps.delete(id);
+    for (const id of this.observed.keys()) if (!visible.has(id)) this.observed.delete(id);
     for (const id of Object.keys(this.watermarks)) if (!visible.has(id) && beforeList.get(id) === this.watermarks[id] && !this.queue.some(e => e.id === id)) delete this.watermarks[id];
     // Rotate before I/O, retaining failures and unprobed entries. A bad first
     // session cannot restart every pass at the head or consume everyone else's retry.
@@ -283,17 +328,25 @@ export class NotificationFeed {
     const ids = new Set([...lazy, ...sessions.filter(s => s.running || this.watermarks[s.id]?.attentionId).map(s => s.id)]);
     for (const id of ids) {
       const session = byId.get(id);
-      if (!session) { this.lazyRetry.delete(id); continue; }
+      if (!session) { this.lazyRetry.delete(id); this.recoveryPending.delete(id); this.blockingRecovery.delete(id); continue; }
       const observedSeq = this.watermarks[id]?.seq;
       let proof: NotificationEvidence;
+      let invalidHistory = false;
       try {
         budget.throwIfAborted();
         proof = await this.source.evidence(id, budget, session);
         budget.throwIfAborted();
-        if (proof.valid === false || proof.sessionId !== id || proof.workspaceId !== session.workspaceId || (this.source.evidenceCurrent && !this.source.evidenceCurrent(proof))) throw new HostError('unavailable');
+        if (proof.valid === false) { invalidHistory = true; throw new HostError('unavailable'); }
+        if (proof.sessionId !== id || proof.workspaceId !== session.workspaceId || (this.source.evidenceCurrent && !this.source.evidenceCurrent(proof))) throw new HostError('unavailable');
       } catch {
         if (activation?.signal.aborted || this.lifetime.signal.aborted) return;
-        this.degrade('reconcile_proof_failed'); this.retryLazy(id, pass);
+        const attention = this.watermarks[id]?.attentionId !== undefined;
+        if (!invalidHistory || this.deliveryGaps.has(id) || attention || this.blockingRecovery.has(id)) {
+          this.blockingRecovery.add(id); this.degrade('reconcile_proof_failed', { running: session.running }); this.retryLazy(id, pass);
+        } else {
+          // An unprovable old history cannot produce a new alert by itself.
+          this.blockingRecovery.delete(id); this.lazyRetry.delete(id);
+        }
         if (budget.aborted) break; // Unprobed IDs are still in the rotated queue.
         continue;
       }
@@ -303,7 +356,7 @@ export class NotificationFeed {
       // pending episode owns the cut; do not replay stale attention over it.
       if (old?.seq !== observedSeq || this.queue.some(e => e.id === id)) continue;
       if (!old && Object.keys(this.watermarks).length >= 10000) { this.degrade('watermark_limit'); this.retryLazy(id, pass); continue; }
-      this.lazyRetry.delete(id); this.recoveryPending.delete(id);
+      this.lazyRetry.delete(id); this.recoveryPending.delete(id); this.blockingRecovery.delete(id); this.deliveryGaps.delete(id); this.gaps.delete(id);
       const attentionId = proof.pending ? old?.attentionId ?? randomUUID() : undefined;
       if (proof.pending && !old?.attentionId) this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/call' }, 'attention-needed', attentionId);
       if (old?.attentionId && !proof.pending) this.emit(proof, { seq: proof.cursor, time: Date.now(), type: 'tool/result' }, 'attention-cleared', old.attentionId);
@@ -318,7 +371,7 @@ export class NotificationFeed {
     }
     this.state.writeNotificationState('producer', this.watermarks);
     if (!this.baselineReady) { this.baselineReady = true; this.degrade('baseline_incomplete'); }
-    if (this.coverage === 'degraded' && revision === this.coverageRevision && !this.recoveryScan && !this.recoveryPending.size && !this.lazyRetry.size && !this.overflow && !this.queue.length && !budget.aborted) { this.coverage = 'ready'; this.changed(); }
+    if (this.coverage === 'degraded' && revision === this.coverageRevision && !this.recoveryScan && !this.recoveryPending.size && !this.lazyRetry.size && !this.blockingRecovery.size && !this.deliveryGaps.size && !this.gaps.size && !this.overflow && !this.queue.length && !budget.aborted) { this.coverage = 'ready'; this.changed(); }
   }
   private retryLazy(id: string, pass: number): void {
     const failures = Math.min((this.lazyRetry.get(id)?.failures ?? 0) + 1, 4);
@@ -326,9 +379,20 @@ export class NotificationFeed {
   }
   private journal(deviceId: string): Journal {
     if (!this.state.getDevice(deviceId)) throw new HostError('unauthorized');
-    return this.batch?.get(deviceId) ?? this.state.readNotificationState<Journal>('device:' + deviceId) ?? { epoch: randomUUID(), sequence: -1, settings: { revision: 0, enabled: false, projects: [], chats: [] }, items: [] };
+    const batched = this.batch?.get(deviceId);
+    if (batched) return batched;
+    const key = 'device:' + deviceId, revision = this.state.notificationRevision(key);
+    const cached = this.journalCache.get(deviceId);
+    if (cached?.revision === revision) return cached.value;
+    const value = this.state.readNotificationState<Journal>(key) ?? { epoch: randomUUID(), sequence: -1, settings: { revision: 0, enabled: false, projects: [], chats: [] }, items: [] };
+    if (!this.journalCache.has(deviceId) && this.journalCache.size >= 128) this.journalCache.delete(this.journalCache.keys().next().value!);
+    this.journalCache.set(deviceId, { revision, value }); return value;
   }
-  private save(deviceId: string, journal: Journal): void { if (this.batch) this.batch.set(deviceId, journal); else this.state.writeNotificationState('device:' + deviceId, journal); }
+  private save(deviceId: string, journal: Journal): void {
+    if (this.batch) { this.batch.set(deviceId, journal); return; }
+    this.state.writeNotificationState('device:' + deviceId, journal);
+    this.journalCache.set(deviceId, { revision: this.state.notificationRevision('device:' + deviceId), value: journal });
+  }
   pruneSettings(deviceId: string, workspaceIds: ReadonlySet<string>, sessions: { id: string; workspaceId: string }[]): NotificationSettings {
     const j = this.journal(deviceId), d = this.state.getDevice(deviceId)!;
     const projects = j.settings.projects.filter(p => workspaceIds.has(p.workspaceId) && allowsWorkspace(d.grants.readWorkspaceIds, p.workspaceId));
@@ -350,11 +414,12 @@ export class NotificationFeed {
     const same = JSON.stringify({ enabled: j.settings.enabled, projects: j.settings.projects, chats: j.settings.chats }) === JSON.stringify(policy);
     if (b.expectedRevision !== j.settings.revision && !(same && b.expectedRevision === j.settings.revision - 1)) throw new HostError('conflict');
     if (!same) {
-      if (policy.enabled && this.state.listDevices().filter(d => d.revokedAt === null && this.state.readNotificationState<Journal>('device:' + d.deviceId)?.settings.enabled).length >= 64 && !j.settings.enabled) throw new HostError('rate_limited');
+      if (policy.enabled && this.state.notificationEnabledDeviceCount() >= 64 && !j.settings.enabled) throw new HostError('rate_limited');
       j.settings = { revision: j.settings.revision + 1, ...policy };
       if (!policy.enabled) j.items = [];
     }
     this.save(deviceId, j);
+    this.enabledCache = undefined;
     if (!this.enabledDevices() || !hadEnabled) {
       this.activation?.abort(); this.activation = undefined; this.activated = false; this.initializing = false; this.baselineReady = false;
       this.queue = []; this.skipped.clear(); this.skippedEvicted = false; this.lazyIdle = []; this.lazyRetry.clear();
@@ -370,21 +435,22 @@ export class NotificationFeed {
   }
   private emit(proof: NotificationEvidence, source: NotificationSource, kind: NotificationEvent['kind'], attentionId?: string): void {
     if (!this.emissionAllowed('host', 1000) || !this.emissionAllowed('session:' + proof.sessionId, 30)) { this.degrade('emission_rate_limit'); this.resetJournals(); return; }
-    for (const device of this.state.listDevices()) {
-      if (!this.state.getDevice(device.deviceId) || !allowsWorkspace(device.grants.readWorkspaceIds, proof.workspaceId)) continue;
-      const j = this.journal(device.deviceId), s = j.settings;
+    for (const deviceId of this.state.notificationEnabledDeviceIds()) {
+      const device = this.state.getDevice(deviceId);
+      if (!device || !allowsWorkspace(device.grants.readWorkspaceIds, proof.workspaceId)) continue;
+      const j = this.journal(deviceId), s = j.settings;
       if (!s.enabled || !(s.chats.find(c => c.sessionId === proof.sessionId)?.enabled ?? s.projects.find(p => p.workspaceId === proof.workspaceId)?.enabled ?? true)) continue;
       if (j.items.some(e => e.sessionId === proof.sessionId && e.sourceSeq === source.seq && e.kind === kind)) continue;
-      if (!this.emissionAllowed('device:' + device.deviceId, 120)) { this.degrade('device_rate_limit'); j.epoch = randomUUID(); j.items = []; this.save(device.deviceId, j); continue; }
+      if (!this.emissionAllowed('device:' + deviceId, 120)) { this.degrade('device_rate_limit'); j.epoch = randomUUID(); j.items = []; this.save(deviceId, j); continue; }
       j.items = j.items.filter(e => e.occurredAt > Date.now() - RETENTION);
       j.items.push({ version: 1, eventId: randomUUID(), sequence: ++j.sequence, occurredAt: source.time, expiresAt: Date.now() + 86400_000, workspaceId: proof.workspaceId, sessionId: proof.sessionId, kind, sourceSeq: source.seq, ...(attentionId ? { attentionId } : {}), ...(kind === 'answer-finished' ? { turn: source.turn! } : {}) });
-      j.items = j.items.slice(-2000); this.save(device.deviceId, j); if (!this.batch) this.changed();
+      j.items = j.items.slice(-2000); this.save(deviceId, j); if (!this.batch) this.changed();
     }
   }
   private resetJournals(): void {
-    for (const d of this.state.listDevices()) if (this.state.getDevice(d.deviceId)) {
-      const j = this.journal(d.deviceId); if (!j.settings.enabled) continue;
-      j.epoch = randomUUID(); j.items = []; this.save(d.deviceId, j);
+    for (const deviceId of this.state.notificationEnabledDeviceIds()) {
+      const j = this.journal(deviceId); if (!j.settings.enabled) continue;
+      j.epoch = randomUUID(); j.items = []; this.save(deviceId, j);
     }
     if (!this.batch) this.changed();
   }
@@ -452,5 +518,5 @@ export class NotificationFeed {
     if (Buffer.byteLength(JSON.stringify(page)) > 128 * 1024 - 512) throw new HostError('payload_too_large');
     return page;
   }
-  async close(): Promise<void> { this.lifetime.abort(); this.listeners.clear(); this.dispose?.(); if (this.timer) clearInterval(this.timer); await this.work; await Promise.all(this.lanes.values()); }
+  async close(): Promise<void> { this.lifetime.abort(); this.listeners.clear(); this.dispose?.(); if (this.timer) clearInterval(this.timer); await this.work; await Promise.all(this.lanes.values()); this.journalCache.clear(); this.enabledCache = undefined; }
 }

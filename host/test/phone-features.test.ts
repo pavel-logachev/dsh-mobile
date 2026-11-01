@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, mkdir, readdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, writeFile, utimes, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HostError } from '../src/errors.ts';
@@ -321,9 +321,10 @@ test('file staging cleans TTL, revoke, close and stale startup files', async t =
   assert.equal(response.status, 201); assert.equal((await readdir(directory)).length, 1);
   assert.equal((await fetch(baseUrl + '/v1/device', { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } })).status, 204);
   await host.close(); assert.deepEqual(await readdir(directory), []);
-  // Startup owns the runtime lock, so it removes orphan random files from a
-  // previous process; opaque mobile IDs are not restored after restart.
+  // Startup removes orphans older than the 24-hour reload grace;
+  // opaque mobile IDs are not restored after restart.
   const stale = join(directory, 'a'.repeat(48) + '.tmp'); await writeFile(stale, 'stale', { mode: 0o600 });
+  const old = new Date(Date.now() - 25 * 60 * 60_000); await utimes(stale, old, old);
   const restarted = await startHostServer({ adapter, config: host.config }); try { assert.deepEqual(await readdir(directory), []); } finally { await restarted.close(); }
 });
 
@@ -424,6 +425,7 @@ test('phone capabilities, model catalog and gzip JSON are additive and bounded',
   const { request, pair, host } = await setup(t), token = pair().deviceToken;
   const caps = await (await request('/capabilities', token)).json();
   assert.equal(caps.capabilities.steer, true); assert.equal(caps.capabilities.approvals, false);
+  assert.equal(caps.storage.pendingCleanups, 0); assert.equal(caps.storage.cleanupFailures, 0);
   assert.equal((await (await request('/models', token)).json()).items[0].supportsImages, true);
   assert.equal((await request('/sessions/chat', token, undefined, { 'Accept-Encoding': 'gzip' })).headers.get('content-encoding'), 'gzip');
   assert.equal((await request('/sessions/chat', token, undefined, { 'Accept-Encoding': 'gzip;q=0, identity' })).headers.get('content-encoding'), null);

@@ -134,4 +134,16 @@ class PhoneProtocolTest {
         assertFalse(PhoneRules.validTitle("я".repeat(129)))
         assertFalse(PhoneRules.validTitle("bad\ntitle")); assertFalse(PhoneRules.validTitle("  "))
     }
+    @Test fun `turn failure direct decode`() {
+        val direct = decodeWire<TurnFailure>("""{"code":"HTTP_400","message":"Provider rejected the turn"}""")
+        assertEquals("Provider rejected the turn", direct.message); assertEquals("HTTP_400", direct.code)
+    }
+    @Test fun `turn failure is accepted only with bounded safe fields`() {
+        val base = """{"session":{"id":"chat","title":"Synthetic","workspaceId":"w","updatedAt":1,"running":false,"canExecute":true},"messages":[],"cursor":1,"hasMore":false,"activity":"idle" """
+        val decoded = decodeWire<SessionSnapshot>("$base,\"failure\":{\"code\":\"HTTP_400\",\"message\":\"Provider rejected the turn\"}}")
+        assertEquals("Provider rejected the turn", decoded.failure?.message)
+        assertEquals("HTTP_400", decoded.failure?.code)
+        val ok = decoded.checked("chat")
+        assertEquals("HTTP_400", ok.failure?.code); assertEquals("Provider rejected the turn", ok.failure?.message)
+    }
 }

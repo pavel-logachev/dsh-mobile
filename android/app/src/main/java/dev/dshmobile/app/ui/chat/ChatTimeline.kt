@@ -65,11 +65,13 @@ private fun Modifier.anchorBottom(list: LazyListState, lastHeight: IntArray, pin
     if (constraints.hasBoundedHeight && previous > 0 && height != previous) androidx.compose.runtime.snapshots.Snapshot.withoutReadObservation {
         val info = list.layoutInfo
         val tail = info.visibleItemsInfo.lastOrNull { it.index == info.totalItemsCount - 1 }
-        val atEnd = tail != null && tail.offset + tail.size + info.afterContentPadding <= info.viewportEndOffset + 1
-        if (pinned() && atEnd && tail != null) {
-            // Item offsets are measured from the content start (after the top padding).
-            val offset = tail.size + info.beforeContentPadding + info.afterContentPadding - height
-            list.requestScrollToItem(tail.index, offset.coerceAtLeast(0))
+        if (tail != null) {
+            val atEnd = tail.offset + tail.size + info.afterContentPadding <= info.viewportEndOffset + 1
+            if (pinned() && atEnd) {
+                // Item offsets are measured from the content start (after the top padding).
+                val offset = tail.size + info.beforeContentPadding + info.afterContentPadding - height
+                list.requestScrollToItem(tail.index, offset.coerceAtLeast(0))
+            }
         }
     }
     val placeable = measurable.measure(constraints)

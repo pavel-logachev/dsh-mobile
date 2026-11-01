@@ -27,9 +27,13 @@ data class ChatMessage(
     @Serializable(with = AttachmentRefsSerializer::class) val attachments: List<AttachmentRef> = emptyList(),
 )
 @Serializable
+data class TurnFailure(val message: String, val code: String? = null)
+
+@Serializable
 data class SessionSnapshot(
     val session: SessionSummary, val messages: List<ChatMessage>, val cursor: Long,
     val hasMore: Boolean, val activity: String, val notice: String? = null,
+    val failure: TurnFailure? = null,
     val activityDetail: ActivityDetail? = null,
     val pendingQueue: List<QueueItem> = emptyList(),
     val pendingQuestions: List<PendingQuestion> = emptyList(),

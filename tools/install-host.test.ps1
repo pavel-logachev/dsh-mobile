@@ -33,7 +33,7 @@ try {
     $patch=Join-Path $profile 'cordis.patch.yml'
     $unrelated=[string][char]0xfeff + "# Synthetic UTF-8-BOM/CRLF profile, never the user's profile.`r`n- id: unrelated-synthetic-plugin`r`n  disabled: !!js true`r`n"
     [IO.File]::WriteAllText($patch,$unrelated,$utf8)
-    $fake=Join-Path $root 'dsh-fake.cmd'; [IO.File]::WriteAllText($fake,"@echo off`r`necho 0.2.1-alpha.1`r`n",[Text.Encoding]::ASCII)
+    $fake=Join-Path $root 'dsh-fake.cmd'; [IO.File]::WriteAllText($fake,"@echo off`r`necho 0.2.1-rc.5`r`n",[Text.Encoding]::ASCII)
     # Reserve an ephemeral synthetic port, never the live 3080/19445 ports.
     $probe=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $probe.Start(); $port=$probe.LocalEndpoint.Port; $probe.Stop()
     Check ($port -notin @(3080,3081,19445)) 'synthetic port is not a live reserved port'
@@ -48,7 +48,7 @@ try {
     Invoke-Installer | Out-Host
     $private=Join-Path $env:LOCALAPPDATA 'DSHMobile/host'; $config=Join-Path $private 'host.json'
     $settings=[IO.File]::ReadAllText($config) | ConvertFrom-Json
-    Check ($settings.workspaceSource -ceq 'dsh-registry' -and $settings.dshVersion -ceq '0.2.1-alpha.1' -and $settings.port -eq $port) 'preflight writes explicit verified version and registry direct config'
+    Check ($settings.workspaceSource -ceq 'dsh-registry' -and $settings.dshVersion -ceq '0.2.1-rc.5' -and $settings.port -eq $port) 'preflight writes explicit verified version and registry direct config'
     Check ((Patch) -ceq $unrelated) 'prepare does not activate profile'
     $installedDirectory=Join-Path $env:LOCALAPPDATA ('DSHMobile/plugin/' + (Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'DSHMobile/plugin') -Directory | Select-Object -First 1).Name)
     $smokeScript=@'

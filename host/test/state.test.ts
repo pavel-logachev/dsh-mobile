@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, rmSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -149,4 +149,108 @@ test('a pairing offer issues an individual credential once and cannot be reused'
   assert.deepEqual(state.authenticate(paired.deviceToken)?.grants, grants);
   assert.throws(() => state.consumePairing(offer.pairingToken, 'Other'), { code: 'unauthorized' });
   assert.equal(state.authenticate(offer.pairingToken), undefined);
+});
+
+test('restoring an older ledger blocks fresh commands while known receipts stay readable, then an explicit new epoch releases it', t => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-ledger-')));
+  const path = join(dir, 'host.sqlite'), backup = join(dir, 'backup.sqlite');
+  const state = new HostState(path);
+  let reopened: HostState | undefined;
+  t.after(() => { state.close(); reopened?.close(); rmSync(dir, { recursive: true, force: true }); });
+  const device = state.consumePairing(state.createPairing(grants).pairingToken, 'Phone');
+  const first = randomUUID();
+  state.admitCommand(device.deviceId, first, 'prompt', hashSecret('first'), 'alpha', 'session-first');
+  state.finishCommand(device.deviceId, first, 'accepted', { result: { sessionId: 'session-first' } });
+  state.close();
+  copyFileSync(path, backup);
+  const later = new HostState(path);
+  const second = randomUUID();
+  later.admitCommand(device.deviceId, second, 'prompt', hashSecret('second'), 'alpha', 'session-second');
+  later.finishCommand(device.deviceId, second, 'accepted');
+  assert.equal(later.ledgerStatus().admittedCount, 2);
+  later.close();
+  for (const suffix of ['-wal', '-shm']) if (existsSync(path + suffix)) rmSync(path + suffix);
+  copyFileSync(backup, path);
+  const restored = new HostState(path);
+  const status = restored.ledgerStatus();
+  assert.equal(status.hold, true); assert.equal(status.holdReason, 'rollback'); assert.equal(status.witnessProblem, 'rollback');
+  assert.equal(restored.getCommand(device.deviceId, first)?.receipt.status, 'accepted');
+  assert.equal(restored.getCommand(device.deviceId, second), undefined, 'the exact command lost by the restore has no receipt');
+  assert.throws(() => restored.admitCommand(device.deviceId, randomUUID(), 'prompt', hashSecret('fresh'), 'alpha', 'session-fresh'), { code: 'recovery_hold' });
+  assert.equal(restored.admitCommand(device.deviceId, first, 'prompt', hashSecret('first'), 'alpha', 'session-first').fresh, false, 'a known receipt still replays during hold');
+  const released = restored.releaseRecovery();
+  assert.equal(released.hold, false); assert.equal(released.epoch, status.epoch + 1);
+  const third = randomUUID();
+  assert.equal(restored.admitCommand(device.deviceId, third, 'prompt', hashSecret('third'), 'alpha', 'session-third').fresh, true);
+  restored.finishCommand(device.deviceId, third, 'accepted');
+  restored.close();
+  reopened = new HostState(path);
+  assert.equal(reopened.ledgerStatus().hold, false, 'the explicit release must not re-hold on reopen');
+  assert.equal(reopened.getCommand(device.deviceId, first)?.receipt.status, 'accepted');
+  assert.equal(reopened.getCommand(device.deviceId, third)?.receipt.status, 'accepted');
+});
+
+test('an explicit recovery hold blocks only fresh admissions and never rewrites a contradictory witness', t => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-hold-')));
+  const path = join(dir, 'host.sqlite'), witness = path + '.ledger.json';
+  const state = new HostState(path);
+  t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); });
+  const device = state.consumePairing(state.createPairing(grants).pairingToken, 'Phone');
+  const known = randomUUID();
+  state.admitCommand(device.deviceId, known, 'prompt', hashSecret('known'), 'alpha', 'session-known');
+  state.finishCommand(device.deviceId, known, 'accepted');
+  const before = state.ledgerStatus();
+  state.setRecoveryHold('operator_request');
+  const held = state.ledgerStatus();
+  assert.equal(held.hold, true); assert.equal(held.holdReason, 'operator_request');
+  assert.throws(() => state.admitCommand(device.deviceId, randomUUID(), 'prompt', hashSecret('blocked'), 'alpha'), { code: 'recovery_hold' });
+  assert.equal(state.admitCommand(device.deviceId, known, 'prompt', hashSecret('known'), 'alpha', 'session-known').fresh, false);
+  assert.equal(state.getCommand(device.deviceId, known)?.receipt.status, 'accepted');
+  const released = state.releaseRecovery();
+  assert.equal(released.hold, false); assert.equal(released.epoch, before.epoch + 1);
+  assert.throws(() => state.releaseRecovery(), { code: 'conflict' }, 'a released ledger cannot be released twice');
+  assert.equal(existsSync(witness), true);
+});
+
+test('notification settings index tracks live enabled devices across reopen and revocation', t => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-notification-index-')));
+  const path = join(dir, 'host.sqlite');
+  let state = new HostState(path);
+  t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); });
+  const device = state.consumePairing(state.createPairing(grants).pairingToken, 'Indexed phone');
+  const journal = (enabled: boolean) => ({ epoch: 'epoch', sequence: 0, settings: { revision: 1, enabled, projects: [], chats: [] }, items: [] });
+  state.writeNotificationState('device:' + device.deviceId, journal(true));
+  assert.equal(state.notificationEnabledDeviceCount(), 1);
+  assert.deepEqual(state.notificationEnabledDeviceIds(), [device.deviceId]);
+  state.close();
+  state = new HostState(path);
+  assert.equal(state.notificationEnabledDeviceCount(), 1, 'old journal must be backfilled into the settings index');
+  state.writeNotificationState('device:' + device.deviceId, journal(false));
+  assert.equal(state.notificationEnabledDeviceCount(), 0);
+  state.writeNotificationState('device:' + device.deviceId, journal(true));
+  assert.equal(state.revokeDevice(device.deviceId), true);
+  assert.equal(state.notificationEnabledDeviceCount(), 0, 'revoked devices do not remain in the enabled hot set');
+  assert.deepEqual(state.notificationEnabledDeviceIds(), []);
+});
+
+test('missing or corrupt ledger witnesses fail closed without inventing a rollback for a first run', t => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-witness-')));
+  const path = join(dir, 'host.sqlite'), witness = path + '.ledger.json';
+  const first = new HostState(path);
+  let seeded: HostState | undefined, corrupt: HostState | undefined;
+  t.after(() => { first.close(); seeded?.close(); corrupt?.close(); rmSync(dir, { recursive: true, force: true }); });
+  const device = first.consumePairing(first.createPairing(grants).pairingToken, 'Phone');
+  assert.equal(first.ledgerStatus().witnessProblem, 'none');
+  first.close();
+  // Losing the sidecar cannot distinguish a first run from a restore of both files; it seeds, never holds.
+  rmSync(witness);
+  seeded = new HostState(path);
+  assert.equal(seeded.ledgerStatus().hold, false); assert.equal(seeded.ledgerStatus().witnessProblem, 'none');
+  seeded.close();
+  writeFileSync(witness, '{not json');
+  corrupt = new HostState(path);
+  assert.equal(corrupt.ledgerStatus().hold, true); assert.equal(corrupt.ledgerStatus().witnessProblem, 'witness_corrupt');
+  assert.throws(() => corrupt.admitCommand(device.deviceId, randomUUID(), 'prompt', hashSecret('x'), 'alpha'), { code: 'recovery_hold' });
+  const released = corrupt.releaseRecovery();
+  assert.equal(released.hold, false); assert.equal(released.witnessProblem, 'none');
 });

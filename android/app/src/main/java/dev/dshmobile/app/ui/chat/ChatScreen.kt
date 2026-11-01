@@ -41,6 +41,7 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
     val context = androidx.compose.ui.platform.LocalContext.current
     val fileUnavailable = stringResource(R.string.mobile_file_unavailable)
     val fileFailed = stringResource(R.string.mobile_file_download_failed)
+    val unknownTurnFailure = stringResource(R.string.mobile_turn_failed_unknown)
     val saveDocument = rememberDocumentSaver(snackbars)
     val downloads = remember { kotlinx.coroutines.sync.Semaphore(2) }
     val copied = stringResource(R.string.mobile_copied)
@@ -61,7 +62,16 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
     var viewer by remember(requestedSession) { mutableStateOf<Pair<List<AttachmentRef>, Int>?>(null) }
     val imageCache = remember(model, requestedSession) { ImageMemoryCache { id -> model.loadImage(requireNotNull(requestedSession ?: state.snapshot?.session?.id), id) } }
     val questionHistory = remember(requestedSession) { mutableStateMapOf<String, PendingQuestion>() }
-    LaunchedEffect(state.snapshot?.pendingQuestions) { state.snapshot?.pendingQuestions.orEmpty().forEach { questionHistory[it.callId] = it } }
+    LaunchedEffect(state.snapshot?.pendingQuestions, state.answerDrafts, requestedSession) {
+        val active = state.snapshot?.pendingQuestions.orEmpty()
+        active.forEach { questionHistory[it.callId] = it }
+        val sessionId = state.snapshot?.session?.id
+        val prefix = sessionId?.let { "${it.length}:$it" }
+        val draftIds = if (prefix == null) emptySet() else state.answerDrafts.keys
+            .filter { it.startsWith(prefix) }.map { it.removePrefix(prefix) }.toSet()
+        val retained = retainedQuestionIds(active.map { it.callId }.toSet(), draftIds, questionHistory.keys.toList())
+        questionHistory.keys.retainAll(retained)
+    }
     val openModels = { imagesNeeded = false; models = true; model.loadModels() }
     var searching by androidx.compose.runtime.saveable.rememberSaveable(requestedSession) { mutableStateOf(false) }
     var query by androidx.compose.runtime.saveable.rememberSaveable(requestedSession) { mutableStateOf("") }
@@ -155,6 +165,13 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
                 if (model.taskNotSentIn(it.session.id, model.editorDraft)) Text(stringResource(R.string.mobile_task_not_sent), Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
                     .testTag("task_not_sent").semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.bodyMedium, color = LocalMobileColors.current.warning)
                 if (!executable(state)) Notice(stringResource(R.string.mobile_read_only_notice))
+                it.failure?.let { failure ->
+                    val detail = failure.message.ifBlank { unknownTurnFailure }
+                    Text(stringResource(R.string.mobile_turn_failed, detail),
+                        Modifier.padding(horizontal = Spacing.Gutter, vertical = Spacing.S).testTag("turn_failure")
+                            .semantics { liveRegion = LiveRegionMode.Polite },
+                        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+                }
                 if (it.activity == "waiting" && !(state.capabilities?.questions == true && it.pendingQuestions.isNotEmpty())) Notice(stringResource(R.string.mobile_desktop_notice))
                 else if (it.notice != null) Notice(stringResource(R.string.mobile_partial_information))
                 if (it.activity !in listOf("idle", "running", "waiting")) Notice(stringResource(R.string.mobile_unknown_activity))

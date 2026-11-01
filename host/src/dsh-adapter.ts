@@ -18,6 +18,10 @@ const MAX_MESSAGES = 100;
 // Includes the opening page. page() is message-aligned, so event/byte counts vary.
 const MAX_HISTORY_PAGES = 16;
 const MAX_HISTORY_BYTES = 16 * 1024 * 1024;
+// Live deltas bypass the history-opening budget. Keep provisional text below the
+// wire snapshot ceiling and cap distinct assistant blocks before joining them.
+const MAX_PROVISIONAL_BYTES = 2 * 1024 * 1024;
+const MAX_PROVISIONAL_BLOCKS = 1024;
 const MAX_HISTORY_CACHE_ENTRIES = 16;
 const MAX_HISTORY_CACHE_BYTES = 32 * 1024 * 1024;
 const MAX_HISTORY_WAITERS = 64;
@@ -154,7 +158,7 @@ function receiptBudget(service: object): ReceiptBudget {
 interface CanonicalWorkspace extends WorkspaceConfig { key: string }
 interface WireEvent { type: string; seq: number; time: number; data: unknown; ignorable?: true; surfaceOp?: unknown }
 interface SurfaceNode { seq: number; message?: ChatMessage; answerTurn?: number }
-interface Provisional { id: string; turn: number; step: number; nextIndex: number; createdAt: number; blocks: Map<number, string> }
+interface Provisional { id: string; turn: number; step: number; nextIndex: number; createdAt: number; bytes: number; blocks: Map<number, string> }
 const KNOWN_LOG_TYPES = new Set([
   'agent-preset/selected', 'agent/inbox/spliced', 'approval/asked', 'approval/decided', 'approval/policy',
   'assistant/attempt', 'command/done', 'command/run', 'compaction/end', 'compaction/prune', 'compaction/start',
@@ -166,6 +170,8 @@ const KNOWN_LOG_TYPES = new Set([
   'team/member', 'team/message/delivered', 'team/message/queued', 'team/task', 'todo/write',
   'tool-workflow/agent-end', 'tool-workflow/agent-start', 'tool-workflow/run-end', 'tool-workflow/run-start',
   'tool/call', 'tool/ptc-dispatch', 'tool/ptc-dispatch-start', 'turn/end', 'turn/start',
+  // rc.4/rc.5 (identical server packages) non-surface durable facts: preserve cursor, never expose cwd/job metadata.
+  'working-directory/change', 'job/registered', 'job/settled',
   'web/deepseek-search-llm-request', 'workspace/changes',
 ]);
 const WAIT_NOTICE = 'A question or approval needs attention in DSH on the desktop. Mobile answers are not supported.';
@@ -250,6 +256,7 @@ class Transcript {
   private readonly questions = new Set<string>();
   private projectedQuestions = false;
   private attempt: Provisional | undefined;
+  private failure: { code?: string; message: string } | undefined;
   private revision = 0;
   private terminals: { turn: number; sourceSeq: number }[] = [];
   private openProjectedQuestions = false;
@@ -265,10 +272,11 @@ class Transcript {
     return { ...snapshot, pendingQueue: queueOf(this.phoneInbox), pendingQuestions: this.phoneQuestions, ...(this.phoneQuestions.length ? { activity: 'waiting' as const } : {}) };
   }
   notificationEvidence(): NotificationEvidence {
-    const ambiguous = this.unsupported || this.historyCut || this.gap;
+    const ambiguous = this.unsupported || this.gap || this.historyCut;
+    const completed = ambiguous ? [] : this.terminals.filter(t => this.nodes.some(n => n.answerTurn === t.turn));
     return { sessionId: this.session.id, workspaceId: this.session.workspaceId, cursor: this.cursor, valid: !ambiguous,
       pending: !ambiguous && !this.attentionStopped && ((!!this.turn && this.approvals.size > 0) || (this.questionProjectionPresent ? this.openProjectedQuestions : this.questions.size > 0)),
-      completed: ambiguous ? [] : this.terminals.filter(t => this.nodes.some(n => n.answerTurn === t.turn)) };
+      completed };
   }
   constructor(session: HostSession) { this.session = { ...session }; this.running = session.running; }
   open(frame: Record<string, unknown>, retentionCut = false): void {
@@ -302,7 +310,7 @@ class Transcript {
     this.revision = typeof baseline?.revision === 'number' ? baseline.revision : 0;
     const active = object(baseline?.activeAttempt);
     if (!retentionCut && active && typeof active.attemptId === 'string' && Number.isSafeInteger(active.nextIndex)) {
-      this.attempt = { id: active.attemptId, turn: active.turn as number, step: active.step as number, nextIndex: active.nextIndex as number, createdAt: this.session.updatedAt, blocks: new Map() };
+      this.attempt = { id: active.attemptId, turn: active.turn as number, step: active.step as number, nextIndex: active.nextIndex as number, createdAt: this.session.updatedAt, bytes: 0, blocks: new Map() };
       if (Array.isArray(active.stream)) {
         for (const value of active.stream) {
           const record = object(value);
@@ -367,11 +375,14 @@ class Transcript {
     if (event.type === 'turn/start') {
       this.activityEstablished = true;
       this.attentionStopped = false; this.approvals.clear(); this.questions.clear(); this.openProjectedQuestions = false;
-      this.calls.clear();
+      this.calls.clear(); this.failure = undefined;
       this.turn = Number.isSafeInteger(data?.turn) ? { number: data!.turn as number, startedAt: event.time } : undefined;
     }
     if (event.type === 'turn/end') {
-      if (!this.retentionCut && object(data?.reason)?.kind === 'completed' && Number.isSafeInteger(data?.turn)) this.terminals.push({ turn: data!.turn as number, sourceSeq: event.seq });
+      const reason = object(data?.reason);
+      if (reason?.kind === 'error') this.setFailure(reason.error);
+      else this.failure = undefined;
+      if (!this.retentionCut && reason?.kind === 'completed' && Number.isSafeInteger(data?.turn)) this.terminals.push({ turn: data!.turn as number, sourceSeq: event.seq });
       this.activityEstablished = true;
       this.attentionStopped = true; this.approvals.clear(); this.questions.clear(); this.openProjectedQuestions = false;
       this.turn = undefined; this.calls.clear();
@@ -388,6 +399,16 @@ class Transcript {
     if (event.type === 'user/message') this.session.updatedAt = Math.max(this.session.updatedAt, event.time);
     if (live && event.type === 'turn/start') this.running = true;
     if (live && event.type === 'turn/end') { this.running = false; this.attempt = undefined; }
+    if (event.type === 'assistant/message') this.failure = undefined;
+    if (event.type === 'assistant/attempt') {
+      const stream = Array.isArray(data?.stream) ? data.stream : [];
+      for (const entry of stream) {
+        const chunk = object(object(entry)?.chunk);
+        const reason = object(chunk?.reason);
+        if (chunk?.type !== 'finish' || reason?.kind !== 'error') continue;
+        this.setFailure(reason.failure ?? reason.error);
+      }
+    }
     if ((event.type === 'assistant/message' || event.type === 'assistant/attempt') && this.attempt?.turn === data?.turn && this.attempt?.step === data?.step) this.attempt = undefined;
     // Keep the desktop historical notice; notification evidence additionally
     // requires an open turn for the runtime's turn-enclosed approval audit pair.
@@ -413,7 +434,7 @@ class Transcript {
     if (frame.revision !== this.revision + 1) { this.markGap(); return; }
     this.revision = frame.revision;
     if (frame.type === 'start') {
-      this.attempt = { id: frame.attemptId, turn: frame.turn as number, step: frame.step as number, nextIndex: 0, createdAt: this.session.updatedAt, blocks: new Map() };
+      this.attempt = { id: frame.attemptId, turn: frame.turn as number, step: frame.step as number, nextIndex: 0, createdAt: this.session.updatedAt, bytes: 0, blocks: new Map() };
       this.running = true;
       return;
     }
@@ -433,14 +454,33 @@ class Transcript {
     const index = chunk.index as number;
     if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
       if (attempt.blocks.size === 0 && typeof time === 'number') attempt.createdAt = time;
-      attempt.blocks.set(index, (attempt.blocks.get(index) ?? '') + chunk.text);
+      const current = attempt.blocks.get(index) ?? '';
+      const next = current + chunk.text;
+      if (!this.storeProvisional(attempt, index, current, next)) return;
     } else if (chunk.type === 'block-end') {
       const block = object(chunk.block);
       if (block?.type === 'text' && typeof block.text === 'string') {
         if (attempt.blocks.size === 0 && typeof time === 'number') attempt.createdAt = time;
-        attempt.blocks.set(index, block.text); // block-end replaces accumulated deltas, never doubles them
+        const current = attempt.blocks.get(index) ?? '';
+        if (!this.storeProvisional(attempt, index, current, block.text)) return; // block-end replaces accumulated deltas, never doubles them
       }
     }
+  }
+  private setFailure(value: unknown): void {
+    const error = object(value);
+    const code = typeof error?.code === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(error.code) ? error.code : undefined;
+    const message = typeof error?.message === 'string'
+      ? error.message.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 512) : '';
+    this.failure = { ...(code ? { code } : {}), message: message || 'The turn failed.' };
+  }
+  /** Bounds one attempt before joining/sorting; overflow invalidates provisional text and demands a fresh cut. */
+  private storeProvisional(attempt: Provisional, index: number, previous: string, next: string): boolean {
+    if (!attempt.blocks.has(index) && attempt.blocks.size >= MAX_PROVISIONAL_BLOCKS) { this.markGap(); return false; }
+    const delta = Buffer.byteLength(next, 'utf8') - Buffer.byteLength(previous, 'utf8');
+    if (attempt.bytes + delta > MAX_PROVISIONAL_BYTES) { this.markGap(); return false; }
+    attempt.bytes += delta;
+    attempt.blocks.set(index, next);
+    return true;
   }
   private trim(): void {
     const visible = this.nodes.filter((entry) => entry.message);
@@ -464,6 +504,7 @@ class Transcript {
       activity: !knownActivity ? 'unknown' : waiting ? 'waiting' : this.running ? 'running' : 'idle',
       ...(knownActivity && this.running && this.turn ? { activityDetail: { turnStartedAt: this.turn.startedAt, ...([...this.calls.values()].at(-1) ? { tool: [...this.calls.values()].at(-1)! } : {}) } } : {}),
       ...(this.unsupported ? { notice: UNKNOWN_NOTICE } : this.historyCut ? { notice: HISTORY_CUT_NOTICE } : this.gap ? { notice: GAP_NOTICE } : waiting ? { notice: WAIT_NOTICE } : {}),
+      ...(this.failure ? { failure: { ...this.failure } } : {}),
     };
   }
 }
@@ -1171,14 +1212,17 @@ export class DshAdapter implements HostAdapter {
       await this.options.sessionController.prompt({ requestId, sessionId, mode: options?.delivery ?? 'queue', content }, active);
       // ACK can be a requestId dedup hit before attachment binding. Only public
       // resolve proving retirement can release this conservative reservation.
-      const service = this.options.fileUploads;
-      if (service?.resolve && this.options.sessionController.resolveAgent) {
-        const resolved = await this.options.sessionController.resolveAgent(sessionId);
-        if ('error' in resolved) return;
-        const budget = receiptBudget(service);
-        const accepted = new Set((options?.attachments ?? []).flatMap(a => a.upstream.type === 'file' ? [a.upstream.receiptId] : []));
-        if (budget) for (const [key, entry] of budget) if (entry.sessionId === sessionId && entry.receiptId && accepted.has(entry.receiptId) && service.resolve(resolved.agent, entry.receiptId) === undefined) budget.delete(key);
-      }
+      // Post-ACK bookkeeping must never rewrite an admission that DSH already accepted.
+      try {
+        const service = this.options.fileUploads;
+        if (service?.resolve && this.options.sessionController.resolveAgent) {
+          const resolved = await this.options.sessionController.resolveAgent(sessionId);
+          if ('error' in resolved) return;
+          const budget = receiptBudget(service);
+          const accepted = new Set((options?.attachments ?? []).flatMap(a => a.upstream.type === 'file' ? [a.upstream.receiptId] : []));
+          if (budget) for (const [key, entry] of budget) if (entry.sessionId === sessionId && entry.receiptId && accepted.has(entry.receiptId) && service.resolve(resolved.agent, entry.receiptId) === undefined) budget.delete(key);
+        }
+      } catch { /* Receipt retirement is diagnostic cleanup; the prompt itself is already admitted. */ }
     } catch (error) { throw phoneError(error); }
   }
   async cancel(sessionId: string, signal: AbortSignal, expectedCursor: number, expectedWorkspaceId: string): Promise<void> {

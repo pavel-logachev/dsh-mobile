@@ -52,7 +52,8 @@ function eventBridge(ctx: CompanionContext): DshEvents {
         const e = value as Record<string, unknown>, d = e.data as Record<string, unknown> | undefined;
         listener(session.id, { type: e.type as string, seq: e.seq as number, time: e.time as number,
           ...(Number.isSafeInteger(d?.turn) ? { turn: d!.turn as number } : {}),
-          ...(e.type === 'turn/end' ? { completed: !!d?.reason && (d.reason as { kind?: string }).kind === 'completed' } : {}) });
+          ...(e.type === 'turn/end' ? { completed: !!d?.reason && (d.reason as { kind?: string }).kind === 'completed' } : {}),
+          ...(e.type === 'approval/asked' || (e.type === 'tool/call' && d?.name === 'ask_user_question') ? { attention: true } : {}) });
       }, { global: true });
     },
     subscribe(sessionId, listener) {

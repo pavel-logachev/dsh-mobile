@@ -110,6 +110,7 @@
     <string name="mobile_error_network_unavailable">Could not reach your computer. Make sure it is on and DSH is running, check the internet connection, then reconnect. The connection may also be unavailable at the relay; the app cannot confirm the cause.</string>
     <string name="mobile_error_tls_failed">Could not verify the computer certificate. Check its certificate, address and invitation. Verification cannot be bypassed.</string>
     <string name="mobile_error_rate_limited">Too many requests. Wait a moment before reconnecting.</string>
+    <string name="mobile_error_recovery_hold">The computer is reconciling its command receipts: new commands stay blocked until the operator finishes. History and receipts remain available.</string>
     <string name="mobile_error_host_error">The computer could not complete this request. Check the host and refresh the connection.</string>
     <string name="mobile_error_storage_failed">Could not securely save phone state. Do not resend an uncertain task; check it on your computer.</string>
     <string name="mobile_error_not_paired">Connect your computer with an invitation first.</string>
@@ -128,6 +129,8 @@
     <string name="mobile_sessions_truncated">Showing the latest 1000 chats. Remaining chats are available on your computer.</string>
     <string name="mobile_reset_connection">Reset local connection</string>
     <string name="mobile_partial_information">Some details are not available on the phone yet. Open the chat on your computer if needed.</string>
+    <string name="mobile_turn_failed">The turn ended with an error: %1$s</string>
+    <string name="mobile_turn_failed_unknown">unknown upstream error</string>
     <string name="mobile_paste_json">Paste JSON manually</string>
     <string name="mobile_hide_json">Hide invitation JSON</string>
     <string name="mobile_invitation_ready">Invitation loaded. Review the computer identity before connecting.</string>

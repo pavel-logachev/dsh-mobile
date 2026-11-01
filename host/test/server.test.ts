@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type { TestContext } from 'node:test';
-import { startHostServer } from '../src/server.ts';
+import { startHostServer, createHostServer } from '../src/server.ts';
 import { HostState } from '../src/state.ts';
 import { createDshAdapter } from '../src/dsh-adapter.ts';
 import { createWorkspaceSource } from '../src/workspace-source.ts';
@@ -40,11 +40,11 @@ class TestAdapter implements HostAdapter {
   async cancel() {}
 }
 
-async function setup(t: TestContext, adapter: HostAdapter = new TestAdapter()) {
+async function setup(t: TestContext, adapter: HostAdapter = new TestAdapter(), extra: { dispatchTimeoutMs?: number } = {}) {
   const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-server-')));
   mkdirSync(join(dir, 'alpha')); mkdirSync(join(dir, 'beta'));
   const config: HostConfiguration = { hostName: 'Test fixture only', bind: '127.0.0.1', port: 0, statePath: join(dir, 'host.sqlite'), allowInsecureLoopback: true, workspaces: ['alpha', 'beta'].map(id => ({ id, name: id, path: join(dir, id) })) };
-  const host = await startHostServer({ config, adapter });
+  const host = await startHostServer({ config, adapter, ...extra });
   const baseUrl = (await host.start()).baseUrl;
   const hosts = [host];
   t.after(async () => { for (const item of hosts) await item.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -78,6 +78,23 @@ test('blank sessions are hidden only in the index, mobile creates remain visible
   const restarted = await startHostServer({ config, adapter }); hosts.push(restarted); const url = (await restarted.start()).baseUrl;
   const items = (await (await fetch(url + '/v1/sessions', { headers: { Authorization: 'Bearer ' + deviceToken } })).json()).items;
   assert.equal(items[0].id, 's-alpha');
+});
+
+test('ledger recovery hold blocks fresh commands but keeps receipt replay and reads', async t => {
+  const { host, request, pair } = await setup(t), { deviceToken } = await pair();
+  const known = randomUUID();
+  assert.equal((await request('/sessions', deviceToken, 'POST', { requestId: known, workspaceId: 'alpha' })).status, 201);
+  host.state.setRecoveryHold('synthetic-test');
+  const blocked = await request('/sessions', deviceToken, 'POST', { requestId: randomUUID(), workspaceId: 'alpha' });
+  assert.equal(blocked.status, 503);
+  assert.equal((await blocked.json()).error.code, 'recovery_hold');
+  assert.equal((await request('/sessions', deviceToken)).status, 200, 'the session index stays readable');
+  assert.equal((await request('/sessions/s-alpha', deviceToken)).status, 200, 'history stays readable');
+  assert.equal((await request(`/commands/${known}`, deviceToken)).status, 200, 'a receipt stays readable');
+  const replay = await request('/sessions', deviceToken, 'POST', { requestId: known, workspaceId: 'alpha' });
+  assert.equal(replay.status, 201); assert.equal((await replay.json()).requestId, known);
+  host.state.releaseRecovery();
+  assert.equal((await request('/sessions', deviceToken, 'POST', { requestId: randomUUID(), workspaceId: 'alpha' })).status, 201);
 });
 
 test('absent blank fails open and waiting boolean is projected into the index', async t => {
@@ -628,6 +645,49 @@ test('grant narrowing while pre-dispatch observation is pending prevents executi
   assert.equal((await request('/sessions/s-alpha/messages', paired.deviceToken, 'POST', body)).status, 403);
 });
 
+for (const stopDuringUpload of [false, true]) test(stopDuringUpload ? 'host close preserves admitted file bytes until held upload settles' : 'accepted file send removes staged bytes after settlement', { timeout: 15000 }, async t => {
+  const entered = Promise.withResolvers<void>(), gate = Promise.withResolvers<void>(), settled = Promise.withResolvers<void>();
+  const payload = 'Файл 😀\r\n'.repeat(10000);
+  const adapter: HostAdapter = new TestAdapter();
+  adapter.phoneCapabilities = () => ({ steer: false, queue: false, rename: false, models: false, questions: false, attachments: true });
+  adapter.upload = async (_id, input) => {
+    const iterator = input.data[Symbol.asyncIterator](), first = await iterator.next();
+    assert.equal(first.done, false); entered.resolve(); await gate.promise;
+    const chunks: Uint8Array[] = [first.value!];
+    for (let next = await iterator.next(); !next.done; next = await iterator.next()) chunks.push(next.value);
+    assert.equal(Buffer.concat(chunks).toString(), payload);
+    return { ref: { id: 'file', name: input.name, size: input.size, mime: input.mime, kind: 'file' }, upstream: { type: 'file', receiptId: 'receipt' } };
+  };
+  adapter.reserveFileUploads = async () => ({ release() { settled.resolve(); } });
+  const { host, hosts, config, baseUrl, request, pair } = await setup(t, adapter), { deviceToken } = await pair();
+  const fs = await import('node:fs/promises'), directory = join(config.statePath, '..', 'mobile-uploads');
+  const picked = await fetch(baseUrl + '/v1/sessions/s-alpha/uploads', { method: 'POST', headers: { Authorization: 'Bearer ' + deviceToken, 'Content-Type': 'text/plain', 'X-File-Name': encodeURIComponent('Файл с пробелом.txt') }, body: payload });
+  assert.equal(picked.status, 201); const { uploadId } = await picked.json();
+  const [name] = await fs.readdir(directory); assert.ok(name); const path = join(directory, name);
+  const sending = request('/sessions/s-alpha/messages', deviceToken, 'POST', { requestId: randomUUID(), text: 'Synthetic', uploadIds: [uploadId] });
+  try {
+    await entered.promise;
+    if (stopDuringUpload) {
+      assert.equal((await sending).status, 202);
+      await host.close();
+      const restarted = await startHostServer({ config, adapter }); hosts.push(restarted);
+      assert.equal(await fs.readFile(path, 'utf8'), payload, 'close and reload must not remove bytes still owned by the adapter');
+    }
+  } finally { gate.resolve(); }
+  await settled.promise;
+  if (!stopDuringUpload) {
+    const response = await sending;
+    let receipt = await response.json();
+    for (let i = 0; i < 100 && receipt.status === 'pending'; i++) {
+      const result = await request('/commands/' + receipt.requestId, deviceToken); receipt = await result.json();
+      if (receipt.status === 'pending') await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(receipt.status, 'accepted');
+  }
+  for (let i = 0; i < 100 && (await fs.readdir(directory)).length; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(await fs.readdir(directory), []);
+});
+
 test('unfinished dispatch becomes uncertain after restart and is never retried', async t => {
   const adapter = new TestAdapter();
   let entered!: () => void, release!: () => void, done!: () => void;
@@ -719,6 +779,12 @@ test('idle permission rechecks cannot republish obsolete history across an async
   const response = await fetch(`${(await host.start()).baseUrl}/v1/sessions/s-alpha/events`, { headers: { authorization: `Bearer ${device.deviceToken}` } });
   const reader = response.body!.getReader(); await reader.read(); await watching;
   await started; // The timer captured the old frame, then its live source check blocked.
+  let pulseTimer: ReturnType<typeof setTimeout> | undefined;
+  const pulse = await Promise.race([
+    reader.read(),
+    new Promise<never>((_, reject) => { pulseTimer = setTimeout(() => reject(Error('heartbeat starved by scope I/O')), 1500); }),
+  ]).finally(() => { if (pulseTimer) clearTimeout(pulseTimer); });
+  assert.match(new TextDecoder().decode(pulse.value), /: heartbeat/, 'scope I/O must not starve stream liveness');
   publish();
   const fresh = new TextDecoder().decode((await reader.read()).value);
   assert.match(fresh, /NEW AUTHORITATIVE TEXT/);
@@ -762,6 +828,69 @@ test('SSE reconnect replaces history and both local and external revocation clos
   const liveReader = live.body!.getReader(); await liveReader.read();
   host.state.revokeDevice(local.deviceId);
   assert.equal((await liveReader.read()).done, true);
+});
+
+test('an admitted dispatch that exceeds its deadline settles uncertain instead of staying pending', { timeout: 5000 }, async t => {
+  const adapter = new TestAdapter();
+  adapter.prompt = async (_id, _text, _requestId, signal) => new Promise((_, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+  const { request, pair } = await setup(t, adapter, { dispatchTimeoutMs: 20 }), { deviceToken } = await pair();
+  const requestId = randomUUID();
+  const response = await request('/sessions/s-alpha/messages', deviceToken, 'POST', { requestId, text: 'Synthetic held dispatch' });
+  assert.equal(response.status, 202);
+  let receipt = await response.json();
+  for (let i = 0; i < 100 && receipt.status === 'pending'; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+    receipt = await (await request('/commands/' + requestId, deviceToken)).json();
+  }
+  assert.equal(receipt.status, 'uncertain');
+});
+
+test('closing during create writes no mobile-session row after the injected SQLite remains open', { timeout: 5000 }, async t => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-close-create-')));
+  mkdirSync(join(dir, 'alpha'));
+  const state = new HostState(join(dir, 'host.sqlite'));
+  const entered = Promise.withResolvers<void>(), gate = Promise.withResolvers<void>();
+  const adapter = new TestAdapter();
+  adapter.createSession = async () => { entered.resolve(); await gate.promise; return { sessionId: 'late-session' }; };
+  const config: HostConfiguration = { hostName: 'Close fixture', bind: '127.0.0.1', port: 0, statePath: join(dir, 'host.sqlite'), allowInsecureLoopback: true, workspaces: [{ id: 'alpha', name: 'alpha', path: join(dir, 'alpha') }] };
+  const host = await createHostServer({ config, adapter, state });
+  t.after(async () => { gate.resolve(); await host.close(); state.close(); rmSync(dir, { recursive: true, force: true }); });
+  const baseUrl = (await host.start()).baseUrl;
+  const offer = state.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: ['alpha'] });
+  const paired = await fetch(baseUrl + '/v1/pairings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairingToken: offer.pairingToken, deviceName: 'Close phone' }) });
+  const { deviceToken } = await paired.json() as { deviceToken: string };
+  const requestId = randomUUID();
+  const sending = fetch(baseUrl + '/v1/sessions', { method: 'POST', headers: { Authorization: 'Bearer ' + deviceToken, 'Content-Type': 'application/json' }, body: JSON.stringify({ requestId, workspaceId: 'alpha' }) }).catch(() => undefined);
+  await entered.promise; await host.close();
+  assert.equal(state.mobileSessionVisible('session-' + requestId.toLowerCase(), true), false, 'a closing create must not retain the requested placeholder');
+  gate.resolve(); await sending;
+  assert.equal(state.mobileSessionVisible('late-session', true), false, 'a closing create must not retain the returned ID');
+});
+
+test('unsettled dispatches are capped before admission and the overflow gets no receipt', { timeout: 10000 }, async t => {
+  const adapter = new TestAdapter(), gate = Promise.withResolvers<void>();
+  let entered = 0;
+  adapter.prompt = async (_id, _text, _requestId, signal) => {
+    entered++;
+    await Promise.race([gate.promise, new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))]);
+  };
+  const { request, pair } = await setup(t, adapter, { dispatchTimeoutMs: 5000 }), { deviceToken } = await pair(), second = await pair();
+  const tokens = [deviceToken, second.deviceToken];
+  const accepted = await Promise.all(Array.from({ length: 32 }, (_, index) => {
+    const requestId = randomUUID();
+    return request('/sessions/s-alpha/messages', tokens[index % 2], 'POST', { requestId, text: 'Held ' + requestId }).then(async response => ({ response, requestId }));
+  }));
+  for (const { response } of accepted) assert.equal(response.status, 202);
+  for (let i = 0; i < 100 && entered < 32; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(entered, 32);
+  const overflowId = randomUUID();
+  const overflow = await request('/sessions/s-alpha/messages', deviceToken, 'POST', { requestId: overflowId, text: 'Overflow' });
+  assert.equal(overflow.status, 429);
+  assert.equal((await overflow.json()).error.code, 'rate_limited');
+  assert.equal((await request('/commands/' + overflowId, deviceToken)).status, 404);
+  gate.resolve();
 });
 
 test('concurrent duplicate commands return one persisted receipt and conflicting payload never dispatches', async t => {
@@ -819,6 +948,20 @@ test('wildcard read and execute grants cover all configured scope, while read-on
   assert.equal((await request('/sessions/s-beta', readOnly.deviceToken)).status, 200);
   assert.equal((await request('/sessions/s-beta/messages', readOnly.deviceToken, 'POST', { requestId: randomUUID(), text: 'Denied' })).status, 403);
   assert.equal((await (await request('/sessions', readOnly.deviceToken)).json()).items.every((item: { canExecute: boolean }) => !item.canExecute), true);
+});
+
+test('session pagination is keyset and does not repeat an item moved above the cut', async t => {
+  const { adapter, request, pair } = await setup(t);
+  const all = await pair({ readWorkspaceIds: ['*'], executeWorkspaceIds: ['*'] });
+  adapter.snapshots.get('s-alpha')!.session.updatedAt = 100;
+  adapter.snapshots.get('s-beta')!.session.updatedAt = 50;
+  const first = await (await request('/sessions?limit=1', all.deviceToken)).json();
+  assert.deepEqual(first.items.map((item: { id: string }) => item.id), ['s-alpha']);
+  // s-beta moves above the cut before page two; an offset would repeat s-alpha.
+  adapter.snapshots.get('s-beta')!.session.updatedAt = 200;
+  const next = await (await request(`/sessions?limit=1&cursor=${first.nextCursor}`, all.deviceToken)).json();
+  assert.deepEqual(next.items, []);
+  assert.equal(next.nextCursor, null);
 });
 
 test('read grants filter every session and pagination; execute grants and self revocation are enforced', async t => {

@@ -110,6 +110,7 @@
     <string name="mobile_error_network_unavailable">Не удалось связаться с компьютером. Убедитесь, что он включён и DSH запущен, проверьте интернет и подключитесь снова. Соединение также может быть недоступно на сервере-посреднике; приложение не может подтвердить причину.</string>
     <string name="mobile_error_tls_failed">Не удалось проверить сертификат компьютера. Проверьте сертификат, адрес и приглашение. Обойти проверку нельзя.</string>
     <string name="mobile_error_rate_limited">Слишком много запросов. Подождите немного перед повторным подключением.</string>
+    <string name="mobile_error_recovery_hold">На компьютере идёт сверка квитанций: новые команды заблокированы, пока оператор её не завершит. История и квитанции доступны.</string>
     <string name="mobile_error_host_error">Компьютер не смог выполнить запрос. Проверьте его состояние и обновите подключение.</string>
     <string name="mobile_error_storage_failed">Не удалось безопасно сохранить состояние телефона. Не повторяйте неподтверждённую задачу; проверьте её на компьютере.</string>
     <string name="mobile_error_not_paired">Сначала подключите компьютер с помощью приглашения.</string>
@@ -128,6 +129,8 @@
     <string name="mobile_sessions_truncated">Показаны последние 1000 чатов. Остальные доступны на компьютере.</string>
     <string name="mobile_reset_connection">Сбросить локальное подключение</string>
     <string name="mobile_partial_information">Часть сведений пока недоступна на телефоне. При необходимости откройте чат на компьютере.</string>
+    <string name="mobile_turn_failed">Ход завершился ошибкой: %1$s</string>
+    <string name="mobile_turn_failed_unknown">неизвестная ошибка провайдера</string>
     <string name="mobile_paste_json">Вставить JSON вручную</string>
     <string name="mobile_hide_json">Скрыть JSON приглашения</string>
     <string name="mobile_invitation_ready">Приглашение загружено. Проверьте компьютер перед подключением.</string>

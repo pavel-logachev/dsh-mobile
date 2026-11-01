@@ -39,6 +39,8 @@ Require **Node 24.x** and an exact DSH version in this explicit allowlist:
 | --- | --- | --- |
 | `0.2.0-rc.2` | `4.0.4` | declarations + compiled JS + isolated full/registry canaries |
 | `0.2.1-alpha.1` | `4.0.5-alpha.1` | declarations + compiled JS + isolated full/registry canaries |
+| `0.2.1-rc.4` | `~4.0.5` | declarations + compiled JS inspected; rc.5 installed-runtime acceptance |
+| `0.2.1-rc.5` | `~4.0.5` | declarations + compiled JS inspected; installed-runtime acceptance |
 
 Do not accept an arbitrary semver range, “latest”, matching method names, or an unverified version string. The plugin requires an explicit `dshVersion` declaration. The installer checks the real `dsh --version`; standalone setup defaults to auto-detection and validates its output. If `dsh` is not on PATH, locate the owner's already-installed trusted launcher and pass `-DshCommand '<absolute launcher>'` to the installer. Do not download another DSH runtime or change a running installation just to make preflight succeed.
 
@@ -210,7 +212,7 @@ After scanning, confirm a new device in `devices`; do not print its bearer token
 
 1. More than one registered project appears in the expected sidebar order; the current workspace/session is not replaced with a mock fixture.
 2. The phone can read an existing approved session. Add/rename a test project on the desktop: it appears without re-pairing/reloading. Archived sessions stay hidden; missing directories stay omitted.
-3. If execution was approved, create one synthetic conversation, send a harmless prompt, observe provisional output become the authoritative final text, and stop with the current observation. With host plugin 0.7.0 or later (current release: 0.7.2), agent questions can be answered or skipped from the phone; approvals still require the desktop, and the phone must not pretend a pending approval is idle.
+3. If execution was approved, create one synthetic conversation, send a harmless prompt, observe provisional output become the authoritative final text, and stop with the current observation. With host plugin 0.7.0 or later (current release: 0.9.0), agent questions can be answered or skipped from the phone; approvals still require the desktop, and the phone must not pretend a pending approval is idle.
 4. Disconnect/reconnect while work runs: desktop execution continues; reconnect replaces history with an authoritative snapshot. Do not automatically resend an uncertain command with a new request ID.
 5. For Tailscale, repeat on mobile data with the LAN disconnected. A local unit test or canary is **not** physical-phone/network acceptance.
 
@@ -246,6 +248,28 @@ node $cli revoke --config $config --device '<DEVICE_UUID>'
 ```
 
 Repeat installation/activation/uninstall is idempotent. Immutable payload mismatch/corruption fails; a same-version zip is never overwritten to bypass it. The receipts and backups are for managed rollback/comparison, not blind full-profile restoration over later unrelated edits. Revoke affected devices before losing administration access. Undo only a firewall rule this procedure created. Deleting private TLS/config/SQLite/invitations/versions requires a **separate owner-approved secure cleanup** after disposal; the installer does not erase them.
+
+### Restoring the command ledger from a backup
+
+This procedure requires the host build with the ledger witness and `recovery-*` commands (host plugin 0.9.0); the earlier published 0.7.2 does not have them. The command ledger is `<statePath>` (normally `state/host.sqlite`) plus its sidecar witness `<statePath>.ledger.json`. If only the database is restored, the sidecar proves the rollback and the host opens with a recovery hold: new commands are refused, while receipts and history remain readable. If both files are restored together or the sidecar is lost, detection cannot work; use the manual hold below before accepting new commands.
+
+1. Stop DSH (or at least the companion listener) so SQLite is closed; do not restore a database while the host is writing it.
+2. Restore `host.sqlite` from the chosen backup. Leave `.ledger.json` in place if it survived; do not edit either file by hand.
+3. If the sidecar is missing or was restored with the database, arm the hold explicitly before or after starting the host:
+   ```powershell
+   node $cli recovery-hold --config $config --reason 'restored backup of host.sqlite'
+   ```
+4. Inspect the ledger and recent commands, and reconcile every uncertain or missing command against the actual DSH chat history:
+   ```powershell
+   node $cli recovery-status --config $config
+   ```
+5. Only after that review, release with a new epoch:
+   ```powershell
+   node $cli recovery-release --config $config --new-epoch
+   ```
+6. Reopen the phone app and reconnect. The app treats a held send as not sent and keeps the draft; it does not retry automatically.
+
+`recovery-status` and `recovery-hold` may be run while the host is running; the release is also read by the next admission. The epoch increment is an operator decision record, not proof that the commands lost with the backup never executed. A hold never changes an existing receipt's status and never deletes history.
 
 ## 11. Advanced: optional self-hosted relay
 

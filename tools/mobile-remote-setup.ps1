@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory)][string]$RouteCredentialsPath,
     [Parameter(Mandatory)][string]$RelayUrl,
     [string]$WorkspacesPath,
-    [ValidateSet('0.2.0-rc.2','0.2.1-alpha.1')][string]$DshVersion = '0.2.1-alpha.1',
+    [ValidateSet('0.2.0-rc.2','0.2.1-alpha.1','0.2.1-rc.4','0.2.1-rc.5')][string]$DshVersion = '0.2.1-alpha.1',
     [string]$HostName = 'DSH Mobile private host',
     [string]$OpenSslPath,
     [switch]$Initialize,

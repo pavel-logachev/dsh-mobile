@@ -145,7 +145,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             409 -> if (error.code == "question_expired") "question_expired" else "request_conflict"
             429 -> "rate_limited"
             else -> if (status in 400..599 && history) "chat_unavailable" else hostErrorKey(error.code)
-        }, retryAfterMs)
+        }, retryAfterMs, retryable = error.retryable)
     }
 
     suspend fun pair(secret: String, name: String): PairingResponse {
@@ -319,7 +319,8 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             }
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
                 if (retired.get() || cancelled.get()) return
-                onFailure(MobileFailure(when (response?.code) {
+                val status = response?.code
+                onFailure(MobileFailure(when (status) {
                     401 -> "unauthorized"
                     403 -> "forbidden"
                     429 -> "rate_limited"
@@ -329,7 +330,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
                         is SSLException -> "tls_failed"
                         else -> "network_unavailable"
                     }
-                }))
+                }, retryable = status == 429 || (status != null && status in 500..599)))
             }
             })
         }
