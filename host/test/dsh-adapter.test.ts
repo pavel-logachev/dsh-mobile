@@ -14,7 +14,6 @@ import type { DshObservation } from '../src/dsh-adapter.ts';
 import { FixtureAdapter, FIXTURE, MULTI_PROJECT_FIXTURE } from '../src/fixture-adapter.ts';
 import { createWorkspaceSource } from '../src/workspace-source.ts';
 import { HostState } from '../src/state.ts';
-import { NotificationFeed } from '../src/notifications.ts';
 
 async function harness(t: { after: (fn: () => Promise<void>) => void }, pollIntervalMs = 10000, throttleMs = 5) {
   const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-adapter-')));
@@ -47,7 +46,7 @@ async function harness(t: { after: (fn: () => Promise<void>) => void }, pollInte
     dshVersion: '0.2.0-rc.2', sessionController: controller,
     agentPresets: { async remoteExportList() { return { presets }; } },
     workspaces: [{ id: 'alpha', name: 'Alpha', path: alpha }],
-    events: { subscribeNotifications() { return () => {}; }, subscribe(_id, listener) { listeners.add(listener); return () => { listeners.delete(listener); }; } },
+    events: { subscribe(_id, listener) { listeners.add(listener); return () => { listeners.delete(listener); }; } },
     pollIntervalMs, throttleMs,
   });
   const cleanupResources: (() => Promise<unknown>)[] = [];
@@ -249,70 +248,6 @@ test('failure scope uses fresh point headers, hides missing/child/archive and in
   await assert.rejects(pending, { code: 'not_found' }, 'a new provider cannot authorize an old awaited view');
   assert.equal(await adapter.sessionScope('session-fixture', signal), 'alpha');
   assert.equal(h.cleanup().resumed, 0); assert.equal(h.cleanup().closed, 0);
-});
-
-test('notification point authority rejects child/archive/remap and proves completion without corpus IO', async t => {
-  const h = await harness(t); let header: unknown = h.frame.header;
-  const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', workspaces: [{ id: 'alpha', name: 'Alpha', path: h.alpha }],
-    sessionController: { ...h.controller, async list() { throw Error('notification scanned corpus'); } },
-    sessionHeader: async () => header, sessionStatus: () => ({ running: false, updatedAt: 0 }),
-    events: { subscribe() { return () => {}; }, subscribeNotifications() { return () => {}; } },
-  });
-  t.after(() => adapter.dispose()); const source = adapter.notifications()!, signal = new AbortController().signal;
-  const listed = await source.lookup!('session-fixture', signal);
-  assert.equal(listed?.workspaceId, 'alpha');
-  assert.deepEqual((await source.evidence('session-fixture', signal, listed)).completed, [{ turn: 1, sourceSeq: 7 }]);
-  header = { ...h.frame.header, origin: 'subagent' }; assert.equal(await source.lookup!('session-fixture', signal), undefined);
-  header = { ...h.frame.header, cwd: h.dir }; assert.equal(await source.lookup!('session-fixture', signal), undefined);
-  header = undefined; assert.equal(await source.lookup!('session-fixture', signal), undefined);
-  assert.equal(h.cleanup().resumed, 0, 'point notification read must not promote the cold session');
-});
-
-test('notification evidence is cold-safe and demands authoritative completed turn and pending episode', async t => {
-  const h = await harness(t); const signal = new AbortController().signal;
-  const source = h.adapter.notifications()!;
-  assert.deepEqual((await source.evidence('session-fixture', signal)).completed, [{ turn: 1, sourceSeq: 7 }]);
-  (h.frame.records[7]!.event.data as any).reason.kind = 'cancelled';
-  assert.equal((await source.evidence('session-fixture', signal)).completed.length, 0);
-  h.frame.records.pop(); h.frame.cursor = 6; h.row.running = true;
-  assert.equal((await source.evidence('session-fixture', signal)).completed.length, 0);
-  (h.frame.records as any[]).push({ type: 'event', event: { seq: 7, time: 1700000000008, type: 'approval/asked', data: { id: 'approval', toolName: 'write' } } }); h.frame.cursor = 7;
-  assert.equal((await source.evidence('session-fixture', signal)).pending, true);
-  (h.frame.records as any[]).push({ type: 'event', event: { seq: 8, time: 1700000000009, type: 'approval/decided', data: { id: 'approval', outcome: 'allowed-once' } } }); h.frame.cursor = 8;
-  assert.equal((await source.evidence('session-fixture', signal)).pending, false);
-  assert.equal(h.cleanup().resumed, 0);
-});
-
-for (const kind of ['question', 'approval'] as const) test(`adapter to feed recovers idle open ${kind} but suppresses continued and stale stopped requests`, async t => {
-  t.mock.timers.enable({ apis: ['setInterval'] });
-  const h = await harness(t); h.row.running = false;
-  h.frame.records = h.frame.records.slice(0, 1); h.frame.cursor = 0;
-  (h.frame.records as any[]).push({ type: 'event', event: { seq: 1, time: 1700000000001, type: kind === 'question' ? 'tool/call' : 'approval/asked', data: kind === 'question' ? { turn: 1, step: 1, callId: 'q', name: 'ask_user_question', arguments: '{"questions":[{"id":"one","question":"Synthetic"}]}' } : { id: 'a', toolName: 'read' } } });
-  h.frame.cursor = 1; h.frame.projections.asOfSeq = 1;
-  if (kind === 'question') (h.frame.projections.values.userQuestions.active as unknown[]).push({ callId: 'q', state: 'open', questions: [{ id: 'one', question: 'Synthetic' }] });
-  const state = new HostState(join(h.dir, 'notification-test.sqlite'));
-  const device = state.consumePairing(state.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Synthetic');
-  const feed = new NotificationFeed(state, h.adapter.notifications()!); h.closeBeforeCleanup(async () => { await feed.close(); state.close(); });
-  await feed.start(); feed.putSettings(device.deviceId, { expectedRevision: 0, enabled: true, projects: [], chats: [] }); await feed.idle();
-  const head = (await feed.page(device.deviceId)).nextCursor;
-  t.mock.timers.tick(60000); await feed.idle();
-  assert.equal((await h.adapter.notifications()!.evidence('session-fixture', new AbortController().signal)).pending, true, 'running:false must not suppress an authoritative open request');
-  const live = await feed.page(device.deviceId, head);
-  assert.equal((await feed.page(device.deviceId)).pending.length, 1);
-  assert.equal(live.items.filter(e => e.kind === 'attention-needed').length, 1);
-  if (kind === 'question') {
-    (h.frame.projections.values.userQuestions.active as any[])[0].state = 'continued';
-    t.mock.timers.tick(60000); await feed.idle();
-    assert.equal((await feed.page(device.deviceId)).pending.length, 0, 'continued-only is never an alert');
-    (h.frame.projections.values.userQuestions.active as any[])[0].state = 'open';
-  }
-  (h.frame.records as any[]).push({ type: 'event', event: { seq: 2, time: 1700000000002, type: 'turn/end', data: { turn: 1, reason: { kind: 'cancelled' } } } });
-  h.frame.cursor = 2; h.frame.projections.asOfSeq = 2;
-  t.mock.timers.tick(60000); await feed.idle();
-  const stopped = await feed.page(device.deviceId, live.nextCursor);
-  assert.equal(stopped.pending.length, 0, 'historical unmatched request after stop is stale even with a leftover open projection');
-  assert.equal(stopped.items.filter(e => e.kind === 'attention-needed').length, 0);
-  assert.equal(h.cleanup().resumed, 0); assert.deepEqual(h.calls(), { created: undefined, prompted: undefined, cancelled: undefined });
 });
 
 test('registry sessions map by canonical cwd, hide archived/missing roots, and create uses live admission scope', async t => {
@@ -678,29 +613,9 @@ test('the plugin composes and disposes with actual installed Cordis and harmless
   await fiber;
   const response = await fetch(`http://127.0.0.1:${port}/v1/capabilities`);
   assert.equal(response.status, 401);
-  const admin = new (await import('../src/state.ts')).HostState(config.statePath);
-  try {
-    const paired = admin.consumePairing(admin.createPairing({ readWorkspaceIds: ['alpha'], executeWorkspaceIds: [] }).pairingToken, 'Notification stub');
-    const headers = { Authorization: 'Bearer ' + paired.deviceToken, 'Content-Type': 'application/json' };
-    assert.equal((await fetch(`http://127.0.0.1:${port}/v1/notification-settings`, { method: 'PUT', headers, body: JSON.stringify({ expectedRevision: 0, enabled: true, projects: [], chats: [] }) })).status, 200);
-    const head = await (await fetch(`http://127.0.0.1:${port}/v1/notification-events`, { headers })).json();
-    h.row.sessionId = 'pc-new-chat'; h.frame.header.id = 'pc-new-chat';
-    const started = { type: 'event', event: { seq: 8, time: Date.now() + 0, type: 'turn/start', data: { turn: 2 } } };
-    const answer = { type: 'event', event: { seq: 9, time: Date.now() + 1, type: 'assistant/message', surfaceOp: 'append', data: { turn: 2, step: 1, message: { id: 'pc-answer', role: 'assistant', content: [{ type: 'text', text: 'Synthetic final answer' }] } } } };
-    const end = { type: 'event', event: { seq: 10, time: Date.now() + 2, type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } } };
-    (h.frame.records as any[]).push(started, answer, end); h.frame.cursor = 10;
-    ctx.emit('session/event', { id: 'pc-new-chat' }, started.event);
-    ctx.emit('session/event', { id: 'pc-new-chat' }, answer.event);
-    ctx.emit('session/event', { id: 'pc-new-chat' }, end.event);
-    const deadline = Date.now() + 3000;
-    let page: any;
-    do { page = await (await fetch(`http://127.0.0.1:${port}/v1/notification-events?after=${head.nextCursor}`, { headers })).json(); if (page.items?.length) break; await new Promise(r => setTimeout(r, 10)); } while (Date.now() < deadline);
-    assert.equal(page.items?.[0]?.sessionId, 'pc-new-chat', 'global bridge observes a newly created PC session without phone observation');
-    assert.equal(page.items?.[0]?.kind, 'answer-finished');
-  } finally { admin.close(); }
   await fiber.dispose();
   await assert.rejects(fetch(`http://127.0.0.1:${port}/v1/capabilities`));
-  assert.deepEqual(h.cleanup(), { closed: 1, resumed: 0 }, 'idle baseline is lazy; terminal proof closes one opening without activation');
+  assert.deepEqual(h.cleanup(), { closed: 0, resumed: 0 }, 'plugin startup does not open any session for a retired feed');
   assert.deepEqual(h.calls(), { created: undefined, prompted: undefined, cancelled: undefined });
   // A dispose racing async realpath/server startup must await cleanup too.
   const racing = ctx.plugin(plugin, config);

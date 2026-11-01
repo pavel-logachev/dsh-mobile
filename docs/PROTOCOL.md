@@ -96,6 +96,10 @@ Android defaults to ordinary user/assistant messages and groups adjacent service
 
 ## Background notifications — Phase 1 as built
 
+### Retired in host 0.9.0
+
+The legacy feed endpoints `GET/PUT /v1/notification-settings`, `GET /v1/notification-events` and `GET /v1/notification-events/stream` are retired and return the existing not-found error. The historical description below applies only to older hosts. Host 0.9.0 keeps the capability shape for older clients: `capabilities.notifications:false` and `notificationCapabilities:{version:1,coverage:"degraded",feed:false,unifiedPush:false,retentionMs:604800000}`. Existing notification tables/data are left untouched and unused; new feed state is not created. Session snapshots, their SSE and failure fields are independent and remain supported.
+
 Additive API v1; existing command receipts, TLS pins, relay wire and `push:false` are unchanged. No UnifiedPush/FCM/WorkManager/boot receiver. Capabilities add `notifications:boolean` (feed implementation available; opt-in starts baseline asynchronously) and `notificationCapabilities:{version:1,feed:boolean,unifiedPush:false,coverage:"initializing"|"ready"|"degraded",retentionMs:604800000}`. Coverage is conservative: after a gap or overflow it reports `degraded`, and returns to `ready` only after confirmed full recovery of all affected sources — no pending retry, overflow, unprocessed events or new errors in that pass; this is not lossless replay.
 
 - `GET /notification-settings` returns `{revision,enabled,projects:[{workspaceId,enabled}],chats:[{sessionId,enabled}]}`. Default master off. Both alert kinds share one boolean: chat override > project override > true, gated by master and current read grants. GET prunes unauthorized/stale overrides and increases revision when changed.

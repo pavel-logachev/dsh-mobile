@@ -5,8 +5,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { createDshAdapter } from '../src/dsh-adapter.ts';
-import { HostState } from '../src/state.ts';
-import { NotificationFeed } from '../src/notifications.ts';
 import { historyCases, historyPage, historyRecords } from './fixtures/history-surface.ts';
 import type { HistoryRecord } from './fixtures/history-surface.ts';
 
@@ -14,7 +12,6 @@ async function recovered(t: { after(fn: () => Promise<void>): void }, records: H
   const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-surface-')));
   const cursor = () => records.at(-1)!.event.seq;
   let resumed = 0, closed = 0, observing = false;
-  let notify: (id: string, event: import('../src/notifications.ts').NotificationSource) => void = () => {};
   let disposed: (id: string) => void = () => {};
   let observe: (value: import('../src/dsh-adapter.ts').DshObservation) => void = () => {};
   const reads: { throughSeq: number; beforeSeq: number; maxMessages: number }[] = [];
@@ -35,9 +32,9 @@ async function recovered(t: { after(fn: () => Promise<void>): void }, records: H
     async projections() { return { asOfSeq: cursor(), values }; },
     async create() { throw new Error('No mutations'); }, async prompt() { throw new Error('No mutations'); }, cancel() { throw new Error('No mutations'); },
   };
-  const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', sessionController: controller, pollIntervalMs, throttleMs: 1, workspaces: [{ id: 'synthetic-workspace', path: dir, name: 'Synthetic' }], events: { subscribeDisposed(listener) { disposed = listener; return () => { disposed = () => {}; }; }, subscribe(_id, listener) { observe = listener; return () => { observe = () => {}; }; }, subscribeNotifications(listener) { notify = listener; return () => { notify = () => {}; }; } } });
+  const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', sessionController: controller, pollIntervalMs, throttleMs: 1, workspaces: [{ id: 'synthetic-workspace', path: dir, name: 'Synthetic' }], events: { subscribeDisposed(listener) { disposed = listener; return () => { disposed = () => {}; }; }, subscribe(_id, listener) { observe = listener; return () => { observe = () => {}; }; } } });
   t.after(async () => { adapter.dispose(); await rm(dir, { recursive: true, force: true }); });
-  return { adapter, controller, reads, dir, emit: (value: import('../src/dsh-adapter.ts').DshObservation) => observe(value), disposeSession: () => disposed('synthetic-session'), notify: (event: import('../src/notifications.ts').NotificationSource) => notify('synthetic-session', event), cleanup: () => ({ resumed, closed }) };
+  return { adapter, controller, reads, dir, emit: (value: import('../src/dsh-adapter.ts').DshObservation) => observe(value), disposeSession: () => disposed('synthetic-session'), cleanup: () => ({ resumed, closed }) };
 }
 
 test('unchanged watch refresh reuses recovered ancestry without any extra backward reads', { timeout: 5000 }, async t => {
@@ -82,30 +79,10 @@ test('new contiguous control events reuse immutable ancestry without new backwar
   assert.equal(h.reads.length, 8);
 });
 
-test('three queued tool events recover one cut once and later events share the snapshot cache', async t => {
-  const fixture = historyCases[1]!, records = historyRecords(fixture), h = await recovered(t, records, fixture.firstSeq);
-  const state = new HostState(join(h.dir, 'notifications.sqlite'));
-  const device = state.consumePairing(state.createPairing({ readWorkspaceIds: ['synthetic-workspace'], executeWorkspaceIds: [] }).pairingToken, 'Synthetic');
-  const source = h.adapter.notifications()!; let proofs = 0;
-  const evidence = source.evidence; source.evidence = (...args) => { proofs++; return evidence(...args); };
-  const feed = new NotificationFeed(state, source);
-  try {
-    await feed.start(); feed.putSettings(device.deviceId, { expectedRevision: 0, enabled: true, projects: [], chats: [] }); await feed.idle();
-    for (let n = 1; n <= 3; n++) records.push({ type: 'event', event: { seq: fixture.cursor + n, time: Date.now(), type: 'tool/call', data: { callId: `call-${n}`, name: 'read' } } });
-    for (const { event } of records.slice(-3)) h.notify({ seq: event.seq, time: event.time, type: event.type });
-    await feed.idle();
-    assert.equal(proofs, 1); assert.equal(h.reads.length, 8, 'three queued tool calls cause eight, not twenty-four, backward reads');
-    await h.adapter.snapshot('synthetic-session', new AbortController().signal);
-    assert.equal(h.reads.length, 8, 'GET shares notification recovery');
-  } finally { await feed.close(); state.close(); }
-});
-
 test('session lifecycle end evicts recovered ancestry before a later same-ID opening', async t => {
   const fixture = historyCases[1]!, h = await recovered(t, historyRecords(fixture), fixture.firstSeq, true);
   await h.adapter.snapshot('synthetic-session', new AbortController().signal); assert.equal(h.reads.length, 8);
-  const source = h.adapter.notifications()!, proof = await source.evidence('synthetic-session', new AbortController().signal);
-  assert.equal(source.evidenceCurrent!(proof), true);
-  h.disposeSession(); assert.equal(source.evidenceCurrent!(proof), false, 'ended lifecycle also invalidates coalesced evidence');
+  h.disposeSession();
   await h.adapter.snapshot('synthetic-session', new AbortController().signal); assert.equal(h.reads.length, 16, 'disposed lifecycle cannot reuse retained history');
 });
 
@@ -358,9 +335,6 @@ for (const fixture of historyCases) test(`bounded ${fixture.name} reconstructs t
   assert.equal(snapshot.activity, fixture.name === 'replacement-2' ? 'running' : 'idle');
   assert.equal(snapshot.notice, undefined);
   assert.deepEqual(h.cleanup(), { resumed: 0, closed: 1 });
-  const proof = await h.adapter.notifications()!.evidence('synthetic-session', new AbortController().signal);
-  assert.equal(proof.valid, true, 'the shared cold recovery must also restore notification coverage');
-  assert.ok(proof.completed.length > 0, 'completed-turn evidence uses only surviving answers');
   assert.equal(h.cleanup().resumed, 0);
 });
 
@@ -373,7 +347,6 @@ test('recovered replacement history preserves an authoritative open approval as 
   const snapshot = await h.adapter.snapshot('synthetic-session', new AbortController().signal);
   assert.deepEqual(snapshot.messages.map(m => Number(m.id.slice('message-'.length))), fixture.expectedMessageSeqs);
   assert.equal(snapshot.activity, 'waiting');
-  assert.equal((await h.adapter.notifications()!.evidence('synthetic-session', new AbortController().signal)).pending, true);
 });
 
 test('a complete malformed surface is unavailable rather than falsely classified as a bounded cut', async t => {
@@ -497,7 +470,6 @@ test('an oversized opening page is rejected before retaining message text but ke
   assert.deepEqual(snapshot.messages, [], 'never fold or publish the oversized message');
   assert.equal(snapshot.activity, 'idle'); assert.equal(snapshot.hasMore, true); assert.match(snapshot.notice!, /bounded history crosses/);
   assert.equal(h.reads.length, 0);
-  assert.equal((await h.adapter.notifications()!.evidence('synthetic-session', new AbortController().signal)).valid, false);
 });
 
 test('byte recovery bound retains no oversized dependency but still reports the newest open approval', async t => {
@@ -542,6 +514,5 @@ test('page recovery stops at the hard budget but still folds the newest proven a
   assert.equal(snapshot.activity, 'idle', 'old surface ambiguity cannot hide the newest authoritative end');
   assert.equal(h.reads.length, 15, 'opening plus at most fifteen cold pages');
   assert.equal(snapshot.hasMore, true);
-  assert.equal((await h.adapter.notifications()!.evidence('synthetic-session', new AbortController().signal)).valid, false, 'never invent completion evidence beyond the recovery budget');
   assert.equal(h.cleanup().resumed, 0);
 });

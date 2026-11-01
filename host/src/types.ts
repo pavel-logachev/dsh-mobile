@@ -27,7 +27,6 @@ export interface HostSnapshot {
 export interface FileUploadReservation { release(): void }
 export interface HostAdapter {
   readonly upstreamVersion: string;
-  notifications?(): import('./notifications.ts').NotificationSources | undefined;
   listPresets(signal: AbortSignal): Promise<Preset[]>;
   listSessions(signal: AbortSignal): Promise<HostSession[]>;
   /** Header-only scope resolution for hiding failed point reads; never returns transcript data. */

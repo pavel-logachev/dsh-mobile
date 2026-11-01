@@ -19,7 +19,6 @@ import type { HostAdapter, HostSnapshot, DeviceGrants, HostConfiguration } from 
 const snapshot: HostSnapshot = { session: { id: 's-alpha', title: 'Synthetic conversation', workspaceId: 'alpha', updatedAt: 1, running: false }, messages: [{ id: 'm1', role: 'assistant', text: 'Fixture only', createdAt: 1 }], cursor: 1, hasMore: false, activity: 'idle' };
 
 class TestAdapter implements HostAdapter {
-  notifications() { return { subscribe() { return () => {}; }, list: async () => this.listSessions(), evidence: async (id: string) => ({ sessionId: id, workspaceId: this.snapshots.get(id)!.session.workspaceId, cursor: 1, pending: false, completed: [] }) }; }
   readonly upstreamVersion = 'synthetic-test';
   prompts: string[] = [];
   snapshots = new Map<string, HostSnapshot>([['s-alpha', structuredClone(snapshot)], ['s-beta', { ...structuredClone(snapshot), session: { ...snapshot.session, id: 's-beta', workspaceId: 'beta' } }]]);
@@ -102,94 +101,6 @@ test('absent blank fails open and waiting boolean is projected into the index', 
   const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
   const item = (await (await request('/sessions', deviceToken)).json()).items[0];
   assert.equal(item.id, 's-alpha'); assert.equal(item.waitingForAnswer, true);
-});
-
-test('notification routes authenticate, stream real pages, enforce policy revisions and stream caps', async t => {
-  const { request, pair } = await setup(t); const { deviceToken } = await pair();
-  assert.equal((await request('/notification-events')).status, 401);
-  const settings = { expectedRevision: 0, enabled: true, projects: [], chats: [] };
-  assert.equal((await request('/notification-settings', deviceToken, 'PUT', settings)).status, 200);
-  assert.equal((await request('/notification-settings', deviceToken, 'PUT', { ...settings, enabled: false })).status, 409);
-  const page = await (await request('/notification-events', deviceToken)).json();
-  assert.equal(page.resetRequired, true);
-  const sse = await request('/notification-events/stream?after=' + page.nextCursor, deviceToken);
-  assert.equal(sse.status, 200); const reader = sse.body!.getReader();
-  try {
-    const frame = new TextDecoder().decode((await reader.read()).value);
-    assert.match(frame, /event: notification-page/);
-    assert.equal((await request('/notification-events/stream', deviceToken)).status, 429);
-  } finally { await reader.cancel(); }
-  assert.equal((await request('/notification-events?limit=101', deviceToken)).status, 400);
-  assert.equal((await request('/notification-events?after=bad', deviceToken)).status, 400);
-  assert.equal((await request('/notification-events?limit=1&limit=2', deviceToken)).status, 400);
-});
-
-test('notification stream wakes on commit without waiting for its fallback tick', async t => {
-  let listener: any; let cursor = -1;
-  const adapter = new TestAdapter();
-  adapter.notifications = () => ({ subscribe(fn: any) { listener = fn; return () => {}; }, list: async () => adapter.listSessions(),
-    evidence: async () => ({ sessionId: 's-alpha', workspaceId: 'alpha', cursor, pending: false, completed: [{ turn: 1, sourceSeq: 0 }] }) });
-  const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
-  await request('/notification-settings', deviceToken, 'PUT', { expectedRevision: 0, enabled: true, projects: [], chats: [] });
-  const response = await request('/notification-events/stream', deviceToken), reader = response.body!.getReader();
-  try {
-    await reader.read();
-    t.mock.timers.enable({ apis: ['setInterval'] });
-    // The already-created interval is replaced by a frozen clock on subsequent starts;
-    // sub-second deadline also excludes the real 1s fallback on this stream.
-    cursor = 0; listener('s-alpha', { seq: 0, type: 'turn/end', turn: 1, completed: true, time: Date.now() });
-    let timeout: ReturnType<typeof setTimeout>;
-    const frame = await Promise.race([reader.read(), new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(Error('commit did not wake stream')), 800); })]).finally(() => clearTimeout(timeout));
-    assert.match(new TextDecoder().decode(frame.value), /answer-finished/);
-  } finally { await reader.cancel(); }
-});
-
-test('notification heartbeat and revoke remain responsive while a page lookup is held', { timeout: 5000 }, async t => {
-  const adapter = new TestAdapter(), gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
-  let hold = false;
-  adapter.notifications = () => ({ subscribe() { return () => {}; }, list: async () => { if (hold) { entered.resolve(); await gate.promise; } return adapter.listSessions(); },
-    evidence: async () => ({ sessionId: 's-alpha', workspaceId: 'alpha', cursor: 0, pending: false, completed: [] }) });
-  const { host, request, pair } = await setup(t, adapter), { deviceId, deviceToken } = await pair();
-  await request('/notification-settings', deviceToken, 'PUT', { expectedRevision: 0, enabled: true, projects: [], chats: [] });
-  const response = await request('/notification-events/stream', deviceToken), reader = response.body!.getReader();
-  try {
-    await reader.read(); hold = true;
-    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
-    // Let the existing fallback enter its held read, then make heartbeat due.
-    await entered.promise;
-    t.mock.timers.tick(15000);
-    let timeout: ReturnType<typeof setTimeout>;
-    const part = await Promise.race([reader.read(), new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(Error('heartbeat starved by lookup')), 1500); })]).finally(() => clearTimeout(timeout));
-    const frame = new TextDecoder().decode(part.value);
-    assert.match(frame, /: heartbeat/, 'an awaited page must not starve liveness');
-    host.state.revokeDevice(deviceId);
-  } finally { gate.resolve(); await reader.cancel(); }
-});
-
-test('disable last notification device returns HTTP reset and sends reset on its existing SSE', { timeout: 10000 }, async t => {
-  const adapter = new TestAdapter(); let listener!: (id: string, event: import('../src/notifications.ts').NotificationSource) => void;
-  // Use a legacy signal-aware catalog: it reproduced the same poisoned signal.
-  const source = { subscribe(fn: any) { listener = fn; return () => {}; },
-    async list(signal: AbortSignal) { signal.throwIfAborted(); return adapter.listSessions(); },
-    async evidence(id: string) { return { sessionId: id, workspaceId: 'alpha', cursor: 0, pending: true, completed: [] }; },
-  };
-  adapter.notifications = () => source as any;
-  const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
-  await request('/notification-settings', deviceToken, 'PUT', { expectedRevision: 0, enabled: true, projects: [], chats: [] });
-  listener('s-alpha', { seq: 0, type: 'tool/call', time: Date.now() });
-  // Admit the pending proof before opening the stream.
-  let initial: any;
-  for (let i = 0; i < 20; i++) { initial = await (await request('/notification-events', deviceToken)).json(); if (initial.pending.length) break; await new Promise(resolve => setImmediate(resolve)); }
-  assert.equal(initial.pending.length, 1);
-  const stream = await request('/notification-events/stream', deviceToken), reader = stream.body!.getReader();
-  try {
-    assert.match(new TextDecoder().decode((await reader.read()).value), /notification-page/);
-    assert.equal((await request('/notification-settings', deviceToken, 'PUT', { expectedRevision: 1, enabled: false, projects: [], chats: [] })).status, 200);
-    const part = await reader.read(); assert.equal(part.done, false);
-    const frame = new TextDecoder().decode(part.value); assert.match(frame, /"resetRequired":true/); assert.match(frame, /"pending":\[\]/);
-    const response = await request('/notification-events?after=' + initial.nextCursor, deviceToken); assert.equal(response.status, 200);
-    const page = await response.json(); assert.equal(page.resetRequired, true); assert.deepEqual(page.pending, []);
-  } finally { await reader.cancel(); }
 });
 
 test('prompt admission bypasses a five-second catalog and retains point authorization', { timeout: 20000 }, async t => {
@@ -1058,6 +969,13 @@ for (const [label, input, expected] of [
   const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
   const response = await request('/sessions/s-alpha', deviceToken); assert.equal(response.status, 200);
   const result = await response.json(); assert.deepEqual(result.failure, expected); assert.equal(result.failure.message.isWellFormed(), true);
+  const stream = await request('/sessions/s-alpha/events', deviceToken); assert.equal(stream.status, 200);
+  const reader = stream.body!.getReader();
+  try {
+    const frame = new TextDecoder().decode((await reader.read()).value);
+    const value = JSON.parse(frame.split('\n').find(line => line.startsWith('data: '))!.slice(6));
+    assert.deepEqual(value.failure, expected);
+  } finally { await reader.cancel(); }
 });
 
 for (const manual of [false, true]) test('recovery startup blocks a restored lost requestId before first admission: manual=' + manual, async t => {

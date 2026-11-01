@@ -46,16 +46,6 @@ function eventBridge(ctx: CompanionContext): DshEvents {
     subscribeDisposed(listener) {
       return ctx.on('session/disposed', (session: { id?: string }) => { if (typeof session.id === 'string') listener(session.id); }, { global: true });
     },
-    subscribeNotifications(listener) {
-      return ctx.on('session/event', (session: { id?: string }, value: unknown) => {
-        if (typeof session.id !== 'string' || !value || typeof value !== 'object') return;
-        const e = value as Record<string, unknown>, d = e.data as Record<string, unknown> | undefined;
-        listener(session.id, { type: e.type as string, seq: e.seq as number, time: e.time as number,
-          ...(Number.isSafeInteger(d?.turn) ? { turn: d!.turn as number } : {}),
-          ...(e.type === 'turn/end' ? { completed: !!d?.reason && (d.reason as { kind?: string }).kind === 'completed' } : {}),
-          ...(e.type === 'approval/asked' || (e.type === 'tool/call' && d?.name === 'ask_user_question') ? { attention: true } : {}) });
-      }, { global: true });
-    },
     subscribe(sessionId, listener) {
       const disposers: (() => unknown)[] = [];
       try {

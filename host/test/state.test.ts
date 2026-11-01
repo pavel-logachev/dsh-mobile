@@ -212,27 +212,6 @@ test('an explicit recovery hold blocks only fresh admissions and never rewrites 
   assert.equal(existsSync(witness), true);
 });
 
-test('notification settings index tracks live enabled devices across reopen and revocation', t => {
-  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-notification-index-')));
-  const path = join(dir, 'host.sqlite');
-  let state = new HostState(path);
-  t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); });
-  const device = state.consumePairing(state.createPairing(grants).pairingToken, 'Indexed phone');
-  const journal = (enabled: boolean) => ({ epoch: 'epoch', sequence: 0, settings: { revision: 1, enabled, projects: [], chats: [] }, items: [] });
-  state.writeNotificationState('device:' + device.deviceId, journal(true));
-  assert.equal(state.notificationEnabledDeviceCount(), 1);
-  assert.deepEqual(state.notificationEnabledDeviceIds(), [device.deviceId]);
-  state.close();
-  state = new HostState(path);
-  assert.equal(state.notificationEnabledDeviceCount(), 1, 'old journal must be backfilled into the settings index');
-  state.writeNotificationState('device:' + device.deviceId, journal(false));
-  assert.equal(state.notificationEnabledDeviceCount(), 0);
-  state.writeNotificationState('device:' + device.deviceId, journal(true));
-  assert.equal(state.revokeDevice(device.deviceId), true);
-  assert.equal(state.notificationEnabledDeviceCount(), 0, 'revoked devices do not remain in the enabled hot set');
-  assert.deepEqual(state.notificationEnabledDeviceIds(), []);
-});
-
 test('missing or corrupt ledger witnesses fail closed without inventing a rollback for a first run', t => {
   const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-witness-')));
   const path = join(dir, 'host.sqlite'), witness = path + '.ledger.json';
@@ -251,6 +230,6 @@ test('missing or corrupt ledger witnesses fail closed without inventing a rollba
   corrupt = new HostState(path);
   assert.equal(corrupt.ledgerStatus().hold, true); assert.equal(corrupt.ledgerStatus().witnessProblem, 'witness_corrupt');
   assert.throws(() => corrupt.admitCommand(device.deviceId, randomUUID(), 'prompt', hashSecret('x'), 'alpha'), { code: 'recovery_hold' });
-  const released = corrupt.releaseRecovery();
-  assert.equal(released.hold, false); assert.equal(released.witnessProblem, 'none');
+  assert.throws(() => corrupt.releaseRecovery(), { code: 'recovery_hold' });
+  assert.equal(corrupt.ledgerStatus().hold, true); assert.equal(corrupt.ledgerStatus().witnessProblem, 'witness_corrupt');
 });

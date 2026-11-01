@@ -82,9 +82,6 @@ export class HostState {
         newest_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
       ) STRICT;
       CREATE TABLE IF NOT EXISTS mobile_created_sessions (id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL) STRICT;
-      CREATE TABLE IF NOT EXISTS notification_state (id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
-      CREATE TABLE IF NOT EXISTS notification_settings (device_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), settings TEXT NOT NULL) STRICT;
-      CREATE INDEX IF NOT EXISTS notification_settings_enabled ON notification_settings(enabled,device_id);
       CREATE TABLE IF NOT EXISTS runtime_lock (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, pid INTEGER NOT NULL) STRICT;
     `);
     // Early development databases have no scope column; unknown prior scope fails closed.
@@ -100,22 +97,6 @@ export class HostState {
     ) STRICT;
     CREATE TABLE IF NOT EXISTS relay_status (route_id TEXT PRIMARY KEY, connected INTEGER NOT NULL, ready INTEGER NOT NULL, generation TEXT, updated_at INTEGER NOT NULL) STRICT;
     `);
-    // One-time migration: old journals are streamed, never re-read on ordinary opens.
-    this.db.exec('CREATE TABLE IF NOT EXISTS host_migrations (id TEXT PRIMARY KEY) STRICT');
-    this.transaction(() => {
-      if (this.db.prepare('SELECT id FROM host_migrations WHERE id=?').get('notification-settings-v1')) return;
-      const rows = this.db.prepare("SELECT id,value FROM notification_state WHERE id LIKE 'device:%'").iterate();
-      const upsert = this.db.prepare(`INSERT INTO notification_settings(device_id,enabled,settings) VALUES (?,?,?)
-        ON CONFLICT(device_id) DO UPDATE SET enabled=excluded.enabled, settings=excluded.settings`);
-      for (const row of rows) {
-        let settings: { enabled?: unknown } | undefined;
-        try { settings = (JSON.parse(String(row.value)) as { settings?: { enabled?: unknown } } | undefined)?.settings; }
-        catch { continue; } // Only malformed JSON is inert; storage failures must roll back the marker.
-        if (!settings || typeof settings.enabled !== 'boolean') continue;
-        upsert.run(String(row.id).slice(7), settings.enabled ? 1 : 0, JSON.stringify(settings));
-      }
-      this.db.prepare('INSERT INTO host_migrations VALUES (?)').run('notification-settings-v1');
-    });
     this.transaction(() => {
       const version = Number(this.db.prepare('PRAGMA user_version').get()?.user_version);
       if (version < 4) {
@@ -220,10 +201,12 @@ export class HostState {
     });
   }
   private syncLedgerWitness(): void {
-    this.transaction(() => {
-      const row = this.ledgerRow(), problem = this.witnessProblem(row);
-      if (problem === 'none' || problem === 'missing') this.writeLedgerWitness(row);
-    });
+    try {
+      this.transaction(() => {
+        const row = this.ledgerRow(), problem = this.witnessProblem(row);
+        if (problem === 'none' || problem === 'missing') this.writeLedgerWitness(row);
+      });
+    } catch { /* Diagnostic sync, including lock acquisition, cannot undo a committed operation. */ }
   }
   /** Reads without changing state; safe for CLI status while a runtime owns the host. */
   ledgerStatus(): LedgerStatus {
@@ -267,6 +250,8 @@ export class HostState {
       const row = this.ledgerRow();
       if (Number(row.hold) !== 1) throw new HostError('conflict');
       const witness = this.readLedgerWitness();
+      // An unreadable/invalid surviving sidecar has no provable epoch ceiling.
+      if (witness.present && (witness.invalid || !witness.value)) throw new HostError('recovery_hold');
       const epoch = Math.max(Number(row.epoch), witness.value?.epoch ?? 0) + 1;
       if (!Number.isSafeInteger(epoch)) throw new HostError('recovery_hold');
       this.db.prepare('UPDATE ledger_meta SET hold=0,hold_reason=NULL,epoch=?,updated_at=? WHERE id=1').run(epoch, this.now());
@@ -275,38 +260,6 @@ export class HostState {
       this.writeLedgerWitness(this.ledgerRow(), true);
     });
     return this.ledgerStatus();
-  }
-
-  /** Notification metadata only; bounded by the feed before committing. Uses this same SQLite DB. */
-  readNotificationState<T>(id: string): T | undefined {
-    const row = this.db.prepare('SELECT value FROM notification_state WHERE id=?').get(id);
-    return row ? JSON.parse(String(row.value)) as T : undefined;
-  }
-  private readonly notificationRevisions = new Map<string, number>();
-  notificationRevision(id: string): number { return this.notificationRevisions.get(id) ?? 0; }
-  notificationEnabledDeviceIds(): string[] {
-    return this.db.prepare(`SELECT s.device_id FROM notification_settings s
-      JOIN devices d ON d.id=s.device_id WHERE s.enabled=1 AND d.revoked_at IS NULL`).all().map(row => String(row.device_id));
-  }
-  notificationEnabledDeviceCount(): number {
-    return Number(this.db.prepare(`SELECT count(*) AS total FROM notification_settings s
-      JOIN devices d ON d.id=s.device_id WHERE s.enabled=1 AND d.revoked_at IS NULL`).get()?.total ?? 0);
-  }
-  writeNotificationState(id: string, value: unknown): void { this.writeNotificationStates([[id, value]]); }
-  writeNotificationStates(values: [string, unknown][]): void {
-    this.transaction(() => {
-      const insert = this.db.prepare('INSERT INTO notification_state(id,value) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value');
-      for (const [id, value] of values) {
-        insert.run(id, JSON.stringify(value)); this.notificationRevisions.set(id, (this.notificationRevisions.get(id) ?? 0) + 1);
-        if (!id.startsWith('device:')) continue;
-        const settings = (value as { settings?: { enabled?: unknown } } | undefined)?.settings;
-        if (settings && typeof settings.enabled === 'boolean') {
-          this.db.prepare(`INSERT INTO notification_settings(device_id,enabled,settings) VALUES (?,?,?)
-            ON CONFLICT(device_id) DO UPDATE SET enabled=excluded.enabled, settings=excluded.settings`)
-            .run(id.slice(7), settings.enabled ? 1 : 0, JSON.stringify(settings));
-        } else this.db.prepare('DELETE FROM notification_settings WHERE device_id=?').run(id.slice(7));
-      }
-    });
   }
 
   /** Index-only exception, never an authorization grant. 256 IDs, seven days. */
@@ -554,28 +507,31 @@ export class HostState {
         this.db.prepare('INSERT OR REPLACE INTO runtime_lock (id,owner,pid) VALUES (1,?,?)').run(owner, process.pid);
         this.recoverUnfinished();
       });
+      this.syncLedgerWitness();
+      // Publish ownership only after startup work; a failed claim owns no closed handle.
       this.runtimeLockDb = lock;
       this.runtimeId = owner;
-      this.syncLedgerWitness();
     } catch {
       lock?.close();
       throw new HostError('conflict');
     }
   }
   releaseRuntime(): void {
-    if (this.runtimeId) {
-      this.db.prepare('DELETE FROM runtime_lock WHERE owner=?').run(this.runtimeId);
-      this.runtimeId = undefined;
-      this.runtimeLockDb?.exec('ROLLBACK');
-      this.runtimeLockDb?.close();
-      this.runtimeLockDb = undefined;
+    const owner = this.runtimeId, lock = this.runtimeLockDb;
+    this.runtimeId = undefined; this.runtimeLockDb = undefined;
+    try {
+      if (owner) this.db.prepare('DELETE FROM runtime_lock WHERE owner=?').run(owner);
+    } finally {
+      try { lock?.exec('ROLLBACK'); } finally { lock?.close(); }
     }
   }
   close(): void {
     if (this.closed) return;
-    this.releaseRuntime();
-    this.closed = true;
-    this.revokeListeners.clear();
-    this.db.close();
+    try { this.releaseRuntime(); }
+    finally {
+      this.closed = true;
+      this.revokeListeners.clear();
+      this.db.close();
+    }
   }
 }

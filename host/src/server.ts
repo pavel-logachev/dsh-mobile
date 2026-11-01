@@ -4,7 +4,6 @@ import { sessionModel, settledQuestions, mutationAnswer } from './phone-projecti
 import { gzipSync } from 'node:zlib';
 import { HOST_VERSION, parseMutation, validateAnswer, UPLOAD_LIMIT, UPLOAD_MIMES, identifier, safeAttachmentRefs, safeQueue, questionsOf } from './phone.ts';
 import type { SessionMutation, PromptOptions, UploadedAttachment } from './phone.ts';
-import { NotificationFeed } from './notifications.ts';
 import { HISTORY_CUT_NOTICE } from './dsh-adapter.ts';
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
@@ -108,8 +107,6 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
   const state = options.state ?? new HostState(config.statePath);
   if (state.path !== config.statePath) { if (!options.state) state.close(); throw new HostError('invalid_config'); }
   const relay = config.relay ? createRelayConnector({ relay: config.relay, state, targetPort: config.port, allowInsecureLoopback: options.allowInsecureRelayLoopback === true }) : undefined;
-  let notifications: NotificationFeed | undefined;
-  const notificationStreams = new Set<string>();
   const limits = new RateLimiter();
   const shutdown = new AbortController();
   let closing = false, started: Promise<{ baseUrl: string }> | undefined;
@@ -499,61 +496,6 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     }
   }
 
-  async function streamNotifications(deviceId: string, after: string | undefined, res: ServerResponse, signal: AbortSignal) {
-    if (!notifications) throw new HostError('unavailable');
-    if (notificationStreams.has(deviceId) || (streamCounts.get(deviceId) ?? 0) >= 3 || streams.size >= 32) throw new HostError('rate_limited');
-    notificationStreams.add(deviceId); streamCounts.set(deviceId, (streamCounts.get(deviceId) ?? 0) + 1);
-    let closed = false, timer: ReturnType<typeof setInterval> | undefined, working = false, dirty = false;
-    let unsubscribe: (() => void) | undefined;
-    const stop = () => {
-      if (closed) return; closed = true;
-      unsubscribe?.();
-      if (timer) clearInterval(timer); streams.delete(registration); notificationStreams.delete(deviceId);
-      const count = (streamCounts.get(deviceId) ?? 1) - 1; if (count) streamCounts.set(deviceId, count); else streamCounts.delete(deviceId);
-      signal.removeEventListener('abort', stop); res.off('close', stop); if (res.headersSent && !res.destroyed) res.end();
-    };
-    const registration = { deviceId, stop }; streams.add(registration);
-    signal.addEventListener('abort', stop, { once: true }); res.once('close', stop);
-    let cursor = after, heartbeat = Date.now(), lastCoverage = '';
-    async function send(first = false) {
-      if (closed) return;
-      if (working) { dirty = true; return; }
-      working = true; dirty = false;
-      try {
-        const page = await notifications!.page(deviceId, cursor, 100, signal);
-        signal.throwIfAborted(); if (closed) return;
-        if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
-        if (first || page.items.length || page.resetRequired || page.hasMore || page.coverage !== lastCoverage) {
-          const frame = `event: notification-page\nid: ${page.nextCursor}\ndata: ${JSON.stringify(page)}\n\n`;
-          if (Buffer.byteLength(frame) > 128 * 1024 || res.writableLength > 128 * 1024 || !res.write(frame)) { stop(); return; }
-          cursor = page.nextCursor; lastCoverage = page.coverage;
-          notifications!.tracePage('sse_sent', page.items);
-          dirty ||= page.hasMore;
-        }
-      } catch (error) { stop(); if (first) throw error; }
-      finally { working = false; if (dirty && !closed) queueMicrotask(() => { void send(); }); }
-    }
-    // Subscribe before the first read: a commit racing an in-flight page gets one
-    // coalesced follow-up, never concurrent sends or a missed notification.
-    unsubscribe = notifications.onChange(() => { void send(); });
-    try {
-      await send(true);
-      if (!closed) {
-        timer = setInterval(() => {
-          // Liveness and revocation never wait behind membership/proof I/O.
-          if (closed) return;
-          if (!state.getDevice(deviceId)) { stop(); return; }
-          if (Date.now() - heartbeat >= (options.heartbeatMs ?? 15000)) {
-            heartbeat = Date.now();
-            if (res.writableLength > 128 * 1024 || !res.write(': heartbeat\n\n')) { stop(); return; }
-          }
-          void send();
-        }, Math.min(1000, options.heartbeatMs ?? 15000)); timer.unref();
-      }
-    }
-    catch (error) { stop(); throw error; }
-  }
-
   function authorized(req: IncomingMessage): AuthorizedDevice {
     const header = req.headers.authorization;
     if (typeof header !== 'string' || !/^Bearer [A-Za-z0-9_-]{43}$/.test(header)) throw new HostError('unauthorized');
@@ -570,7 +512,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     if (!req.url?.startsWith('/v1/') || req.url.length > 2048 || /[#\x00-\x20\\]/.test(req.url)) throw new HostError('invalid_request');
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname + url.search !== req.url) throw new HostError('invalid_request');
-    const allowedQuery = req.method === 'GET' ? url.pathname === '/v1/sessions' ? ['workspaceId', 'limit', 'cursor'] : url.pathname === '/v1/notification-events' ? ['after', 'limit'] : url.pathname === '/v1/notification-events/stream' ? ['after'] : [] : [];
+    const allowedQuery = req.method === 'GET' ? url.pathname === '/v1/sessions' ? ['workspaceId', 'limit', 'cursor'] : [] : [];
     for (const key of url.searchParams.keys()) if (!allowedQuery.includes(key) || url.searchParams.getAll(key).length !== 1) throw new HostError('invalid_request');
     const segments = url.pathname.split('/').slice(2).map(segment => {
       try {
@@ -596,43 +538,6 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     }
     const device = authorized(req);
     limits.take(`device:${device.deviceId}`, 120);
-    if (url.pathname === '/v1/notification-settings' && ['GET', 'PUT'].includes(req.method ?? '')) {
-      if (!notifications) throw new HostError('unavailable');
-      if (req.method === 'GET') {
-        limits.take(`notification:${device.deviceId}`, 60);
-        const sessions = (await adapter.listSessions(signal)).filter(s => !workspaceSource.archivedSessionIds().has(s.id));
-        const ids = await workspaceIds(); signal.throwIfAborted();
-        sendJson(res, 200, notifications.pruneSettings(device.deviceId, ids, sessions)); return;
-      }
-      limits.take(`notification-policy:${device.deviceId}`, 6);
-      const body = await bodyJson(req, signal);
-      if (Buffer.byteLength(JSON.stringify(body)) > 32768) throw new HostError('payload_too_large');
-      // Parse first without committing; unauthorized override IDs are hidden.
-      const sessions = await adapter.listSessions(signal), ids = await workspaceIds();
-      for (const p of Array.isArray(body.projects) ? body.projects : []) {
-        if (!p || typeof p.workspaceId !== 'string') throw new HostError('invalid_request');
-        checkKnownScope(device.deviceId, p.workspaceId, ids, false, true);
-      }
-      for (const c of Array.isArray(body.chats) ? body.chats : []) {
-        const session = sessions.find(s => s.id === c?.sessionId);
-        if (!session || workspaceSource.archivedSessionIds().has(session.id)) throw new HostError('not_found');
-        checkKnownScope(device.deviceId, session.workspaceId, ids, false, true);
-      }
-      sendJson(res, 200, notifications.putSettings(device.deviceId, body)); return;
-    }
-    if (req.method === 'GET' && ['/v1/notification-events', '/v1/notification-events/stream'].includes(url.pathname)) {
-      if (!notifications) throw new HostError('unavailable');
-      limits.take(`notification:${device.deviceId}`, 60);
-      const after = url.searchParams.get('after') ?? undefined;
-      if (url.pathname.endsWith('/stream')) {
-        limits.take(`notification-open:${device.deviceId}`, 6);
-        if (req.headers['last-event-id'] !== undefined && req.headers['last-event-id'] !== after) throw new HostError('invalid_request');
-        await streamNotifications(device.deviceId, after, res, signal); return;
-      }
-      const raw = url.searchParams.get('limit') ?? '50';
-      if (!/^[1-9][0-9]{0,2}$/.test(raw) || Number(raw) > 100) throw new HostError('invalid_request');
-      sendJson(res, 200, await notifications.page(device.deviceId, after, Number(raw), signal)); return;
-    }
     if (req.method === 'GET' && url.pathname === '/v1/workspaces') {
       const workspaces = await workspaceSource.list(); signal.throwIfAborted();
       const current = freshDevice(device.deviceId);
@@ -640,7 +545,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     }
     if (req.method === 'GET' && url.pathname === '/v1/capabilities') {
       const cleanup = files.cleanupStats();
-      sendJson(res, 200, { protocolVersion: 1, hostVersion: HOST_VERSION, hostName: config.hostName, upstreamVersion: adapter.upstreamVersion, capabilities: { sessions: true, textPrompt: true, cancel: true, liveSnapshots: true, questionSkip: false, fileDownload: false, ...(adapter.phoneCapabilities?.() ?? { attachments: false, questions: false, steer: false, queue: false, rename: false, models: false }), approvals: false, push: false, notifications: !!notifications }, notificationCapabilities: { version: 1, coverage: notifications?.coverage ?? 'degraded', feed: !!notifications, unifiedPush: false, retentionMs: 604800000 }, storage: { pendingCleanups: cleanup.pending, cleanupFailures: cleanup.failures } }); return;
+      sendJson(res, 200, { protocolVersion: 1, hostVersion: HOST_VERSION, hostName: config.hostName, upstreamVersion: adapter.upstreamVersion, capabilities: { sessions: true, textPrompt: true, cancel: true, liveSnapshots: true, questionSkip: false, fileDownload: false, ...(adapter.phoneCapabilities?.() ?? { attachments: false, questions: false, steer: false, queue: false, rename: false, models: false }), approvals: false, push: false, notifications: false }, notificationCapabilities: { version: 1, coverage: 'degraded', feed: false, unifiedPush: false, retentionMs: 604800000 }, storage: { pendingCleanups: cleanup.pending, cleanupFailures: cleanup.failures } }); return;
     }
     if (req.method === 'GET' && url.pathname === '/v1/models') {
       if (!adapter.models) throw new HostError('unavailable');
@@ -878,7 +783,9 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       const completion = dispatch(device.deviceId, command);
       const key = `${device.deviceId}:${requestId}`;
       dispatches.set(key, { deviceId: device.deviceId, requestId, completion });
-      void completion.finally(() => dispatches.delete(key)).catch(() => {});
+      // Only a durable terminal receipt retires shutdown recovery. A rejected
+      // deadline observer (or late undefined settlement) is not persistence.
+      void completion.then(receipt => { if (receipt && receipt.receipt.status !== 'pending') dispatches.delete(key); }, () => {});
       const receipt = await responseReceipt(device.deviceId, requestId, completion);
       freshDevice(device.deviceId);
       sendJson(res, receipt.httpStatus, receipt.receipt); return;
@@ -932,8 +839,6 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         state.claimRuntime(); claimed = true;
         await files.startup(await workspaceSource.list());
         if (relay) state.recoverPendingRelayPublications();
-        const sources = adapter.notifications?.();
-        if (sources) { notifications = new NotificationFeed(state, sources); await notifications.start(); }
         await new Promise<void>((resolve, reject) => {
           const failed = () => { state.releaseRuntime(); claimed = false; reject(new HostError('unavailable')); };
           server.once('error', failed);
@@ -950,7 +855,6 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       if (closing) return;
       closing = true; pumpUploads(); shutdown.abort(); clearInterval(uploadSweep); for (const id of uploads.keys()) removeUpload(id);
       await Promise.all([...cleanups]).catch(() => {}); await files.close().catch(() => {});
-      await notifications?.close();
       await relay?.close();
       for (const stream of streams) stream.stop();
       onRevoke();

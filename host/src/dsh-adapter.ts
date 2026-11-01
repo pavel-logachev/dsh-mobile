@@ -12,7 +12,6 @@ import { safeFailure } from './failure.ts';
 import { presentUserText } from './message-presentation.ts';
 import type { ChatMessage, FileUploadReservation, HostAdapter, HostSession, HostSnapshot, Preset, WorkspaceConfig } from './types.ts';
 
-import type { NotificationEvidence, NotificationSource, NotificationSources } from './notifications.ts';
 import { isCompatibleDshVersion } from './compatibility.ts';
 export { COMPATIBLE_DSH_VERSIONS } from './compatibility.ts';
 const MAX_MESSAGES = 100;
@@ -73,7 +72,6 @@ export type DshObservation = { type: 'event'; event: unknown } | { type: 'assist
 export interface DshEvents {
   /** Only this session's data may reach the listener. The disposer must remove all subscriptions. */
   subscribe(sessionId: string, listener: (observation: DshObservation) => void): () => void;
-  subscribeNotifications?(listener: (id: string, event: NotificationSource) => void): () => void;
   /** Inspected session/disposed lifecycle, separate from cold follow cleanup. */
   subscribeDisposed?(listener: (id: string) => void): () => void;
 }
@@ -158,7 +156,7 @@ function receiptBudget(service: object): ReceiptBudget {
 }
 interface CanonicalWorkspace extends WorkspaceConfig { key: string }
 interface WireEvent { type: string; seq: number; time: number; data: unknown; ignorable?: true; surfaceOp?: unknown }
-interface SurfaceNode { seq: number; message?: ChatMessage; answerTurn?: number }
+interface SurfaceNode { seq: number; message?: ChatMessage }
 interface Provisional { id: string; turn: number; step: number; nextIndex: number; createdAt: number; bytes: number; blocks: Map<number, string> }
 const KNOWN_LOG_TYPES = new Set([
   'agent-preset/selected', 'agent/inbox/spliced', 'approval/asked', 'approval/decided', 'approval/policy',
@@ -221,8 +219,7 @@ const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'system/mess
 function applySurface(nodes: SurfaceNode[], event: WireEvent): boolean {
   if (!SURFACE_TYPES.has(event.type)) return true;
   const message = messageOf(event);
-  const data = object(event.data);
-  const node = { seq: event.seq, ...(message ? { message } : {}), ...(event.type === 'assistant/message' && message && data?.interrupted !== true && Number.isSafeInteger(data?.turn) ? { answerTurn: data!.turn as number } : {}) };
+  const node = { seq: event.seq, ...(message ? { message } : {}) };
   if (event.surfaceOp === 'append') { nodes.push(node); return true; }
   const op = object(event.surfaceOp);
   if (op?.op !== 'replace' || !Number.isSafeInteger(op.startSeq) || !Number.isSafeInteger(op.endSeq)) throw new HostError('unavailable');
@@ -259,10 +256,6 @@ class Transcript {
   private attempt: Provisional | undefined;
   private failure: { code?: string; message: string } | undefined;
   private revision = 0;
-  private terminals: { turn: number; sourceSeq: number }[] = [];
-  private openProjectedQuestions = false;
-  private questionProjectionPresent = false;
-  private attentionStopped = false;
   private activityEstablished = false;
   private retentionCut = false;
   private phoneInbox: Record<string, unknown> = {};
@@ -271,13 +264,6 @@ class Transcript {
     const snapshot = this.snapshot();
     if (this.unsupported || this.gap || this.historyCut) return snapshot;
     return { ...snapshot, pendingQueue: queueOf(this.phoneInbox), pendingQuestions: this.phoneQuestions, ...(this.phoneQuestions.length ? { activity: 'waiting' as const } : {}) };
-  }
-  notificationEvidence(): NotificationEvidence {
-    const ambiguous = this.unsupported || this.gap || this.historyCut;
-    const completed = ambiguous ? [] : this.terminals.filter(t => this.nodes.some(n => n.answerTurn === t.turn));
-    return { sessionId: this.session.id, workspaceId: this.session.workspaceId, cursor: this.cursor, valid: !ambiguous,
-      pending: !ambiguous && !this.attentionStopped && ((!!this.turn && this.approvals.size > 0) || (this.questionProjectionPresent ? this.openProjectedQuestions : this.questions.size > 0)),
-      completed };
   }
   constructor(session: HostSession) { this.session = { ...session }; this.running = session.running; }
   open(frame: Record<string, unknown>, retentionCut = false): void {
@@ -325,8 +311,6 @@ class Transcript {
     if (Array.isArray(activeQuestions)) {
       // The runtime fold is authoritative for timed open/continued/settled calls;
       // an unmatched historic tool call cannot override its empty/continued view.
-      this.questionProjectionPresent = true;
-      this.openProjectedQuestions = !this.attentionStopped && activeQuestions.some(q => object(q)?.state === 'open');
       for (const q of activeQuestions) if (object(q)?.state === 'continued' && typeof object(q)?.callId === 'string') this.questions.delete(object(q)!.callId as string);
     }
     this.trim();
@@ -379,7 +363,7 @@ class Transcript {
     }
     if (event.type === 'turn/start') {
       this.activityEstablished = true;
-      this.attentionStopped = false; this.approvals.clear(); this.questions.clear(); this.openProjectedQuestions = false;
+      this.approvals.clear(); this.questions.clear();
       this.calls.clear(); this.failure = undefined;
       this.turn = Number.isSafeInteger(data?.turn) ? { number: data!.turn as number, startedAt: event.time } : undefined;
     }
@@ -387,9 +371,8 @@ class Transcript {
       const reason = object(data?.reason);
       if (reason?.kind === 'error') this.setFailure(reason.error);
       else this.failure = undefined;
-      if (!this.retentionCut && reason?.kind === 'completed' && Number.isSafeInteger(data?.turn)) this.terminals.push({ turn: data!.turn as number, sourceSeq: event.seq });
       this.activityEstablished = true;
-      this.attentionStopped = true; this.approvals.clear(); this.questions.clear(); this.openProjectedQuestions = false;
+      this.approvals.clear(); this.questions.clear();
       this.turn = undefined; this.calls.clear();
     }
     if (event.type === 'tool/call' && this.turn?.number === data?.turn && typeof data?.callId === 'string' && typeof data.name === 'string' && /^[A-Za-z0-9_.:/-]{1,128}$/.test(data.name)) {
@@ -415,8 +398,6 @@ class Transcript {
       }
     }
     if ((event.type === 'assistant/message' || event.type === 'assistant/attempt') && this.attempt?.turn === data?.turn && this.attempt?.step === data?.step) this.attempt = undefined;
-    // Keep the desktop historical notice; notification evidence additionally
-    // requires an open turn for the runtime's turn-enclosed approval audit pair.
     if (event.type === 'approval/asked' && typeof data?.id === 'string') {
       if (this.retentionCut && (this.approvals.size >= 1000 || Buffer.byteLength(data.id) > 256)) this.unsupported = true;
       else this.approvals.add(data.id);
@@ -540,8 +521,6 @@ export class DshAdapter implements HostAdapter {
   private readonly historyFlights = new Map<string, HistoryFlight>();
   private readonly openingFlights = new Map<string, OpeningFlight>();
   private readonly disposeHistory: (() => void) | undefined;
-  private readonly evidenceScopes = new WeakMap<NotificationEvidence, { view: readonly WorkspaceConfig[]; revision: number; lifecycle: object }>();
-  private evidenceRevision = 0;
   private readonly lifecycles = new Map<string, object>();
   private lifecycleToken(id: string): object {
     let token = this.lifecycles.get(id);
@@ -586,32 +565,6 @@ export class DshAdapter implements HostAdapter {
     this.options = options; this.source = source; this.upstreamVersion = options.dshVersion;
     this.disposeHistory = options.events?.subscribeDisposed?.(id => { this.lifecycles.delete(id); this.evictHistory(id); const flight = this.historyFlights.get(id); if (flight) this.detachHistory(id, flight); const opening = this.openingFlights.get(id); if (opening) this.detachOpening(id, opening); });
   }
-  notifications(): NotificationSources | undefined {
-    const subscribe = this.options.events?.subscribeNotifications;
-    if (!subscribe) return undefined;
-    const bindings = new WeakMap<object, { view: readonly WorkspaceConfig[]; revision: object }>();
-    return { subscribe, list: signal => this.listSessions(signal),
-      ...(this.options.sessionHeader ? { lookup: async (id: string, signal: AbortSignal) => {
-        // Header stat is membership authority, not a cached catalog or phone index.
-        try {
-          const revision = this.lifecycleToken(id);
-          const { workspaceId, view } = await this.pointScope(id, this.signal(signal));
-          this.checkLifecycle(id, revision);
-          const listed = { id, workspaceId }; bindings.set(listed, { view, revision }); return listed;
-        } catch (error) { if (error instanceof HostError && error.code === 'not_found') return undefined; throw error; }
-      }, lookupCurrent: (listed: { id: string; workspaceId: string }) => {
-        const binding = bindings.get(listed);
-        return !!binding && binding.revision === this.lifecycles.get(listed.id) && !this.lifetime.signal.aborted && (!this.source.isCurrent || this.source.isCurrent(binding.view)) && !this.source.archivedSessionIds().has(listed.id);
-      } } : {}), evidence: async (id, signal, listed) => {
-      const lifecycle = this.lifecycleToken(id);
-      const { transcript, view } = await this.open(id, this.signal(signal), undefined, listed ? { ...listed, running: listed.running ?? false, title: '', updatedAt: 0 } : undefined);
-      this.checkLifecycle(id, lifecycle);
-      const proof = transcript.notificationEvidence(); this.evidenceScopes.set(proof, { view, revision: this.evidenceRevision, lifecycle }); return proof;
-    }, evidenceCurrent: proof => {
-      const binding = this.evidenceScopes.get(proof);
-      return !!binding && !this.lifetime.signal.aborted && binding.revision === this.evidenceRevision && binding.lifecycle === this.lifecycles.get(proof.sessionId) && (!this.source.isCurrent || this.source.isCurrent(binding.view)) && JSON.stringify(binding.view) === this.historyScope && !this.source.archivedSessionIds().has(proof.sessionId);
-    } };
-  }
   dispose(): void {
     this.lifetime.abort(); this.disposeHistory?.();
     for (const [id, flight] of this.historyFlights) this.detachHistory(id, flight);
@@ -624,7 +577,7 @@ export class DshAdapter implements HostAdapter {
     const view = await this.source.list();
     const signature = JSON.stringify(view);
     if (signature !== this.historyScope) {
-      this.history.clear(); this.historyBytes = 0; this.historyScope = signature; this.evidenceRevision++;
+      this.history.clear(); this.historyBytes = 0; this.historyScope = signature;
       for (const [id, flight] of this.historyFlights) this.detachHistory(id, flight);
     }
     const archived = this.source.archivedSessionIds();
@@ -786,9 +739,9 @@ export class DshAdapter implements HostAdapter {
     }
     return waiting;
   }
-  private async open(sessionId: string, active: AbortSignal, expectedWorkspaceId?: string, listed?: HostSession): Promise<{ transcript: Transcript; view: readonly WorkspaceConfig[] }> {
+  private async open(sessionId: string, active: AbortSignal, expectedWorkspaceId?: string): Promise<{ transcript: Transcript; view: readonly WorkspaceConfig[] }> {
     const revision = this.lifecycleToken(sessionId);
-    let session = listed ?? (!this.options.sessionStatus || expectedWorkspaceId !== undefined ? (await this.permitted(sessionId, active, expectedWorkspaceId)).session : undefined);
+    let session = !this.options.sessionStatus || expectedWorkspaceId !== undefined ? (await this.permitted(sessionId, active, expectedWorkspaceId)).session : undefined;
     // Mutations and legacy controller-only compositions keep their original
     // admission/cleanup ordering. Coalesced openings carry no scope bindings.
     let transcript: Transcript | undefined, view: readonly WorkspaceConfig[] | undefined;
