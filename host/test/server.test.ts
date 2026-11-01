@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, realpathSync, copyFileSync } from 'node:fs';
 import { runAdminCli } from '../src/cli.ts';
 import { prepareConfiguration, validateBaseUrl } from '../src/config.ts';
 import { tmpdir } from 'node:os';
@@ -999,4 +999,122 @@ test('all reads require device bearer auth; one-use pairing returns individual a
   const browser = await request('/workspaces', paired.deviceToken, 'GET', undefined, { Origin: 'http://localhost' });
   assert.equal(browser.status, 403);
   assert.equal((await request('/workspaces?token=not-a-credential', paired.deviceToken)).status, 400);
+});
+
+for (const operation of ['create', 'prompt', 'mutate', 'snapshot'] as const) test('H03 host deadline owns terminal receipt for held ' + operation, { timeout: 5000 }, async t => {
+  const adapter = new TestAdapter(), gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+  let calls = 0;
+  const hold = async () => { calls++; entered.resolve(); await gate.promise; };
+  if (operation === 'create') adapter.createSession = async () => { await hold(); return { sessionId: 'late-session' }; };
+  if (operation === 'prompt') adapter.prompt = hold;
+  if (operation === 'mutate') {
+    (adapter as HostAdapter).mutateSession = hold;
+    (adapter as HostAdapter).phoneCapabilities = () => ({ steer: false, queue: false, rename: true, models: false, questions: false, attachments: false });
+  }
+  const { request, pair, host } = await setup(t, adapter, { dispatchTimeoutMs: 30 }), { deviceToken, deviceId } = await pair();
+  const requestId = randomUUID();
+  if (operation === 'snapshot') {
+    const snapshot = adapter.snapshot.bind(adapter);
+    adapter.snapshot = async id => { if (host.state.getCommand(deviceId, requestId)) await hold(); return snapshot(id); };
+  }
+  const path = operation === 'create' ? '/sessions' : '/sessions/s-alpha' + (operation === 'mutate' ? '/title' : '/messages');
+  const body = operation === 'create' ? { requestId, workspaceId: 'alpha' } : operation === 'mutate' ? { requestId, title: 'Synthetic' } : { requestId, text: 'Synthetic' };
+  const sending = request(path, deviceToken, 'POST', body);
+  t.after(() => gate.resolve());
+  await entered.promise;
+  await new Promise(r => setTimeout(r, 70));
+  assert.equal((await (await request('/commands/' + requestId, deviceToken)).json()).status, 'uncertain');
+  gate.resolve(); await sending;
+  await new Promise(r => setImmediate(r));
+  assert.equal((await (await request('/commands/' + requestId, deviceToken)).json()).status, 'uncertain', 'late settlement cannot overwrite deadline');
+  assert.equal(host.state.mobileSessionVisible('late-session', true), false);
+  assert.equal(calls, 1);
+});
+
+test('H07 equal timestamps use one total order across every keyset page', async t => {
+  const adapter = new TestAdapter(); adapter.snapshots.clear();
+  const ids = ['a', 'B', '!', 'é', 'e\u0301', 'Ж', '😀'];
+  for (const id of ids) adapter.snapshots.set(id, { ...structuredClone(snapshot), session: { ...snapshot.session, id } });
+  const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
+  const seen: string[] = []; let cursor: string | null = null;
+  do {
+    const response = await request('/sessions?limit=1' + (cursor ? '&cursor=' + cursor : ''), deviceToken);
+    assert.equal(response.status, 200); const page = await response.json(); seen.push(...page.items.map((s: any) => s.id)); cursor = page.nextCursor;
+    assert.ok(seen.length <= ids.length, 'pagination must terminate');
+  } while (cursor);
+  assert.deepEqual(seen, ['!', 'B', 'a', 'e\u0301', 'é', 'Ж', '😀']);
+});
+
+for (const [label, input, expected] of [
+  ['controls', { code: 'HTTP_400', message: '  Привет\r\n\0мир\u007f!  ', unexpected: 'internal' }, { code: 'HTTP_400', message: 'Привет мир !' }],
+  ['astral boundary', { message: 'x'.repeat(511) + '😀' }, { message: 'x'.repeat(511) }],
+  ['lone surrogate', { message: 'x\ud800y' }, { message: 'x�y' }],
+  ['empty', { message: '', code: '' }, { message: 'The turn failed.' }],
+  ['wrong types', { message: 42, code: ['bad'] }, { message: 'The turn failed.' }],
+  ['huge', { message: '😀'.repeat(100000), code: 'x'.repeat(100) }, { message: '😀'.repeat(256) }],
+  ['wrong object', ['bad'], { message: 'The turn failed.' }],
+] as const) test('H10 snapshot failure is allowlisted and Unicode safe: ' + label, async t => {
+  const adapter = new TestAdapter(); (adapter.snapshots.get('s-alpha') as any).failure = input;
+  const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
+  const response = await request('/sessions/s-alpha', deviceToken); assert.equal(response.status, 200);
+  const result = await response.json(); assert.deepEqual(result.failure, expected); assert.equal(result.failure.message.isWellFormed(), true);
+});
+
+for (const manual of [false, true]) test('recovery startup blocks a restored lost requestId before first admission: manual=' + manual, async t => {
+  const adapter = new TestAdapter();
+  const { host, hosts, config, pair } = await setup(t, adapter), device = await pair();
+  await host.close(); const backup = config.statePath + '.backup'; copyFileSync(config.statePath, backup);
+  copyFileSync(config.statePath + '.ledger.json', backup + '.ledger.json');
+  const active = await startHostServer({ config, adapter }); hosts.push(active); const activeUrl = (await active.start()).baseUrl;
+  const requestId = randomUUID(), body = { requestId, text: 'Synthetic lost receipt' }, headers = { Authorization: 'Bearer ' + device.deviceToken, 'Content-Type': 'application/json' };
+  assert.equal((await fetch(activeUrl + '/v1/sessions/s-alpha/messages', { method: 'POST', headers, body: JSON.stringify(body) })).status, 200);
+  assert.equal(adapter.prompts.length, 1); await active.close();
+  copyFileSync(backup, config.statePath);
+  if (manual) {
+    // Both artifacts restored: automatic detection is impossible. Operator hold is
+    // persisted off-line before any listener is opened, never retroactively.
+    copyFileSync(backup + '.ledger.json', config.statePath + '.ledger.json');
+    const admin = new HostState(config.statePath); admin.setRecoveryHold('restore_reconciliation'); admin.close();
+  }
+  const restored = await createHostServer({ config, adapter }); hosts.push(restored);
+  assert.equal(restored.state.ledgerStatus().hold, true, 'hold precedes listen');
+  let checkedAtListen = false;
+  restored.server.once('listening', () => { checkedAtListen = true; assert.equal(restored.state.ledgerStatus().hold, true); });
+  const url = (await restored.start()).baseUrl;
+  const send = () => fetch(url + '/v1/sessions/s-alpha/messages', { method: 'POST', headers, body: JSON.stringify(body) });
+  assert.equal(checkedAtListen, true);
+  assert.equal((await fetch(url + '/v1/commands/' + requestId, { headers })).status, 404);
+  const blocked = await send(); assert.equal(blocked.status, 503); assert.equal((await blocked.json()).error.code, 'recovery_hold'); assert.equal(adapter.prompts.length, 1);
+  restored.state.releaseRecovery();
+  assert.equal((await send()).status, 200); assert.equal(adapter.prompts.length, 2, 'explicit release has no wire epoch fencing; a lost ID is a new admission');
+  assert.equal((await send()).status, 200); assert.equal(adapter.prompts.length, 2, 'the new persisted receipt deduplicates subsequent replay');
+});
+
+test('H03 terminal deadline does not free capacity owned by nonsettled upstream calls', { timeout: 10000 }, async t => {
+  const adapter = new TestAdapter(), gate = Promise.withResolvers<void>(); let calls = 0;
+  adapter.createSession = async () => { calls++; await gate.promise; return { sessionId: 'late' }; };
+  const { request, pair, host } = await setup(t, adapter, { dispatchTimeoutMs: 60 }); const devices = [await pair(), await pair()];
+  const ids: { requestId: string; deviceId: string }[] = [];
+  try {
+    await Promise.all(Array.from({ length: 32 }, async (_, i) => { const device = devices[i % 2]!, requestId = randomUUID(); ids.push({ requestId, deviceId: device.deviceId }); await request('/sessions', device.deviceToken, 'POST', { requestId, workspaceId: 'alpha' }); }));
+    await new Promise(r => setTimeout(r, 100)); assert.equal(calls, 32);
+    assert.ok(ids.every(item => host.state.getCommand(item.deviceId, item.requestId)?.receipt.status === 'uncertain'));
+    const overflow = randomUUID(); assert.equal((await request('/sessions', devices[0]!.deviceToken, 'POST', { requestId: overflow, workspaceId: 'alpha' })).status, 429);
+    assert.equal(host.state.getCommand(devices[0]!.deviceId, overflow), undefined);
+  } finally { gate.resolve(); }
+  await new Promise(r => setImmediate(r)); assert.ok(ids.every(item => host.state.getCommand(item.deviceId, item.requestId)?.receipt.status === 'uncertain'));
+  assert.equal((await request('/sessions', devices[0]!.deviceToken, 'POST', { requestId: randomUUID(), workspaceId: 'alpha' })).status, 201);
+});
+
+test('H03 failed deadline persistence aborts observation without an uncaught timer error or invented receipt', { timeout: 5000 }, async t => {
+  const adapter = new TestAdapter(), gate = Promise.withResolvers<void>(); let seen!: AbortSignal;
+  adapter.createSession = async (_input, signal) => { seen = signal; await gate.promise; return { sessionId: 'late' }; };
+  const { request, pair, host } = await setup(t, adapter, { dispatchTimeoutMs: 60 }), device = await pair();
+  const finish = host.state.finishCommand.bind(host.state); let fail = true;
+  host.state.finishCommand = ((...args) => { if (fail) throw new Error('synthetic durable write failure'); return finish(...args); }) as typeof host.state.finishCommand;
+  try {
+    const id = randomUUID(); await request('/sessions', device.deviceToken, 'POST', { requestId: id, workspaceId: 'alpha' });
+    await new Promise(r => setTimeout(r, 100)); assert.equal(seen.aborted, true);
+    assert.equal(host.state.getCommand(device.deviceId, id)?.receipt.status, 'pending', 'a failed write cannot be represented as persisted uncertain');
+  } finally { fail = false; await host.close(); gate.resolve(); }
 });

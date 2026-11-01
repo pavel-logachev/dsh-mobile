@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync, openSync, closeSync, chmodSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, openSync, closeSync, chmodSync, readFileSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { HostError } from './errors.ts';
@@ -57,6 +57,7 @@ export class HostState {
     try { closeSync(openSync(path, 'wx', 0o600)); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; }
     if (process.platform !== 'win32') chmodSync(path, 0o600);
     this.db = new DatabaseSync(path, { timeout: 5_000, enableForeignKeyConstraints: true, enableDoubleQuotedStringLiterals: false, allowExtension: false });
+    try {
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = FULL;
@@ -83,6 +84,7 @@ export class HostState {
       CREATE TABLE IF NOT EXISTS mobile_created_sessions (id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS notification_state (id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS notification_settings (device_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), settings TEXT NOT NULL) STRICT;
+      CREATE INDEX IF NOT EXISTS notification_settings_enabled ON notification_settings(enabled,device_id);
       CREATE TABLE IF NOT EXISTS runtime_lock (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, pid INTEGER NOT NULL) STRICT;
     `);
     // Early development databases have no scope column; unknown prior scope fails closed.
@@ -98,20 +100,21 @@ export class HostState {
     ) STRICT;
     CREATE TABLE IF NOT EXISTS relay_status (route_id TEXT PRIMARY KEY, connected INTEGER NOT NULL, ready INTEGER NOT NULL, generation TEXT, updated_at INTEGER NOT NULL) STRICT;
     `);
-    // Upgrade from journals written before the separate settings table existed. This
-    // is one bounded startup scan, never part of an event hot path.
+    // One-time migration: old journals are streamed, never re-read on ordinary opens.
+    this.db.exec('CREATE TABLE IF NOT EXISTS host_migrations (id TEXT PRIMARY KEY) STRICT');
     this.transaction(() => {
-      const rows = this.db.prepare("SELECT id,value FROM notification_state WHERE id LIKE 'device:%'").all();
+      if (this.db.prepare('SELECT id FROM host_migrations WHERE id=?').get('notification-settings-v1')) return;
+      const rows = this.db.prepare("SELECT id,value FROM notification_state WHERE id LIKE 'device:%'").iterate();
       const upsert = this.db.prepare(`INSERT INTO notification_settings(device_id,enabled,settings) VALUES (?,?,?)
         ON CONFLICT(device_id) DO UPDATE SET enabled=excluded.enabled, settings=excluded.settings`);
       for (const row of rows) {
-        try {
-          const journal = JSON.parse(String(row.value)) as { settings?: { enabled?: unknown } } | undefined;
-          const settings = journal?.settings;
-          if (!settings || typeof settings.enabled !== 'boolean') continue;
-          upsert.run(String(row.id).slice(7), settings.enabled ? 1 : 0, JSON.stringify(settings));
-        } catch { /* A malformed old journal stays inert; it cannot enable notifications. */ }
+        let settings: { enabled?: unknown } | undefined;
+        try { settings = (JSON.parse(String(row.value)) as { settings?: { enabled?: unknown } } | undefined)?.settings; }
+        catch { continue; } // Only malformed JSON is inert; storage failures must roll back the marker.
+        if (!settings || typeof settings.enabled !== 'boolean') continue;
+        upsert.run(String(row.id).slice(7), settings.enabled ? 1 : 0, JSON.stringify(settings));
       }
+      this.db.prepare('INSERT INTO host_migrations VALUES (?)').run('notification-settings-v1');
     });
     this.transaction(() => {
       const version = Number(this.db.prepare('PRAGMA user_version').get()?.user_version);
@@ -137,6 +140,7 @@ export class HostState {
         .run(randomUUID(), Number(counts?.total ?? 0), Number(counts?.completed ?? 0), Number(counts?.newest ?? 0), this.now());
     });
     this.verifyLedgerWitness();
+    } catch (error) { this.db.close(); throw error; }
   }
 
   private transaction<T>(fn: () => T): T {
@@ -174,8 +178,7 @@ export class HostState {
    * admissions/completions than the database proves that the database was restored from
    * an older copy. It is deliberately best-effort: losing the witness degrades detection.
    */
-  private witnessProblem(row: Row): LedgerStatus['witnessProblem'] {
-    const witness = this.readLedgerWitness();
+  private witnessProblem(row: Row, witness = this.readLedgerWitness()): LedgerStatus['witnessProblem'] {
     if (!witness.present) return 'missing';
     if (witness.invalid || !witness.value) return 'witness_corrupt';
     if (witness.value.ledgerId !== String(row.ledger_id)) return 'ledger_replaced';
@@ -183,42 +186,60 @@ export class HostState {
       witness.value.completedCount > Number(row.completed_count)) return 'rollback';
     return 'none';
   }
-  private writeLedgerWitness(row: Row): void {
+  private writeLedgerWitness(row: Row, strict = false): void {
     const target = this.ledgerWitnessPath(), temporary = `${target}.tmp-${process.pid}-${randomUUID()}`;
     const value: LedgerWitness = { version: 1, ledgerId: String(row.ledger_id), epoch: Number(row.epoch),
       admittedCount: Number(row.admitted_count), completedCount: Number(row.completed_count), newestAt: Number(row.newest_at) };
     const current = this.readLedgerWitness().value;
     // Concurrent settlements can finish out of order; never let an older snapshot overwrite a newer witness.
-    if (current && current.ledgerId === value.ledgerId && current.epoch === value.epoch &&
-      (current.admittedCount > value.admittedCount || current.completedCount > value.completedCount)) return;
+    if (current && current.ledgerId === value.ledgerId && (current.epoch > value.epoch || (current.epoch === value.epoch &&
+      (current.admittedCount > value.admittedCount || current.completedCount > value.completedCount)))) {
+      if (strict) throw new HostError('recovery_hold');
+      return;
+    }
     try {
       writeFileSync(temporary, JSON.stringify(value) + '\n', { encoding: 'utf8', mode: 0o600 });
       renameSync(temporary, target);
       if (process.platform !== 'win32') chmodSync(target, 0o600);
-    } catch { /* A failed witness write degrades rollback detection; it never blocks admitted work. */ }
+    } catch (error) {
+      // Ordinary admitted work cannot be rolled back by diagnostic IO, but an
+      // explicit recovery release must never report durability it did not obtain.
+      if (strict) throw error;
+    } finally { try { unlinkSync(temporary); } catch { /* Missing after rename, or filesystem remains unavailable. */ } }
   }
   private verifyLedgerWitness(): void {
     const row = this.ledgerRow(), problem = this.witnessProblem(row);
     // Seed a first run or an upgraded database. A merely stale (lower) witness is safe and
     // must not be rewritten by a concurrent read-only admin open; runtime sync does that.
-    if (problem === 'missing') { this.writeLedgerWitness(row); return; }
     if (problem === 'none') return;
-    // Keep the contradictory witness as evidence; an operator must release the ledger explicitly.
-    if (Number(row.hold) === 0) this.db.prepare('UPDATE ledger_meta SET hold=1,hold_reason=?,updated_at=? WHERE id=1').run(problem, this.now());
+    // Recheck the current cut under the writers' lock before making a sticky hold.
+    this.transaction(() => {
+      const current = this.ledgerRow(), checked = this.witnessProblem(current);
+      if (checked === 'missing') { this.writeLedgerWitness(current); return; }
+      if (checked !== 'none' && Number(current.hold) === 0) this.db.prepare('UPDATE ledger_meta SET hold=1,hold_reason=?,updated_at=? WHERE id=1').run(checked, this.now());
+    });
   }
   private syncLedgerWitness(): void {
-    const row = this.ledgerRow(), problem = this.witnessProblem(row);
-    if (problem === 'none' || problem === 'missing') this.writeLedgerWitness(row);
+    this.transaction(() => {
+      const row = this.ledgerRow(), problem = this.witnessProblem(row);
+      if (problem === 'none' || problem === 'missing') this.writeLedgerWitness(row);
+    });
   }
   /** Reads without changing state; safe for CLI status while a runtime owns the host. */
   ledgerStatus(): LedgerStatus {
-    const row = this.ledgerRow(), witness = this.readLedgerWitness();
+    // An optimistic read keeps routine status nonblocking. If either side changed
+    // during the read, repeat both under the same lock used by all witness writers.
+    const witness = this.readLedgerWitness(), row = this.ledgerRow(), confirmed = this.readLedgerWitness();
+    if (JSON.stringify(witness) !== JSON.stringify(confirmed) || this.witnessProblem(row, confirmed) !== 'none') return this.transaction(() => this.ledgerStatusAt(this.ledgerRow(), this.readLedgerWitness()));
+    return this.ledgerStatusAt(row, confirmed);
+  }
+  private ledgerStatusAt(row: Row, witness: ReturnType<HostState['readLedgerWitness']>): LedgerStatus {
     return {
       ledgerId: String(row.ledger_id), epoch: Number(row.epoch), hold: Number(row.hold) === 1,
       holdReason: row.hold_reason === null ? null : String(row.hold_reason),
       admittedCount: Number(row.admitted_count), completedCount: Number(row.completed_count),
       newestAt: Number(row.newest_at), updatedAt: Number(row.updated_at),
-      witnessPresent: witness.present, witnessProblem: this.witnessProblem(row),
+      witnessPresent: witness.present, witnessProblem: this.witnessProblem(row, witness),
     };
   }
   recentCommands(limit = 20): RecentCommand[] {
@@ -234,8 +255,7 @@ export class HostState {
   setRecoveryHold(reason = 'operator_request'): LedgerStatus {
     if (typeof reason !== 'string' || !reason.trim() || Buffer.byteLength(reason, 'utf8') > 256 || /[\x00-\x1f\x7f]/.test(reason)) throw new HostError('invalid_request');
     this.transaction(() => { this.db.prepare('UPDATE ledger_meta SET hold=1,hold_reason=?,updated_at=? WHERE id=1').run(reason.trim(), this.now()); });
-    const row = this.ledgerRow(), problem = this.witnessProblem(row);
-    if (problem === 'none' || problem === 'missing') this.writeLedgerWitness(row);
+    this.syncLedgerWitness();
     return this.ledgerStatus();
   }
   /**
@@ -244,11 +264,16 @@ export class HostState {
    */
   releaseRecovery(): LedgerStatus {
     this.transaction(() => {
-      if (Number(this.ledgerRow().hold) !== 1) throw new HostError('conflict');
-      this.db.prepare('UPDATE ledger_meta SET hold=0,hold_reason=NULL,epoch=epoch+1,updated_at=? WHERE id=1').run(this.now());
+      const row = this.ledgerRow();
+      if (Number(row.hold) !== 1) throw new HostError('conflict');
+      const witness = this.readLedgerWitness();
+      const epoch = Math.max(Number(row.epoch), witness.value?.epoch ?? 0) + 1;
+      if (!Number.isSafeInteger(epoch)) throw new HostError('recovery_hold');
+      this.db.prepare('UPDATE ledger_meta SET hold=0,hold_reason=NULL,epoch=?,updated_at=? WHERE id=1').run(epoch, this.now());
+      // Write before commit: failure rolls back the release; a commit failure leaves
+      // a newer contradictory witness, which fails closed on the next open.
+      this.writeLedgerWitness(this.ledgerRow(), true);
     });
-    // A release intentionally resets the witness to the restored cut; the epoch records the decision.
-    this.writeLedgerWitness(this.ledgerRow());
     return this.ledgerStatus();
   }
 

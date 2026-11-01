@@ -13,7 +13,7 @@ import { request as httpRequest } from 'node:http';
 import { UPLOAD_LIMIT } from '../src/phone.ts';
 import type { HostAdapter, HostSnapshot } from '../src/types.ts';
 
-async function setup(t: any, scopeGate?: () => Promise<void>) {
+async function setup(t: any, scopeGate?: () => Promise<void>, dispatchTimeoutMs?: number) {
   const root = await mkdtemp(join(tmpdir(), 'mobile-phone-'));
   await mkdir(join(root, 'workspace'));
   const calls: unknown[] = [];
@@ -22,7 +22,7 @@ async function setup(t: any, scopeGate?: () => Promise<void>) {
     phoneCapabilities: () => ({ steer: true, queue: true, rename: true, models: true, questions: false, attachments: false }),
     async mutateSession(...args) { calls.push(args); }, async models() { return { items: [{ provider: 'fixture', id: 'model', name: 'Synthetic model', supportsImages: true }] }; },
   };
-  const host = await startHostServer({ adapter, ...(scopeGate ? { workspaceSource: { kind: 'explicit' as const, async list() { await scopeGate(); return [{ id: 'w', name: 'Synthetic', path: join(root, 'workspace') }]; }, archivedSessionIds: () => new Set<string>() } } : {}), config: { bind: '127.0.0.1', port: 0, allowInsecureLoopback: true, hostName: 'Synthetic', statePath: join(root, 'state.sqlite'), workspaces: [{ id: 'w', name: 'Synthetic', path: join(root, 'workspace') }] } });
+  const host = await startHostServer({ adapter, ...(dispatchTimeoutMs ? { dispatchTimeoutMs } : {}), ...(scopeGate ? { workspaceSource: { kind: 'explicit' as const, async list() { await scopeGate(); return [{ id: 'w', name: 'Synthetic', path: join(root, 'workspace') }]; }, archivedSessionIds: () => new Set<string>() } } : {}), config: { bind: '127.0.0.1', port: 0, allowInsecureLoopback: true, hostName: 'Synthetic', statePath: join(root, 'state.sqlite'), workspaces: [{ id: 'w', name: 'Synthetic', path: join(root, 'workspace') }] } });
   t.after(async () => { await host.close(); await rm(root, { recursive: true, force: true }); });
   const { baseUrl } = await host.start();
   const pair = (execute = true) => host.state.consumePairing(host.state.createPairing({ readWorkspaceIds: ['w'], executeWorkspaceIds: execute ? ['w'] : [] }).pairingToken, 'Synthetic phone');
@@ -433,4 +433,68 @@ test('phone capabilities, model catalog and gzip JSON are additive and bounded',
   assert.equal((await request('/sessions/chat', token, undefined, { 'Accept-Encoding': 'GZip; q=0.5' })).headers.get('content-encoding'), 'gzip');
   assert.equal((await request('/sessions/chat', token, undefined, { 'Accept-Encoding': 'gzip, gzip;q=0' })).headers.get('content-encoding'), null);
   assert.equal(host.server.keepAliveTimeout, 60_000);
+});
+
+test('H03 deadline settles receipt but holds upload bytes and reservation until real settlement', { timeout: 5000 }, async t => {
+  const { host, adapter, pair, baseUrl, request, root } = await setup(t, undefined, 60);
+  const gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>(); let released = 0, prompts = 0;
+  adapter.phoneCapabilities = () => ({ steer: false, queue: false, rename: false, models: false, questions: false, attachments: true });
+  adapter.reserveFileUploads = async () => ({ release() { released++; } });
+  adapter.upload = async (_id, input) => { entered.resolve(); await gate.promise; return { ref: { id: 'f', name: input.name, size: input.size, mime: input.mime, kind: 'file' }, upstream: { type: 'file', receiptId: 'r' } }; };
+  adapter.prompt = async () => { prompts++; };
+  const device = pair(), token = device.deviceToken;
+  const picked = await fetch(baseUrl + '/v1/sessions/chat/uploads', { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'text/plain' }, body: 'synthetic bytes' });
+  const uploadId = (await picked.json()).uploadId, requestId = randomUUID();
+  const sending = request('/sessions/chat/messages', token, { requestId, text: 'Synthetic', uploadIds: [uploadId] });
+  try {
+    await entered.promise; await new Promise(r => setTimeout(r, 100));
+    assert.equal(host.state.getCommand(device.deviceId, requestId)?.receipt.status, 'uncertain');
+    assert.equal(released, 0); const paths = await readdir(join(root, 'mobile-uploads')); assert.equal(paths.length, 1);
+    assert.equal((await readFile(join(root, 'mobile-uploads', paths[0]!))).toString(), 'synthetic bytes');
+  } finally { gate.resolve(); await sending; }
+  const until = Date.now() + 2000;
+  while ((await readdir(join(root, 'mobile-uploads'))).length) { assert.ok(Date.now() < until); await new Promise(r => setImmediate(r)); }
+  assert.equal(released, 1); assert.equal(prompts, 0); assert.equal(host.state.getCommand(device.deviceId, requestId)?.receipt.status, 'uncertain');
+});
+
+test('H03 held post-admission workspace lookup cannot dispatch after deadline', { timeout: 5000 }, async t => {
+  const gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>(); let admitted = false, creates = 0;
+  const { host, adapter, pair, request } = await setup(t, async () => { if (admitted) { entered.resolve(); await gate.promise; } }, 30);
+  const admit = host.state.admitCommand.bind(host.state);
+  host.state.admitCommand = (...args) => { const result = admit(...args); admitted = result.fresh; return result; };
+  adapter.createSession = async () => { creates++; return { sessionId: 'late' }; };
+  const device = pair(), requestId = randomUUID();
+  const sending = request('/sessions', device.deviceToken, { requestId, workspaceId: 'w' });
+  try { await entered.promise; await new Promise(r => setTimeout(r, 70)); assert.equal(host.state.getCommand(device.deviceId, requestId)?.receipt.status, 'uncertain'); }
+  finally { admitted = false; gate.resolve(); await sending; }
+  await new Promise(r => setImmediate(r)); assert.equal(creates, 0);
+});
+
+test('H03 timed-out queued uploads keep claims until dequeue and never start late side effects', { timeout: 5000 }, async t => {
+  const { host, adapter, pair, baseUrl, request, root } = await setup(t, undefined, 60);
+  const gate = Promise.withResolvers<void>(); let uploads = 0, prompts = 0;
+  adapter.phoneCapabilities = () => ({ steer: false, queue: false, rename: false, models: false, questions: false, attachments: true });
+  adapter.upload = async (_id, input) => { uploads++; await gate.promise; return { ref: { id: 'f', name: input.name, size: 1, mime: input.mime, kind: 'file' }, upstream: { type: 'file', receiptId: 'r' } }; };
+  adapter.prompt = async () => { prompts++; };
+  const device = pair(), ids: string[] = [], picks: string[] = [];
+  // Local intake shares the same per-device limiter: finish all picks before
+  // occupying its two slots with intentionally held send-time upstream uploads.
+  for (let i = 0; i < 3; i++) {
+    const pick = await fetch(baseUrl + '/v1/sessions/chat/uploads', { method: 'POST', headers: { Authorization: 'Bearer ' + device.deviceToken, 'Content-Type': 'text/plain' }, body: 'a' });
+    assert.equal(pick.status, 201); picks.push((await pick.json()).uploadId);
+  }
+  try {
+    for (const uploadId of picks) {
+      const requestId = randomUUID(); ids.push(requestId);
+      const sent = await request('/sessions/chat/messages', device.deviceToken, { requestId, text: 'Synthetic', uploadIds: [uploadId] });
+      assert.equal(sent.status, 202, JSON.stringify(await sent.json()));
+    }
+    await new Promise(r => setTimeout(r, 100));
+    assert.equal(uploads, 2, 'third send is queued behind per-device capacity');
+    assert.ok(ids.every(id => host.state.getCommand(device.deviceId, id)?.receipt.status === 'uncertain'));
+    assert.equal((await readdir(join(root, 'mobile-uploads'))).length, 3);
+  } finally { gate.resolve(); }
+  const until = Date.now() + 2000;
+  while ((await readdir(join(root, 'mobile-uploads'))).length) { assert.ok(Date.now() < until); await new Promise(r => setImmediate(r)); }
+  assert.equal(uploads, 2); assert.equal(prompts, 0);
 });

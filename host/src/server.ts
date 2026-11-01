@@ -1,4 +1,5 @@
 import { FileStaging } from './file-staging.ts';
+import { safeFailure } from './failure.ts';
 import { sessionModel, settledQuestions, mutationAnswer } from './phone-projection.ts';
 import { gzipSync } from 'node:zlib';
 import { HOST_VERSION, parseMutation, validateAnswer, UPLOAD_LIMIT, UPLOAD_MIMES, identifier, safeAttachmentRefs, safeQueue, questionsOf } from './phone.ts';
@@ -169,21 +170,37 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
   }
   function dispatch(deviceId: string, command: Command): Promise<StoredCommand | undefined> {
     const controller = new AbortController();
-    const deadline = setTimeout(() => controller.abort(new Error('dispatch_timeout')), options.dispatchTimeoutMs ?? 600_000);
+    let timedOut = false;
+    let resolveTerminal!: (value: StoredCommand | undefined) => void;
+    let rejectTerminal!: (reason: unknown) => void;
+    const terminal = new Promise<StoredCommand | undefined>((resolve, reject) => { resolveTerminal = resolve; rejectTerminal = reject; });
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      // Receipt lifetime is bounded even when an upstream await ignores abort.
+      // Resource lifetime below still follows the real operation, not this receipt.
+      try {
+        if (!closing) resolveTerminal(state.finishCommand(deviceId, command.requestId, 'uncertain', { error: { code: 'delivery_uncertain', message: 'Delivery could not be confirmed. Do not automatically resend this action.' }, httpStatus: 202 }));
+        else resolveTerminal(undefined);
+      } catch (error) { rejectTerminal(error); } // Persistence failure is not a fabricated durable receipt.
+      finally { controller.abort(new Error('dispatch_timeout')); }
+    }, options.dispatchTimeoutMs ?? 600_000);
     deadline.unref();
-    return (async () => {
+    const settlement = (async () => {
       let dispatched = false;
       try {
         if (closing) throw new HostError('unavailable');
         // This signal is host-owned, not tied to HTTP lifetime. Admission is already durable.
         await checkScope(deviceId, command.workspaceId, true, command.operation !== 'create');
+        controller.signal.throwIfAborted();
         if (command.operation !== 'create') {
           const snapshot = await sessionSnapshot(command.sessionId, deviceId, controller.signal, command.operation !== 'prompt');
+          controller.signal.throwIfAborted();
           if (snapshot.session.workspaceId !== command.workspaceId) throw new HostError('forbidden');
           if (command.operation === 'cancel' && (!snapshot.session.running || snapshot.cursor !== command.expectedCursor)) throw new HostError('conflict');
         }
         if (closing) throw new HostError('unavailable');
         await checkScope(deviceId, command.workspaceId, true, command.operation !== 'create');
+        controller.signal.throwIfAborted();
         dispatched = true;
         let result: { sessionId?: string } | undefined;
         if (command.operation === 'create') {
@@ -191,7 +208,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
           // settles: a host stop closes SQLite, and a failed create must not leave
           // a phantom blank-session exception behind.
           result = await adapter.createSession({ workspaceId: command.workspaceId, requestId: command.requestId, ...(command.presetId ? { presetId: command.presetId } : {}) }, controller.signal, command.workspaceId);
-          if (closing) return undefined;
+          if (closing || timedOut) return undefined;
           state.rememberMobileSession('session-' + command.requestId.toLowerCase());
           state.rememberMobileSession(result.sessionId!);
         }
@@ -199,16 +216,20 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
           const attachments: UploadedAttachment[] = [];
           for (const staged of command.staged ?? []) {
             await checkScope(deviceId, command.workspaceId, true, true);
+            controller.signal.throwIfAborted();
             if (staged.filePath) {
               if (!adapter.upload) throw new HostError('unavailable');
               const release = await acquireSendUpload(deviceId);
               try {
+                controller.signal.throwIfAborted();
                 await checkScope(deviceId, command.workspaceId, true, true);
+                controller.signal.throwIfAborted();
                 attachments.push(await adapter.upload(command.sessionId, { ...(command.fileReservation ? { reservation: command.fileReservation } : {}), data: files.read(staged.filePath, controller.signal), size: staged.value.ref.size, mime: staged.value.ref.mime, name: staged.value.ref.name }, controller.signal, command.workspaceId));
               } finally { release(); }
             } else attachments.push(staged.value);
           }
           await checkScope(deviceId, command.workspaceId, true, true);
+          controller.signal.throwIfAborted();
           await adapter.prompt(command.sessionId, command.text, upstreamRequestId(deviceId, command.requestId), controller.signal, command.workspaceId, { delivery: command.options?.delivery ?? 'queue', ...(attachments.length ? { attachments } : {}) });
         }
         else if (command.operation === 'mutate') {
@@ -216,12 +237,10 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
           await adapter.mutateSession(command.sessionId, command.mutation, controller.signal, command.workspaceId);
         }
         else await adapter.cancel(command.sessionId, controller.signal, command.expectedCursor, command.workspaceId);
-        if (closing) return undefined;
-        if (command.operation === 'prompt') await Promise.all((command.staged ?? []).flatMap(u => { if (!u.filePath) return []; files.release(u.filePath); return [files.remove(u.filePath)]; })).catch(() => {});
+        if (closing || timedOut) return undefined;
         return state.finishCommand(deviceId, command.requestId, 'accepted', { ...(result?.sessionId ? { result: { sessionId: result.sessionId } } : {}), httpStatus: command.operation === 'create' ? 201 : 200 });
       } catch (error) {
-        if (closing) return undefined;
-        if (command.operation === 'prompt') await Promise.all((command.staged ?? []).flatMap(u => { if (!u.filePath) return []; files.release(u.filePath); return [files.remove(u.filePath)]; })).catch(() => {});
+        if (closing || timedOut) return undefined;
         if ((!dispatched || error instanceof HostError) && error instanceof HostError && error.status >= 400 && error.status < 500) {
           return state.finishCommand(deviceId, command.requestId, 'rejected', { error: { code: error.code, message: error.message }, httpStatus: error.status });
         }
@@ -237,6 +256,8 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         }
       }
     })();
+    // Observe every late rejection; only actual settlement frees claimed resources/capacity.
+    return Promise.race([settlement, terminal]);
   }
   async function responseReceipt(deviceId: string, requestId: string, completion: Promise<StoredCommand | undefined>): Promise<StoredCommand> {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -246,6 +267,8 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     } finally { if (timer) clearTimeout(timer); }
   }
 
+  // Locale-independent UTF-16 total order, shared verbatim by sort and seek.
+  const sessionOrder = (a: { updatedAt: number; id: string }, b: { updatedAt: number; id: string }): number => b.updatedAt - a.updatedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   const cursors = new Map<string, { deviceId: string; workspaceId: string | undefined; after: { updatedAt: number; id: string }; expiresAt: number }>();
   function freshDevice(deviceId: string): AuthorizedDevice {
     const device = state.getDevice(deviceId);
@@ -305,7 +328,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     const runningSubagents = childCount(snapshot.runningSubagents);
     if (runningSubagents !== undefined && session.runningSubagents !== undefined && runningSubagents !== session.runningSubagents) throw new HostError('internal_error');
     const count = runningSubagents ?? session.runningSubagents;
-    const result = { ...(snapshot.model !== undefined ? { model: sessionModel(snapshot.model) } : {}), ...(snapshot.resolvedQuestions !== undefined ? { resolvedQuestions: settledQuestions(snapshot.resolvedQuestions) } : {}), ...(snapshot.pendingQueue ? { pendingQueue: safeQueue(snapshot.pendingQueue).map(q => ({ ...q, ...(q.requestId ? { requestId: mobileId(q.requestId) } : {}) })) } : {}), ...(snapshot.pendingQuestions ? { pendingQuestions: questionsOf(snapshot.pendingQuestions) } : {}), ...(count !== undefined ? { runningSubagents: count } : {}), ...(activityDetail ? { activityDetail } : {}), session, messages, cursor: snapshot.cursor, hasMore: snapshot.hasMore === true || snapshot.messages.length > 100, activity: snapshot.activity, ...(snapshot.notice === HISTORY_CUT_NOTICE ? { notice: HISTORY_CUT_NOTICE } : snapshot.activity === 'unknown' || (snapshot.activity === 'waiting' && !snapshot.pendingQuestions?.length) ? { notice: 'Return to the desktop to check this task.' } : {}), ...(snapshot.failure ? { failure: snapshot.failure } : {}) };
+    const result = { ...(snapshot.model !== undefined ? { model: sessionModel(snapshot.model) } : {}), ...(snapshot.resolvedQuestions !== undefined ? { resolvedQuestions: settledQuestions(snapshot.resolvedQuestions) } : {}), ...(snapshot.pendingQueue ? { pendingQueue: safeQueue(snapshot.pendingQueue).map(q => ({ ...q, ...(q.requestId ? { requestId: mobileId(q.requestId) } : {}) })) } : {}), ...(snapshot.pendingQuestions ? { pendingQuestions: questionsOf(snapshot.pendingQuestions) } : {}), ...(count !== undefined ? { runningSubagents: count } : {}), ...(activityDetail ? { activityDetail } : {}), session, messages, cursor: snapshot.cursor, hasMore: snapshot.hasMore === true || snapshot.messages.length > 100, activity: snapshot.activity, ...(snapshot.notice === HISTORY_CUT_NOTICE ? { notice: HISTORY_CUT_NOTICE } : snapshot.activity === 'unknown' || (snapshot.activity === 'waiting' && !snapshot.pendingQuestions?.length) ? { notice: 'Return to the desktop to check this task.' } : {}), ...(snapshot.failure !== undefined ? { failure: safeFailure(snapshot.failure) } : {}) };
     // Keep complete messages and Unicode intact. Observation is a bounded latest-history view.
     while (Buffer.byteLength(JSON.stringify(result), 'utf8') > 2 * 1024 * 1024) {
       if (result.messages.length <= 1) throw new HostError('payload_too_large');
@@ -643,10 +666,10 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
       const sessions = await adapter.listSessions(signal); signal.throwIfAborted();
       const ids = await workspaceIds(); signal.throwIfAborted();
       const archived = workspaceSource.archivedSessionIds(), current = freshDevice(device.deviceId);
-      const scoped = sessions.filter(session => state.mobileSessionVisible(session.id, session.blank) && ids.has(session.workspaceId) && !archived.has(session.id) && allowsWorkspace(current.grants.readWorkspaceIds, session.workspaceId) && (workspaceId === undefined || session.workspaceId === workspaceId)).sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
+      const scoped = sessions.filter(session => state.mobileSessionVisible(session.id, session.blank) && ids.has(session.workspaceId) && !archived.has(session.id) && allowsWorkspace(current.grants.readWorkspaceIds, session.workspaceId) && (workspaceId === undefined || session.workspaceId === workspaceId)).sort(sessionOrder);
       // Keyset, not a numeric offset: concurrent updatedAt changes must not repeat a
       // previous page item. A session that moves above the cut is left for a refresh.
-      const start = after ? scoped.findIndex(session => session.updatedAt < after.updatedAt || (session.updatedAt === after.updatedAt && session.id > after.id)) : 0;
+      const start = after ? scoped.findIndex(session => sessionOrder(session, after!) > 0) : 0;
       const from = start < 0 ? scoped.length : start;
       const items = scoped.slice(from, from + limit).map(session => sessionForDevice(session, current.deviceId, ids));
       let nextCursor: string | null = null;

@@ -8,6 +8,7 @@ import { isAbsolute } from 'node:path';
 import { createWorkspaceSource, workspacePathKey } from './workspace-source.ts';
 import type { WorkspaceSource } from './workspace-source.ts';
 import { HostError } from './errors.ts';
+import { safeFailure } from './failure.ts';
 import { presentUserText } from './message-presentation.ts';
 import type { ChatMessage, FileUploadReservation, HostAdapter, HostSession, HostSnapshot, Preset, WorkspaceConfig } from './types.ts';
 
@@ -467,11 +468,7 @@ class Transcript {
     }
   }
   private setFailure(value: unknown): void {
-    const error = object(value);
-    const code = typeof error?.code === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(error.code) ? error.code : undefined;
-    const message = typeof error?.message === 'string'
-      ? error.message.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 512) : '';
-    this.failure = { ...(code ? { code } : {}), message: message || 'The turn failed.' };
+    this.failure = safeFailure(value);
   }
   /** Bounds one attempt before joining/sorting; overflow invalidates provisional text and demands a fresh cut. */
   private storeProvisional(attempt: Provisional, index: number, previous: string, next: string): boolean {
@@ -616,6 +613,7 @@ export class DshAdapter implements HostAdapter {
     for (const [id, flight] of this.historyFlights) this.detachHistory(id, flight);
     for (const [id, flight] of this.openingFlights) this.detachOpening(id, flight);
     this.history.clear(); this.historyBytes = 0;
+    this.retirementReads.clear();
   }
   private signal(signal: AbortSignal): AbortSignal { return AbortSignal.any([signal, this.lifetime.signal]); }
   private async workspaceMap(): Promise<{ workspaces: ReadonlyMap<string, CanonicalWorkspace>; view: readonly WorkspaceConfig[] }> {
@@ -1080,6 +1078,32 @@ export class DshAdapter implements HostAdapter {
     } catch (error) { throw phoneError(error); }
   }
   private readonly fileReservations = new WeakMap<FileUploadReservation, { sessionId: string; slots: object[]; budget: Map<object, { sessionId: string; receiptId?: string }> }>();
+  private readonly retirementReads = new Map<string, Set<(result: { agent: unknown } | { error: unknown }) => void>>();
+  private async retirementAgent(id: string, active: AbortSignal): Promise<{ agent: unknown } | { error: unknown }> {
+    active.throwIfAborted();
+    let waiters = this.retirementReads.get(id);
+    if (!waiters) {
+      if (this.retirementReads.size >= 64) throw new HostError('unavailable');
+      waiters = new Set(); this.retirementReads.set(id, waiters);
+      const current = waiters;
+      const finish = (result: { agent: unknown } | { error: unknown }) => {
+        if (this.retirementReads.get(id) === current) this.retirementReads.delete(id);
+        for (const waiter of current) waiter(result);
+        current.clear();
+      };
+      void Promise.resolve().then(() => this.options.sessionController.resolveAgent!(id)).then(finish, error => finish({ error }));
+    }
+    if (waiters.size >= 64) throw new HostError('unavailable');
+    // One settlement handler per real IO; aborted waiters detach immediately.
+    // The bounded flight remains coalesced until the non-cooperative IO really settles.
+    const current = waiters;
+    return new Promise((resolve, reject) => {
+      const finish = (result: { agent: unknown } | { error: unknown }) => { current.delete(finish); active.removeEventListener('abort', abort); resolve(result); };
+      const abort = () => { current.delete(finish); active.removeEventListener('abort', abort); reject(active.reason); };
+      current.add(finish); active.addEventListener('abort', abort, { once: true });
+      if (active.aborted) abort();
+    });
+  }
   async reserveFileUploads(sessionId: string, count: number, signal: AbortSignal, expectedWorkspaceId: string): Promise<FileUploadReservation> {
     const active = this.signal(signal), service = this.options.fileUploads;
     if (!service || !Number.isSafeInteger(count) || count < 1 || count > 20) throw new HostError('invalid_request');
@@ -1091,7 +1115,7 @@ export class DshAdapter implements HostAdapter {
       for (const id of new Set([...budget.values()].filter(e => e.receiptId).map(e => e.sessionId))) {
         active.throwIfAborted();
         try {
-          const resolved = await this.options.sessionController.resolveAgent(id);
+          const resolved = await this.retirementAgent(id, active);
           if ('error' in resolved) continue;
           for (const [key, entry] of budget) if (entry.sessionId === id && entry.receiptId && service.resolve(resolved.agent, entry.receiptId) === undefined) budget.delete(key);
         } catch { active.throwIfAborted(); }
@@ -1210,19 +1234,9 @@ export class DshAdapter implements HostAdapter {
     const content = [{ type: 'text' as const, text }, ...(options?.attachments ?? []).map(a => a.upstream)];
     try {
       await this.options.sessionController.prompt({ requestId, sessionId, mode: options?.delivery ?? 'queue', content }, active);
-      // ACK can be a requestId dedup hit before attachment binding. Only public
-      // resolve proving retirement can release this conservative reservation.
-      // Post-ACK bookkeeping must never rewrite an admission that DSH already accepted.
-      try {
-        const service = this.options.fileUploads;
-        if (service?.resolve && this.options.sessionController.resolveAgent) {
-          const resolved = await this.options.sessionController.resolveAgent(sessionId);
-          if ('error' in resolved) return;
-          const budget = receiptBudget(service);
-          const accepted = new Set((options?.attachments ?? []).flatMap(a => a.upstream.type === 'file' ? [a.upstream.receiptId] : []));
-          if (budget) for (const [key, entry] of budget) if (entry.sessionId === sessionId && entry.receiptId && accepted.has(entry.receiptId) && service.resolve(resolved.agent, entry.receiptId) === undefined) budget.delete(key);
-        }
-      } catch { /* Receipt retirement is diagnostic cleanup; the prompt itself is already admitted. */ }
+      // ACK is the admission boundary. Retirement is deferred to the next
+      // reserveFileUploads observation, where unknown receipts retain their quota.
+      // Never await diagnostic IO after a proven upstream admission.
     } catch (error) { throw phoneError(error); }
   }
   async cancel(sessionId: string, signal: AbortSignal, expectedCursor: number, expectedWorkspaceId: string): Promise<void> {

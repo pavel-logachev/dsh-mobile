@@ -95,38 +95,38 @@ test('journal listeners observe only committed events and stop after unsubscribe
   stop(); f.proof.pending = true; await f.event(1, 'tool/call'); assert.equal(wakes, before);
 });
 
-test('unprovable idle history alone does not create a delivery gap', async t => {
+test('invalid idle recovery proof keeps internal coverage degraded', async t => {
   t.mock.timers.enable({ apis: ['setInterval'] });
   const f = await fixture(t); await f.feed.idle(); assert.equal(f.feed.coverage, 'ready');
   f.proof.valid = false;
   for (let pass = 0; pass < 9; pass++) { t.mock.timers.tick(60000); await f.feed.idle(); }
-  assert.equal(f.feed.coverage, 'ready', 'no alertable event was involved');
+  assert.equal(f.feed.coverage, 'degraded', 'invalid recovery evidence cannot prove readiness');
 });
 
-test('a running session with unprovable history remains ready without an alertable gap', async t => {
+test('a running session with unprovable history remains degraded', async t => {
   t.mock.timers.enable({ apis: ['setInterval'] });
   const f = await fixture(t); await f.feed.idle(); assert.equal(f.feed.coverage, 'ready');
   f.listed([{ id: 'chat', workspaceId: 'alpha', running: true }]);
   f.proof.valid = false;
   for (let pass = 0; pass < 9; pass++) { t.mock.timers.tick(60000); await f.feed.idle(); }
-  assert.equal(f.feed.coverage, 'ready');
+  assert.equal(f.feed.coverage, 'degraded');
 });
 
-test('a non-alerting event with invalid history does not degrade coverage', async t => {
+test('a non-alerting event with invalid history degrades internal coverage', async t => {
   const f = await fixture(t); await f.feed.idle();
   f.proof.valid = false;
   await f.event(0, 'tool/call');
-  assert.equal(f.feed.coverage, 'ready');
+  assert.equal(f.feed.coverage, 'degraded');
   assert.equal((await f.feed.page(f.device.deviceId, f.head)).items.length, 0);
   assert.equal(f.state.readNotificationState<any>('producer').chat, undefined);
 });
 
-test('a running source with invalid non-alerting history also stays ready', async t => {
+test('a running source with invalid non-alerting history stays degraded', async t => {
   const f = await fixture(t); await f.feed.idle();
   f.listed([{ id: 'chat', workspaceId: 'alpha', running: true }]);
   f.proof.valid = false;
   await f.event(0, 'tool/call');
-  assert.equal(f.feed.coverage, 'ready');
+  assert.equal(f.feed.coverage, 'degraded');
 });
 
 test('an attention-flagged event with invalid proof stays degraded', async t => {
@@ -144,7 +144,7 @@ test('continuous invalid non-alerting events do not hide a later exact completio
   await f.event(3, 'turn/end', { turn: 1, completed: true });
   const page = await f.feed.page(f.device.deviceId, f.head);
   assert.deepEqual(page.items.map(e => e.kind), ['answer-finished']);
-  assert.equal(f.feed.coverage, 'ready');
+  assert.equal(f.feed.coverage, 'degraded', 'later exact completion is not authoritative recovery of rejected evidence');
 });
 
 test('a live terminal without an exact completed pair remains a sticky gap', async t => {

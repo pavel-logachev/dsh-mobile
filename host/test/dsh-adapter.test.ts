@@ -871,3 +871,11 @@ test('a persistent opening gap refreshes at a bounded polling rate and releases 
   assert.ok(h.cleanup().closed <= 1 + Math.ceil((Date.now() - started) / 50) + 1, 'resync must not spin on an unchanged invalid opening');
   assert.equal(h.cleanup().resumed, 0); assert.equal(h.listeners(), 0);
 });
+
+test('H10 failed turn sanitization does not split an astral character at the bound', async t => {
+  const h = await harness(t);
+  (h.frame.records as any[]).push({ type: 'event', event: { seq: 8, time: 1700000000008, type: 'turn/end', data: { turn: 2, reason: { kind: 'error', error: { code: 'HTTP_400', message: 'x'.repeat(511) + '😀' } } } } });
+  h.frame.cursor = 8; h.frame.projections.asOfSeq = 8;
+  const snap = await h.adapter.snapshot('session-fixture', new AbortController().signal);
+  assert.deepEqual(snap.failure, { code: 'HTTP_400', message: 'x'.repeat(511) }); assert.equal(snap.failure!.message.isWellFormed(), true);
+});

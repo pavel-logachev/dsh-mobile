@@ -383,3 +383,34 @@ test('adapter uploads via plugin service, sends server-owned prompt parts and re
   await assert.rejects(adapter.image(row.sessionId, 'image', signal, 'wrong'), { code: 'not_found' });
   row.origin = 'subagent'; await assert.rejects(adapter.upload(row.sessionId, input, signal, 'w'), { code: 'not_found' });
 });
+
+test('H04 prompt ACK returns without waiting for held retirement IO', { timeout: 3000 }, async t => {
+  const gate = Promise.withResolvers<void>(); let resolves = 0;
+  const { adapter, row } = await setup(t, { fileUploads: { resolve() { return {}; }, async uploadStream() { throw new Error('unused'); } } as any, resolveAgent: async () => { resolves++; await gate.promise; return { agent: {} }; } });
+  const controller = new AbortController(); let settled = false;
+  const sending = adapter.prompt(row.sessionId, 'Synthetic', requestId, controller.signal, 'w').then(() => { settled = true; });
+  try { await new Promise(r => setTimeout(r, 30)); controller.abort(); assert.equal(settled, true); assert.equal(resolves, 0, 'retirement is deferred to the next quota reservation'); }
+  finally { gate.resolve(); await sending; }
+});
+
+test('H04 deferred retirement is abortable and coalesces held diagnostic IO', async t => {
+  const gate = Promise.withResolvers<void>(); let resolves = 0;
+  const { adapter, row, signal } = await setup(t, { resolveAgent: async () => { resolves++; await gate.promise; return { agent: {} }; }, fileUploads: { resolve() { return {}; }, async uploadStream(r) { for await (const _chunk of r.data) {} return { receiptId: 'r', file: { attachmentId: 'f', name: 'synthetic.txt', bytes: 3 } }; } } });
+  const input = { size: 3, name: 'synthetic.txt', mime: 'text/plain', data: (async function* () { yield Buffer.from('abc'); })() };
+  await adapter.upload(row.sessionId, input, signal, 'w');
+  try {
+    for (let i = 0; i < 2; i++) {
+      const abort = new AbortController(), pending = adapter.reserveFileUploads(row.sessionId, 1, abort.signal, 'w');
+      await new Promise(r => setTimeout(r, 10)); abort.abort(new Error('stop diagnostic'));
+      const result = await Promise.race([pending.then(() => 'resolved', () => 'aborted'), new Promise(r => setTimeout(() => r('held'), 40))]);
+      assert.equal(result, 'aborted');
+    }
+    assert.equal(resolves, 1, 'same held public resolution must not create unbounded cleanup calls');
+    const flights = (adapter as any).retirementReads;
+    assert.equal(flights.size, 1); assert.equal([...flights.values()][0].size, 0, 'aborted observers must not accumulate on a held promise');
+    const pending = adapter.reserveFileUploads(row.sessionId, 1, signal, 'w');
+    const outcome = pending.then(() => 'resolved', () => 'disposed');
+    await new Promise(r => setTimeout(r, 10)); adapter.dispose();
+    assert.equal(await outcome, 'disposed'); assert.equal(flights.size, 0);
+  } finally { gate.resolve(); }
+});

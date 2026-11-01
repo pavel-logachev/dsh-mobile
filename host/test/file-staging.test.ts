@@ -45,18 +45,12 @@ for (const budget of ['count', 'bytes']) test(`staging sweep retries first unlin
         await assert.rejects(store.save(broken(), UPLOAD_LIMIT, signal), { code: 'rate_limited' });
         t.mock.timers.tick(30_000);
         for (let i = 0; i < 100; i++) { try { await fs.access(failedPath); } catch { break; } await new Promise(resolve => setImmediate(resolve)); }
-        // The reservation is released only after the sweep's unlink and entry
-        // deletion settle; poll instead of assuming both completed with unlink.
-        let lastError: unknown;
-        for (let i = 0; i < 100; i++) {
-          try { await assert.rejects(store.save(broken(), UPLOAD_LIMIT, signal), /Synthetic interrupted intake/); lastError = 'accepted'; break; }
-          catch (error) {
-            lastError = error;
-            if ((error as { code?: string }).code !== 'rate_limited') throw error;
-            await new Promise(resolve => setImmediate(resolve));
-          }
-        }
-        assert.equal(lastError, 'accepted', 'sweep must release the retained byte reservation');
+        // The timer starts remove synchronously; joining its public promise waits
+        // for both unlink and reservation deletion, not merely file disappearance.
+        // assert.rejects wraps a mismatched rate_limited in AssertionError, so the
+        // old retry loop could not actually recognize the transient it intended.
+        await store.remove(failedPath);
+        await assert.rejects(store.save(broken(), UPLOAD_LIMIT, signal), /Synthetic interrupted intake/);
       } finally { gate.resolve(); await results; }
     }
     await assert.rejects(fs.access(failedPath), { code: 'ENOENT' });

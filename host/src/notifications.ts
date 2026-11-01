@@ -64,8 +64,7 @@ export class NotificationFeed {
   private coverageRevision = 0;
   private recoveryScan = false;
   private readonly recoveryPending = new Set<string>();
-  // Only a source whose proof is still needed for a current running or
-  // attention-bearing session can keep the bounded recovery pass pending.
+  // Every rejected authoritative proof blocks readiness until a valid recovery.
   private readonly blockingRecovery = new Set<string>();
   // A real sequence discontinuity is a delivery gap and stays sticky until a
   // valid authoritative proof succeeds. It is separate from an unprovable old
@@ -74,6 +73,7 @@ export class NotificationFeed {
   // Last delivered envelope per source, including ignored/non-alerting kinds.
   // This is the continuity checkpoint, not the proven producer watermark.
   private readonly observed = new Map<string, number>();
+  private readonly continuityIds = new Set<string>();
   // A sequence discontinuity seen on any envelope, including ignored kinds.
   private readonly gaps = new Set<string>();
   // Irrelevant envelopes are not membership evidence. Bounded, transient sequence cuts are
@@ -139,7 +139,7 @@ export class NotificationFeed {
     if (this.activated || !this.started || !this.enabledDevices()) return;
     const activation = this.activation = new AbortController();
     this.activated = true; this.initializing = true; this.baselineReady = false; this.baselineAt = Date.now();
-    this.lazyIdle = []; this.lazyRetry.clear(); this.recoveryPass = 0; this.recoveryPending.clear(); this.blockingRecovery.clear(); this.deliveryGaps.clear(); this.observed.clear(); this.gaps.clear(); this.recoveryScan = false;
+    this.lazyIdle = []; this.lazyRetry.clear(); this.recoveryPass = 0; this.recoveryPending.clear(); this.blockingRecovery.clear(); this.deliveryGaps.clear(); this.observed.clear(); this.continuityIds.clear(); this.gaps.clear(); this.recoveryScan = false;
     this.coverage = 'initializing';
     this.work = this.work.then(async () => {
       if (activation.signal.aborted) return;
@@ -150,6 +150,7 @@ export class NotificationFeed {
         budget.throwIfAborted();
         if (sessions.length > 10000) throw new HostError('unavailable');
         const active = new Set(sessions.map(s => s.id));
+        for (const id of active) this.continuityIds.add(id);
         for (const id of Object.keys(this.watermarks)) if (!active.has(id)) delete this.watermarks[id];
         // Keep the entire cut retryable even if this baseline exhausts its budget.
         this.lazyIdle = sessions.map(s => s.id);
@@ -160,8 +161,8 @@ export class NotificationFeed {
           if (!session.running && !this.watermarks[session.id]?.attentionId) { delete this.watermarks[session.id]; continue; }
           const evidence = await this.source.evidence(session.id, budget, session);
           budget.throwIfAborted();
-          if (evidence.valid === false) {
-            if (this.watermarks[session.id]?.attentionId) this.degrade('baseline_proof_invalid');
+          if (evidence.valid === false || evidence.sessionId !== session.id || evidence.workspaceId !== session.workspaceId || (this.source.evidenceCurrent && !this.source.evidenceCurrent(evidence))) {
+            this.blockingRecovery.add(session.id); this.degrade('baseline_proof_invalid');
             continue;
           }
           const queued = this.queue.filter(e => e.id === session.id).map(e => e.event.seq);
@@ -169,6 +170,7 @@ export class NotificationFeed {
         }
         if (pendingBefore !== this.pendingCut()) this.resetJournals();
         this.state.writeNotificationState('producer', this.watermarks);
+        if (this.queue.length) this.degrade('baseline_queue_pending');
         this.coverage = this.coverage === 'degraded' ? 'degraded' : 'ready'; this.changed();
       } catch { if (!activation.signal.aborted) { this.degrade('baseline_failed'); this.resetJournals(); } }
       finally { if (this.activation === activation && !activation.signal.aborted) { this.baselineReady = true; this.initializing = false; this.schedule(); } }
@@ -217,11 +219,21 @@ export class NotificationFeed {
   private async lookup(id: string, signal = this.signal()): Promise<{ id: string; workspaceId: string; running?: boolean } | undefined> {
     return this.source.lookup ? this.source.lookup(id, signal) : (await this.source.list(signal)).find(s => s.id === id);
   }
+  private reserveContinuity(id: string): boolean {
+    if (!this.continuityIds.has(id) && this.continuityIds.size >= 10000) {
+      if (!this.skippedEvicted) { this.skippedEvicted = true; this.degrade('continuity_limit'); this.resetJournals(); }
+      return false;
+    }
+    this.continuityIds.add(id); return true;
+  }
   private async accept(id: string, event: NotificationSource, proofs: Map<string, NotificationEvidence>): Promise<void> {
     if (event.time < this.baselineAt) return;
     const previous = this.watermarks[id];
     if (previous && event.seq <= previous.seq) return;
-    const seen = this.observed.get(id);
+    // One shared admission budget covers even excluded/irrelevant IDs while list IO is held.
+    if (!this.reserveContinuity(id)) return;
+    const seen = this.observed.get(id) ?? previous?.seq;
+    if (seen !== undefined && event.seq <= seen) return; // Duplicate/older envelope cannot rewind an accepted checkpoint.
     const continuityGap = seen !== undefined && event.seq !== seen + 1;
     this.observed.set(id, event.seq);
     if (!relevant.has(event.type)) {
@@ -238,7 +250,8 @@ export class NotificationFeed {
     const activation = this.activation;
     const listed = await this.lookup(id);
     if (activation !== this.activation || activation?.signal.aborted) return;
-    if (!listed) { proofs.delete(id); this.skipped.delete(id); return; }
+    if (!listed) { proofs.delete(id); this.skipped.delete(id); this.observed.delete(id); this.gaps.delete(id); return; }
+    if (!this.reserveContinuity(id)) return; // Membership IO can overlap authoritative slot retirement too.
     const old = this.watermarks[id];
     if (event.time < this.baselineAt || (old && event.seq <= old.seq)) return;
     const skipped = this.skipped.get(id); this.skipped.delete(id);
@@ -258,10 +271,8 @@ export class NotificationFeed {
     }
     this.lifetime.signal.throwIfAborted();
     if (activation !== this.activation || activation?.signal.aborted) return;
+    if (!this.reserveContinuity(id)) return; // Reconciliation may have retired this slot during proof IO.
     if (proof.valid === false || proof.sessionId !== id || proof.workspaceId !== listed.workspaceId || proof.cursor < event.seq || (this.source.evidenceCurrent && !this.source.evidenceCurrent(proof))) {
-      const alerting = (event.type === 'turn/end' && event.completed === true) || event.attention === true
-        || (old?.attentionId !== undefined && (event.type === 'approval/decided' || event.type === 'tool/result' || event.type === 'user/message'));
-      if (!alerting) return;
       this.deliveryGaps.add(id); this.degrade('proof_invalid', { type: event.type, seq: event.seq, previous: old?.seq, valid: proof.valid, pending: proof.pending, cursor: proof.cursor, completed: proof.completed.length }); return;
     }
     // Other lanes may have filled the bounded watermark set during evidence IO.
@@ -296,16 +307,21 @@ export class NotificationFeed {
     const visible = new Set(sessions.map(s => s.id));
     // Capture a whole authoritative recovery set once per new failure, not just
     // the eight lazy sources probed in this bounded pass. Removed sources retire.
-    if (this.recoveryScan) {
-      for (const id of visible) this.recoveryPending.add(id);
-      this.recoveryScan = false;
-    }
     for (const id of this.recoveryPending) if (!visible.has(id)) this.recoveryPending.delete(id);
     for (const id of this.lazyRetry.keys()) if (!visible.has(id)) this.lazyRetry.delete(id);
     for (const id of this.blockingRecovery) if (!visible.has(id)) this.blockingRecovery.delete(id);
     for (const id of this.deliveryGaps) if (!visible.has(id)) this.deliveryGaps.delete(id);
     for (const id of this.gaps) if (!visible.has(id)) this.gaps.delete(id);
     for (const id of this.observed.keys()) if (!visible.has(id)) this.observed.delete(id);
+    for (const id of this.skipped.keys()) if (!visible.has(id)) this.skipped.delete(id);
+    for (const id of this.continuityIds) if (!visible.has(id)) this.continuityIds.delete(id);
+    // This current authoritative set has at most 10,000 IDs; reserve its slots
+    // before yielding again so live excluded traffic cannot crowd out recovery.
+    for (const id of visible) this.continuityIds.add(id);
+    if (this.recoveryScan) {
+      for (const id of visible) this.recoveryPending.add(id);
+      this.recoveryScan = false;
+    }
     for (const id of Object.keys(this.watermarks)) if (!visible.has(id) && beforeList.get(id) === this.watermarks[id] && !this.queue.some(e => e.id === id)) delete this.watermarks[id];
     // Rotate before I/O, retaining failures and unprobed entries. A bad first
     // session cannot restart every pass at the head or consume everyone else's retry.
@@ -331,22 +347,15 @@ export class NotificationFeed {
       if (!session) { this.lazyRetry.delete(id); this.recoveryPending.delete(id); this.blockingRecovery.delete(id); continue; }
       const observedSeq = this.watermarks[id]?.seq;
       let proof: NotificationEvidence;
-      let invalidHistory = false;
       try {
         budget.throwIfAborted();
         proof = await this.source.evidence(id, budget, session);
         budget.throwIfAborted();
-        if (proof.valid === false) { invalidHistory = true; throw new HostError('unavailable'); }
+        if (proof.valid === false) throw new HostError('unavailable');
         if (proof.sessionId !== id || proof.workspaceId !== session.workspaceId || (this.source.evidenceCurrent && !this.source.evidenceCurrent(proof))) throw new HostError('unavailable');
       } catch {
         if (activation?.signal.aborted || this.lifetime.signal.aborted) return;
-        const attention = this.watermarks[id]?.attentionId !== undefined;
-        if (!invalidHistory || this.deliveryGaps.has(id) || attention || this.blockingRecovery.has(id)) {
-          this.blockingRecovery.add(id); this.degrade('reconcile_proof_failed', { running: session.running }); this.retryLazy(id, pass);
-        } else {
-          // An unprovable old history cannot produce a new alert by itself.
-          this.blockingRecovery.delete(id); this.lazyRetry.delete(id);
-        }
+        this.blockingRecovery.add(id); this.degrade('reconcile_proof_failed', { running: session.running }); this.retryLazy(id, pass);
         if (budget.aborted) break; // Unprobed IDs are still in the rotated queue.
         continue;
       }
@@ -363,15 +372,16 @@ export class NotificationFeed {
       // Reconciliation owns pending state, not live event admission. In particular
       // its snapshot can already contain a terminal still waiting in our queue.
       const queued = this.queue.filter(e => e.id === session.id).map(e => e.event.seq);
-      const seq = old?.seq ?? (queued.length ? Math.min(...queued) - 1 : proof.cursor);
+      const seq = queued.length ? Math.min(...queued) - 1 : Math.max(old?.seq ?? -1, proof.cursor);
       this.watermarks[session.id] = { seq, ...(attentionId ? { attentionId } : {}) };
+      if (this.observed.has(session.id) || this.observed.size < 10000) this.observed.set(session.id, seq);
       const skipped = this.skipped.get(session.id);
       if (skipped && skipped.last <= seq) this.skipped.delete(session.id);
       else if (skipped && skipped.first <= seq) skipped.first = seq + 1;
     }
     this.state.writeNotificationState('producer', this.watermarks);
     if (!this.baselineReady) { this.baselineReady = true; this.degrade('baseline_incomplete'); }
-    if (this.coverage === 'degraded' && revision === this.coverageRevision && !this.recoveryScan && !this.recoveryPending.size && !this.lazyRetry.size && !this.blockingRecovery.size && !this.deliveryGaps.size && !this.gaps.size && !this.overflow && !this.queue.length && !budget.aborted) { this.coverage = 'ready'; this.changed(); }
+    if (this.coverage === 'degraded' && revision === this.coverageRevision && !this.recoveryScan && !this.recoveryPending.size && !this.lazyRetry.size && !this.blockingRecovery.size && !this.deliveryGaps.size && !this.gaps.size && !this.overflow && !this.queue.length && !budget.aborted) { this.skippedEvicted = false; this.coverage = 'ready'; this.changed(); }
   }
   private retryLazy(id: string, pass: number): void {
     const failures = Math.min((this.lazyRetry.get(id)?.failures ?? 0) + 1, 4);
@@ -391,6 +401,7 @@ export class NotificationFeed {
   private save(deviceId: string, journal: Journal): void {
     if (this.batch) { this.batch.set(deviceId, journal); return; }
     this.state.writeNotificationState('device:' + deviceId, journal);
+    if (!this.journalCache.has(deviceId) && this.journalCache.size >= 128) this.journalCache.delete(this.journalCache.keys().next().value!);
     this.journalCache.set(deviceId, { revision: this.state.notificationRevision('device:' + deviceId), value: journal });
   }
   pruneSettings(deviceId: string, workspaceIds: ReadonlySet<string>, sessions: { id: string; workspaceId: string }[]): NotificationSettings {
