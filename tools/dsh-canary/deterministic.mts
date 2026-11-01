@@ -54,7 +54,10 @@ export function createDeterministicAdapter(Base: typeof LlmAdapter) {
       assert.equal(options.provider, PROVIDER);
       assert.equal(options.model, MODEL);
       assert.equal(options.tools?.length ?? 0, 0, 'Canary must offer zero tools');
-      const user = options.messages.findLast(message => message.role === 'user');
+      // Runtime context is also model-visible as role=user. Select the actual
+      // submitted user message (including caller-delivered subagent tasks), not
+      // a later context projection; exact synthetic text admission stays below.
+      const user = options.messages.findLast(message => message.role === 'user' && message.source?.kind === 'user');
       const text = user?.content.filter(block => block.type === 'text').map(block => block.text).join('') ?? '';
       const kind = (Object.entries(PROMPTS).find(([, prompt]) => prompt === text)?.[0]) as Kind | undefined;
       assert.ok(kind !== undefined || this.serve && text === ANDROID_PROMPT, 'Only exact explicitly synthetic prompts are admitted');

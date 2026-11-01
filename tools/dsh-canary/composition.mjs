@@ -17,14 +17,14 @@ const COMPONENTS = [
   ['dsh-agent-loop', { agents: [], maxParallelToolCalls: 1 }],
   ['dsh-agent-default-model', { provider: PROVIDER, model: MODEL }],
   ['dsh-storage', {}], ['dsh-storage-domain', { backend: 'json' }],
-  ['dsh-workspace', {}], ['dsh-api-session-controller', { nativeOpen: false }],
+  ['dsh-workspace', {}], ['dsh-api-remote-access', {}], ['dsh-api-session-controller', { nativeOpen: false }],
 ];
 
 export function officialLoader(runtimeRoot) {
   const require = createRequire(path.join(runtimeRoot, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'));
   const evidence = [];
   let installedVersion;
-  const allowed = new Set(['cordis', 'cordis-plugin-loader', 'cordis-plugin-include', 'dsh-app-boot', 'dsh-agent-preset-registry', 'dsh-agent-preset', 'dsh-api-workspace-controller', 'dsh-credentials', 'dsh-subagent', 'dsh-subagent-fork-in-process', 'dsh-subagent-spawn-in-process', ...COMPONENTS.map(([id]) => id), 'dsh-session-persistence-jsonl', 'dsh-storage-json', 'dsh-fs-local', 'dsh-attachment-local']);
+  const allowed = new Set(['cordis', 'cordis-plugin-loader', 'cordis-plugin-include', 'dsh-app-boot', 'dsh-agent-preset-registry', 'dsh-agent-preset', 'dsh-api-workspace-controller', 'dsh-credentials', 'dsh-subagent', 'dsh-subagent-fork-in-process', 'dsh-subagent-spawn-in-process', ...COMPONENTS.map(([id]) => id), 'dsh-working-directory', 'dsh-session-persistence-jsonl', 'dsh-storage-json', 'dsh-fs-local', 'dsh-attachment-local']);
   return {
     evidence,
     get installedVersion() { return installedVersion; },
@@ -62,6 +62,7 @@ export async function composeRuntime(loader, directories, { compression = 'none'
       ['dsh-session-persistence-jsonl', { root: directories.sessions, compression }],
       ['dsh-storage-json', { root: directories.storages }],
       ['dsh-fs-local', { cwd: directories.workspace }],
+      ['dsh-working-directory', { defaultDirectory: directories.workspace }],
       ['dsh-attachment-local', { dshHome: directories.home }],
     ]) {
       const module = await loader.load(id);
@@ -73,7 +74,7 @@ export async function composeRuntime(loader, directories, { compression = 'none'
     fibers.push(register);
     await Promise.all(fibers.map(fiber => fiber.await()));
     for (const fiber of fibers) assert.equal(fiber.state, 2, `Inactive component ${fiber.name}`);
-    for (const service of ['sessionController', 'agentLoop', 'sessionPersistence', 'workspaceRegistry', 'attachments', 'fileUploads']) assert.ok(ctx.get(service), `Required real service ${service}`);
+    for (const service of ['sessionController', 'remoteAccess', 'workingDirectory', 'agentLoop', 'sessionPersistence', 'workspaceRegistry', 'attachments', 'fileUploads']) assert.ok(ctx.get(service), `Required real service ${service}`);
     for (const service of ['settings', 'configEditor', 'profileContext', 'loader', 'webServer', 'subprocess', 'mcp', 'authorization', 'deepseekAccount', 'otel', 'productTelemetry']) {
       assert.equal(ctx.get(service), undefined, `Forbidden service ${service}`);
     }
