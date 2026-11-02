@@ -7,7 +7,8 @@ import type { DshAdapterOptions } from './dsh-adapter.ts';
 import { createDshAdapter } from './dsh-adapter.ts';
 import type { DshAgentPresets, DshEvents, DshSessionController } from './dsh-adapter.ts';
 import { HostError } from './errors.ts';
-import { loadConfiguration } from './config.ts';
+import { loadConfiguration, prepareConfiguration } from './config.ts';
+import { HostState } from './state.ts';
 import { isAbsolute } from 'node:path';
 import { startHostServer } from './server.ts';
 import type { HostConfiguration } from './types.ts';
@@ -71,6 +72,7 @@ function eventBridge(ctx: CompanionContext): DshEvents {
 export async function apply(ctx: CompanionContext, config: Config): Promise<() => Promise<void>> {
   let adapter: Awaited<ReturnType<typeof createDshAdapter>> | undefined;
   let questions: ReturnType<typeof createQuestionBridge> | undefined;
+  let state: HostState | undefined;
   try {
     let hostConfig: HostConfiguration;
     if ('configPath' in config && config.configPath !== undefined) {
@@ -105,7 +107,10 @@ export async function apply(ctx: CompanionContext, config: Config): Promise<() =
     const attachments = ctx.get ? ctx.get('attachments') : ctx.attachments;
     const userQuestions = ctx.get ? ctx.get('userQuestions') : ctx.userQuestions;
     const llm = ctx.get ? ctx.get('llm') : ctx.llm;
-    if (userQuestions && ctx.sessionController.resolveAgent) questions = createQuestionBridge(listener => ctx.on('user-questions/request', listener, { global: true, prepend: true }));
+    // Validate/canonicalize before opening private state; plugin owns its lifetime.
+    hostConfig = (await prepareConfiguration(hostConfig)).config;
+    state = new HostState(hostConfig.statePath);
+    if (userQuestions && ctx.sessionController.resolveAgent) questions = createQuestionBridge(listener => ctx.on('user-questions/request', listener, { global: true, prepend: true }), state);
     adapter = await createDshAdapter({ dshVersion: config.dshVersion, sessionController: ctx.sessionController,
       ...(typeof persistence()?.open === 'function' ? { promptJournal: promptJournal(() => { const backend = persistence(); return typeof backend?.open === 'function' ? backend as OutcomePersistence : undefined; }) } : {}),
       ...(fileUploads ? { fileUploads } : {}), ...(attachments ? { attachments } : {}),
@@ -121,14 +126,15 @@ export async function apply(ctx: CompanionContext, config: Config): Promise<() =
         if (!store || !registry) throw new HostError('unavailable');
         return runningSubagentCounts(registry.list(), store.list());
       } } : {}) });
-    const host = await startHostServer({ config: hostConfig, adapter, workspaceSource });
+    const host = await startHostServer({ config: hostConfig, adapter, workspaceSource, state });
     let closed = false;
     return async () => {
       if (closed) return; closed = true;
       questions?.close(); adapter!.dispose();
       try { await host.close(); } catch { throw new HostError('unavailable'); }
+      finally { state!.close(); }
     };
-  } catch (error) { questions?.close(); adapter?.dispose(); throw error instanceof HostError ? error : new HostError('invalid_config'); }
+  } catch (error) { questions?.close(); adapter?.dispose(); state?.close(); throw error instanceof HostError ? error : new HostError('invalid_config'); }
 }
 
 export default { name, inject, apply };

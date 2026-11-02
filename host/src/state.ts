@@ -5,6 +5,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { HostError } from './errors.ts';
 import type { CommandReceipt, DeviceGrants, RelayGrant, RelayAccess } from './types.ts';
 import type { OutcomeCheckpoint } from './prompt-outcomes.ts';
+import type { ResolvedQuestion } from './phone.ts';
+import { settledQuestions } from './phone-projection.ts';
+import { LEGACY_ANSWER_TTL_MS, LEGACY_ANSWERS_PER_SESSION, LEGACY_ANSWERS_GLOBAL } from './question-history.ts';
 
 export interface AuthorizedDevice { deviceId: string; deviceName: string; grants: DeviceGrants; createdAt: number }
 export interface DeviceSummary extends AuthorizedDevice { revokedAt: number | null }
@@ -40,7 +43,8 @@ export function validateGrants(grants: DeviceGrants): DeviceGrants {
   return { readWorkspaceIds: [...grants.readWorkspaceIds].sort(), executeWorkspaceIds: [...grants.executeWorkspaceIds].sort() };
 }
 
-/** Local admin/storage boundary. No transcripts or plaintext credentials are retained. */
+/** Local admin/storage boundary. No transcript cache or plaintext credentials.
+ * Legacy phone answer history is explicitly whitelisted and TTL/cap bounded. */
 export class HostState {
   readonly path: string;
   private readonly db: DatabaseSync;
@@ -87,6 +91,10 @@ export class HostState {
         checkpoint TEXT NOT NULL, PRIMARY KEY(device_id,request_id),
         FOREIGN KEY(device_id,request_id) REFERENCES commands(device_id,request_id)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS legacy_question_answers (
+        session_id TEXT NOT NULL, call_id TEXT NOT NULL, question TEXT NOT NULL, expires_at INTEGER NOT NULL,
+        PRIMARY KEY(session_id,call_id)
+      ) STRICT;
       CREATE TABLE IF NOT EXISTS mobile_created_sessions (id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS runtime_lock (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, pid INTEGER NOT NULL) STRICT;
     `);
@@ -127,6 +135,7 @@ export class HostState {
         .run(randomUUID(), Number(counts?.total ?? 0), Number(counts?.completed ?? 0), Number(counts?.newest ?? 0), this.now());
     });
     this.verifyLedgerWitness();
+    this.pruneSettledQuestions();
     } catch (error) { this.db.close(); throw error; }
   }
 
@@ -134,6 +143,30 @@ export class HostState {
     this.db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); this.db.exec('COMMIT'); return result; }
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  private pruneSettledQuestions(): void {
+    this.db.prepare('DELETE FROM legacy_question_answers WHERE expires_at<=?').run(this.now());
+  }
+  rememberSettledQuestion(sessionId: string, value: ResolvedQuestion): void {
+    const question = settledQuestions([value])[0];
+    if (!question) return;
+    this.transaction(() => {
+      this.pruneSettledQuestions();
+      // Replace obtains a fresh rowid, preserving completion order even at equal timestamps.
+      this.db.prepare('INSERT OR REPLACE INTO legacy_question_answers VALUES (?,?,?,?)')
+        .run(sessionId, question.callId, JSON.stringify(question), this.now() + LEGACY_ANSWER_TTL_MS);
+      this.db.prepare(`DELETE FROM legacy_question_answers WHERE session_id=? AND rowid NOT IN
+        (SELECT rowid FROM legacy_question_answers WHERE session_id=? ORDER BY rowid DESC LIMIT ?)`)
+        .run(sessionId, sessionId, LEGACY_ANSWERS_PER_SESSION);
+      this.db.prepare(`DELETE FROM legacy_question_answers WHERE rowid NOT IN
+        (SELECT rowid FROM legacy_question_answers ORDER BY rowid DESC LIMIT ?)`).run(LEGACY_ANSWERS_GLOBAL);
+    });
+  }
+  settledQuestions(sessionId: string): ResolvedQuestion[] {
+    this.pruneSettledQuestions();
+    return this.db.prepare('SELECT question FROM legacy_question_answers WHERE session_id=? ORDER BY rowid').all(sessionId)
+      .flatMap(row => settledQuestions([JSON.parse(String(row.question))]));
   }
 
   private ledgerRow(): Row {
