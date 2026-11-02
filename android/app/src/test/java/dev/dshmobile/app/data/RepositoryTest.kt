@@ -1212,28 +1212,54 @@ class RepositoryTest {
         assertTrue(damaged.notSentSessions.isEmpty())
     }
     @Test fun `preheader connection recovery retries bounded while backgrounded and admits exactly one POST`() = runBlocking {
-        var recover: (() -> Unit)? = null
-        withRepository(preHeaderRetryDelay = { attempt -> assertEquals(0, attempt); recover!!.invoke(); 0L }) { repo, store, fixture, scope ->
-            fixture.message = { json("""{"requestId":"${requestId(it)}","status":"accepted","updatedAt":20}""") }
-            repo.updateDraft("Synthetic recovery")
-            store.gate = CompletableDeferred()
-            val send = scope.async(start = CoroutineStart.UNDISPATCHED) { repo.sendMessage("Synthetic recovery") }
-            val port = fixture.stopServer()
-            val replacement = MockWebServer()
-            recover = {
-                replacement.dispatcher = fixture
-                try { replacement.start(java.net.InetAddress.getByName("127.0.0.1"), port) }
-                catch (failure: Exception) { throw AssertionError("Fixture could not rebind stopped port $port", failure) }
+        // Keep the serving port alive. A test-process ProxySelector routes only
+        // the first mutation through a stopped loopback proxy: a real refused TCP
+        // connection before HTTP headers, with no same-port server restart.
+        val previousSelector = java.net.ProxySelector.getDefault()
+        val refusedAddress = java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1")).use {
+            java.net.InetSocketAddress("127.0.0.1", it.localPort)
+        }
+        val refuse = java.util.concurrent.atomic.AtomicBoolean(false)
+        // Prove this route is refused, not an HTTP failure or a connect timeout.
+        try { java.net.Socket().use { it.connect(refusedAddress, 1_000) }; fail("Proxy must refuse TCP") }
+        catch (_: java.net.ConnectException) { }
+        val refusedRoutes = java.util.concurrent.atomic.AtomicInteger()
+        val retries = mutableListOf<Int>()
+        java.net.ProxySelector.setDefault(object : java.net.ProxySelector() {
+            override fun select(uri: java.net.URI): List<java.net.Proxy> =
+                if (refuse.get()) {
+                    refusedRoutes.incrementAndGet()
+                    listOf(java.net.Proxy(java.net.Proxy.Type.HTTP, refusedAddress))
+                } else listOf(java.net.Proxy.NO_PROXY)
+            override fun connectFailed(uri: java.net.URI, address: java.net.SocketAddress, failure: java.io.IOException) {
+                // OkHttp retryOnConnectionFailure(false) need not invoke this callback.
+                assertEquals(refusedAddress, address)
+                assertTrue("Expected actual TCP refusal, got $failure", failure is java.net.ConnectException)
             }
-            val stop = scope.async(start = CoroutineStart.UNDISPATCHED) { repo.setForeground(false) }
-            try {
+        })
+        try {
+            withRepository(preHeaderRetryDelay = { attempt ->
+                retries += attempt
+                assertEquals(0, attempt)
+                assertTrue("The mutation must select the refused TCP route", refusedRoutes.get() > 0)
+                refuse.set(false)
+                0L
+            }) { repo, store, fixture, scope ->
+                fixture.message = { json("""{"requestId":"${requestId(it)}","status":"accepted","updatedAt":20}""") }
+                repo.updateDraft("Synthetic recovery")
+                store.gate = CompletableDeferred()
+                val send = scope.async(start = CoroutineStart.UNDISPATCHED) { repo.sendMessage("Synthetic recovery") }
+                refuse.set(true)
+                val stop = scope.async(start = CoroutineStart.UNDISPATCHED) { repo.setForeground(false) }
                 store.gate!!.complete(Unit); send.await(); stop.await()
+                assertEquals(listOf(0), retries)
+                assertTrue("The mutation must select the refused TCP route", refusedRoutes.get() > 0)
                 assertNull(store.value.pending)
                 assertFalse(repo.state.value.sendNotSent)
                 assertEquals("accepted", store.value.acceptedPrompts.single().status)
                 assertEquals(1, fixture.mutations.size)
-            } finally { replacement.shutdown() }
-        }
+            }
+        } finally { java.net.ProxySelector.setDefault(previousSelector) }
     }
     @Test fun `connection refused before headers is not sent and retains draft without an uncertain record`() = runBlocking {
         val attempts = mutableListOf<Int>()
