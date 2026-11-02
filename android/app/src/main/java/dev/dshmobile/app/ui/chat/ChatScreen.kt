@@ -150,7 +150,9 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
                 stringResource(if (state.busy || model.interactionBlocked) R.string.mobile_short_syncing else R.string.mobile_stale_state) else null
             // Off-line, the stale-state explanation is the strip's second row instead of a separate third line.
             ConnectionIssueStrip(state, refreshChat, detail = staleText)
-            if (state.connection == ConnectionState.ONLINE) state.error?.let { ErrorText(it, Modifier.padding(horizontal = Spacing.Gutter, vertical = Spacing.S)) }
+            // The queue receipt card already explains unknown delivery; it is not a failure.
+            val queueDeliveryUncertain = state.pending?.kind == "queue" && state.pending.status == "uncertain" && state.error == "command_uncertain"
+            if (state.connection == ConnectionState.ONLINE && !queueDeliveryUncertain) state.error?.let { ErrorText(it, Modifier.padding(horizontal = Spacing.Gutter, vertical = Spacing.S)) }
             if (state.demo) {
                 // Opaque band with a hairline: the timeline scrolls under an edge, not under floating text.
                 // The band grows with the badge (it wraps at large font scales) and keeps the 8dp rhythm under the top bar.
