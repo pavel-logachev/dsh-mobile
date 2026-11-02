@@ -29,6 +29,7 @@
     <string name="mobile_queue_steer_now">Steer now</string>
     <string name="mobile_queue_remove">Remove from queue on computer</string>
     <string name="mobile_queue_steering">Steering…</string>
+    <string name="mobile_queue_removing">Removing…</string>
     <string name="mobile_queue_steer_failed">Couldn’t steer. The message is still queued.</string>
     <string name="mobile_queue_remove_failed">Couldn’t remove from the queue.</string>
     <string name="mobile_queue_steer_unavailable">The agent isn’t working, so there’s nothing to steer. The message will be delivered on its own.</string>

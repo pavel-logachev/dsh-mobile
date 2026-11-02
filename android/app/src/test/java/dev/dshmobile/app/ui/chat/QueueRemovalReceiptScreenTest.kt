@@ -24,7 +24,7 @@ import org.robolectric.annotation.GraphicsMode
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class QueueRemovalReceiptScreenTest {
     @get:Rule val compose = createAndroidComposeRule<androidx.activity.ComponentActivity>()
-    private class Repo(val status: String) : MobileRepository {
+    private class Repo(val status: String, val gate: kotlinx.coroutines.CompletableDeferred<Unit>? = null) : MobileRepository {
         var removals = 0
         override val state = MutableStateFlow(MobileState(paired = true, connection = ConnectionState.ONLINE,
             workspaces = listOf(Workspace("w", "Synthetic", true)),
@@ -34,6 +34,7 @@ class QueueRemovalReceiptScreenTest {
         override val acceptedCreate = MutableStateFlow<CreateAcceptance?>(null)
         override suspend fun queueAction(itemId: String, action: String) {
             assertEquals("item", itemId); assertEquals("remove", action); removals++
+            gate?.await()
             state.value = state.value.copy(
                 pending = if (status == "rejected") null else PendingCommand("receipt", "queue", "chat", null, status),
                 error = when (status) { "rejected" -> "command_rejected"; "uncertain" -> "command_uncertain"; else -> null })
@@ -56,6 +57,22 @@ class QueueRemovalReceiptScreenTest {
     @Test fun `pending removal is neutral until confirmed snapshot removes item`() = checkRemoval("pending")
     @Test fun `uncertain removal is not a definite failure and never resends`() = checkRemoval("uncertain")
     @Test fun `definite removal rejection still shows error and retains item`() = checkRemoval("rejected")
+
+    @Test fun `in-flight removal is labelled as removal, not steering`() {
+        val gate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val repo = Repo("pending", gate); val vm = MobileViewModel(RuntimeEnvironment.getApplication()) { repo }
+        try {
+            compose.setContent { MaterialTheme { ChatScreen(repo.state.collectAsState().value, vm, "chat", {}, {}) } }
+            compose.onNodeWithTag("queue_remove_item").performClick()
+            compose.waitUntil { repo.removals == 1 }
+            compose.onNodeWithText(compose.activity.getString(R.string.mobile_queue_removing)).assertIsDisplayed()
+            compose.onNodeWithText(compose.activity.getString(R.string.mobile_queue_steering)).assertDoesNotExist()
+            capture("queue-removing.png")
+            gate.complete(Unit)
+            compose.waitUntil { vm.phoneAction == null }
+            compose.onNodeWithText(compose.activity.getString(R.string.mobile_queue_removing)).assertDoesNotExist()
+        } finally { gate.complete(Unit); androidx.lifecycle.ViewModelStore().apply { put("vm", vm); clear() } }
+    }
 
     private fun checkRemoval(status: String) {
         val repo = Repo(status); val vm = MobileViewModel(RuntimeEnvironment.getApplication()) { repo }

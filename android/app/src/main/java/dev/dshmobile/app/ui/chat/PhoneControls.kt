@@ -96,7 +96,7 @@ internal fun QueueGroup(items: List<QueueItem>, enabled: Boolean, working: Boole
                     if (item.attachments.isNotEmpty()) { Icon(MobileIcons.Attach, null, Modifier.size(14.dp)); Text("${item.attachments.size}", style = MaterialTheme.typography.labelSmall); Spacer(Modifier.width(6.dp)) }
                     Column(Modifier.weight(1f)) {
                         Text(item.text.ifBlank { item.attachments.firstOrNull()?.name.orEmpty() }, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
-                        if (acting?.startsWith("queue:${item.id}:") == true) Row(verticalAlignment = Alignment.CenterVertically) { Spinner(size = 12.dp); Text(stringResource(R.string.mobile_queue_steering), style = MaterialTheme.typography.bodySmall) }
+                        if (acting?.startsWith("queue:${item.id}:") == true) Row(verticalAlignment = Alignment.CenterVertically) { Spinner(size = 12.dp); Text(stringResource(if (acting.endsWith(":remove")) R.string.mobile_queue_removing else R.string.mobile_queue_steering), style = MaterialTheme.typography.bodySmall) }
                         if (error != null && acting == null && failedAction?.startsWith("queue:${item.id}:") == true) PhoneError(stringResource(if (failedAction.endsWith(":remove")) R.string.mobile_queue_remove_failed else R.string.mobile_queue_steer_failed))
                     }
                     if (steerSupported) IconButton(onClick = { onAction(item.id, "steer") }, enabled = enabled && working && acting == null, modifier = Modifier.testTag("queue_steer_${item.id}")) {

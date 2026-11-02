@@ -29,6 +29,7 @@
     <string name="mobile_queue_steer_now">Направить сейчас</string>
     <string name="mobile_queue_remove">Удалить из очереди на компьютере</string>
     <string name="mobile_queue_steering">Направляем…</string>
+    <string name="mobile_queue_removing">Удаляем…</string>
     <string name="mobile_queue_steer_failed">Не удалось направить. Сообщение осталось в очереди.</string>
     <string name="mobile_queue_remove_failed">Не удалось удалить из очереди.</string>
     <string name="mobile_queue_steer_unavailable">Агент не работает, направлять нечего. Сообщение уйдёт само.</string>
