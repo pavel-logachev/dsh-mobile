@@ -42,3 +42,8 @@ Recorded 2026-11-03 (MSK).
 | Android, merged tree `f5ba99b` | `testDebugUnitTest` 490/490; `lintDebug` 0 errors, 41 warnings; `assembleRelease` exit 0. |
 | GitHub CI on `ci/green-tests` | Linux host, Windows host and Android green on two attempts of one run. |
 | Queue remove on the phone (APK from `e717375`, host 0.9.0) | PASS, 2 runs — no «Не удалось удалить», item gone in 6–8 s, removed text never delivered, no extra turn. Found the «Направляем…» label, fixed in `76c7644` (test red before the fix, green after). |
+| GitHub CI on `main` after the merge | Linux host, Windows host and Android green. |
+| Host 0.9.1 on the owner's DSH | Independent package review PASS; activated through the DSH change pipeline 2026-11-03 02:16: batch committed, 0 errors, package post-check 3/3, smoke passed. The installed release directory equals the host ZIP, 86/86 files. |
+| Signed APK | Signed from `76c7644` (later commits change only tests, CI and docs); version 0.9.1, code 18; certificate unchanged; zipalign and the 8-permission check pass. Installed with `adb install -r`, pairing kept; `base.apk` on the phone has the same SHA-256. |
+| Phone, final APK + host 0.9.1 (02:47–02:51) | PASS — legacy question answered on the phone: agent reply «PICKED Beta», chat shows «Ответ: Beta». The answer row is present in the host's private state with expiry 24 h after settlement. Queue remove: «Удаляем…» shown while in flight, item gone within 16 s, the removed text was never delivered, the running turn finished normally. |
+| «Ответ: …» after a real host restart, on the phone | UNVERIFIED — the answer was given after the activation restart and no further restart was taken. The restart path is covered by host tests with real SQLite. |
