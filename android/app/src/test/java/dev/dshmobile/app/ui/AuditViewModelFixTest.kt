@@ -25,7 +25,12 @@ class AuditViewModelFixTest {
             snapshot = SessionSnapshot(SessionSummary("chat", "Synthetic", "w", 1, false, true), emptyList(), 1, false, "idle")))
         override val acceptedCreate = MutableStateFlow<CreateAcceptance?>(null)
         var forgetCalls = 0
-        override suspend fun answer(callId: String, answer: QuestionAnswer) {}
+        var answerStatus: String? = null
+        var answerError: String? = null
+        override suspend fun answer(callId: String, answer: QuestionAnswer) {
+            if (answerStatus != null || answerError != null) state.value = state.value.copy(
+                pending = answerStatus?.let { PendingCommand("receipt", "answer", "chat", null, it) }, error = answerError)
+        }
         override suspend fun restore() {}
         override suspend fun refresh() {}
         override suspend fun pair(invitationJson: String, deviceName: String) {}
@@ -54,6 +59,28 @@ class AuditViewModelFixTest {
             assertEquals(32, vm.answeredQuestions.size)
             assertFalse(vm.answeredQuestions.containsKey(questionDraftKey("chat", "question-0")))
             vm.forget(); runCurrent(); assertTrue(vm.answeredQuestions.isEmpty())
+        } finally { models.clear(); Dispatchers.resetMain() }
+    }
+    @Test fun `pending or uncertain answer is not a failed submission or optimistic answer`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val repo = Repo(); val vm = MobileViewModel(RuntimeEnvironment.getApplication()) { repo }
+        val models = androidx.lifecycle.ViewModelStore().apply { put("vm", vm) }
+        try {
+            runCurrent()
+            for (status in listOf("pending", "uncertain")) {
+                repo.state.value = repo.state.value.copy(pending = null, error = null)
+                repo.answerStatus = status
+                repo.answerError = if (status == "uncertain") "command_uncertain" else null
+                vm.answer("call", QuestionAnswer(emptyList())); runCurrent()
+                assertNull("$status is not proof that the answer was not sent", vm.phoneError)
+                assertNull(vm.phoneErrorAction); assertTrue(vm.answeredQuestions.isEmpty())
+                assertEquals(status, repo.state.value.pending?.status)
+            }
+            repo.state.value = repo.state.value.copy(pending = null, error = null)
+            repo.answerStatus = null; repo.answerError = "command_rejected"
+            vm.answer("call", QuestionAnswer(emptyList())); runCurrent()
+            assertEquals("command_rejected", vm.phoneError)
+            assertEquals("answer:call", vm.phoneErrorAction)
         } finally { models.clear(); Dispatchers.resetMain() }
     }
     @Test fun `AND01 corrupt notification record cannot block UI destructive forget`() = runTest {

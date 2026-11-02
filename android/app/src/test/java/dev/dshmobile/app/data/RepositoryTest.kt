@@ -1775,6 +1775,38 @@ class RepositoryTest {
             } finally { release.countDown(); send.await() }
         }
     }
+    @Test fun `pending answer and skip settle by receipt without another POST`() = runBlocking {
+        for (skip in listOf(false, true)) withRepository { repo, store, fixture, _ ->
+            fixture.capabilities = fixture.capabilities.replace("\"questions\":false", "\"questions\":true,\"questionSkip\":true")
+            fixture.snapshotText = snapshot().dropLast(1) + """, "pendingQuestions":[{"callId":"call","state":"open","questions":[{"id":"q","question":"Synthetic?","options":[{"label":"Yes"}]}]}]}"""
+            val answer = dev.dshmobile.app.model.QuestionAnswer(listOf(dev.dshmobile.app.model.AnswerItem("q", listOf("Yes"))))
+            val polls = java.util.concurrent.atomic.AtomicInteger()
+            fixture.message = { json("""{"requestId":"${requestId(it)}","status":"pending","updatedAt":20}""", 202) }
+            fixture.receipt = { id -> json("""{"requestId":"$id","status":"${if (polls.incrementAndGet() == 1) "pending" else "accepted"}","updatedAt":21}""") }
+            repo.refresh(); repo.saveAnswerDraft("chat", "call", answer)
+            if (skip) repo.skipQuestion("call") else repo.answer("call", answer)
+            withTimeout(3000) { repo.state.first { it.pending == null } }
+            assertNull(store.value.pending); assertTrue(store.value.answerDrafts.isEmpty())
+            assertNull(repo.state.value.error); assertEquals(2, polls.get())
+            assertEquals(1, fixture.mutations.size)
+        }
+    }
+    @Test fun `pending answer timeout stays uncertain with draft and manual rejection never resends`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            fixture.capabilities = fixture.capabilities.replace("\"questions\":false", "\"questions\":true")
+            fixture.snapshotText = snapshot().dropLast(1) + """, "pendingQuestions":[{"callId":"call","state":"open","questions":[{"id":"q","question":"Synthetic?","options":[{"label":"Yes"}]}]}]}"""
+            val answer = dev.dshmobile.app.model.QuestionAnswer(listOf(dev.dshmobile.app.model.AnswerItem("q", listOf("Yes"))))
+            fixture.message = { json("""{"requestId":"${requestId(it)}","status":"pending","updatedAt":20}""", 202) }
+            fixture.receipt = { id -> json("""{"requestId":"$id","status":"pending","updatedAt":21}""") }
+            repo.refresh(); repo.saveAnswerDraft("chat", "call", answer); repo.answer("call", answer)
+            withTimeout(15_000) { repo.state.first { it.pending?.status == "uncertain" } }
+            assertEquals("command_uncertain", repo.state.value.error); assertFalse(store.value.answerDrafts.isEmpty())
+            fixture.receipt = { id -> json("""{"requestId":"$id","status":"rejected","updatedAt":22}""") }
+            repo.resolvePending(); assertNull(store.value.pending)
+            assertEquals("command_rejected", repo.state.value.error); assertFalse(store.value.answerDrafts.isEmpty())
+            assertEquals(1, fixture.mutations.size)
+        }
+    }
     @Test fun `normal pending send auto polls accepted without ever becoming uncertain`() = runBlocking {
         withRepository { repo, _, fixture, scope ->
             val statuses = CopyOnWriteArrayList<String>()

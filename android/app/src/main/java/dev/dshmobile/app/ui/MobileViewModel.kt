@@ -51,7 +51,9 @@ class MobileViewModel @JvmOverloads constructor(application: Application,
         viewModelScope.launch {
             try {
                 editorActions.withLock { operation() }
-                if (state.value.pending == null && state.value.error == null) accepted() else phoneError = state.value.error ?: "command_uncertain"
+                // An unresolved answer has a delivery receipt, not proof of a failed submission.
+                if (key.startsWith("answer:") && state.value.pending?.kind == "answer") Unit
+                else if (state.value.pending == null && state.value.error == null) accepted() else phoneError = state.value.error ?: "command_uncertain"
             } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
             catch (_: Exception) { phoneError = "host_error" }
             finally { if (phoneError != null) phoneErrorAction = key; interactionBlocked = false; phoneAction = null }

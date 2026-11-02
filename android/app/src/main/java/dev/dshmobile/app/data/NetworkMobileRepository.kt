@@ -1090,7 +1090,7 @@ internal class NetworkMobileRepository(
     private var receiptPoll: Job? = null
     private var receiptPollId: String? = null
     private fun scheduleReceiptPoll(command: StoredCommand) {
-        if (command.kind !in setOf("send", "create") || command.status != "pending" || !foreground || closed) return
+        if (command.kind !in setOf("send", "create", "answer") || command.status != "pending" || !foreground || closed) return
         if (receiptPollId == command.requestId && receiptPoll?.isActive == true) return
         receiptPoll?.cancel()
         receiptPollId = command.requestId
