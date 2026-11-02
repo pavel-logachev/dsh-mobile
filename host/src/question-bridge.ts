@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { HostError } from './errors.ts';
 import { questionsOf, validateAnswer } from './phone.ts';
 import type { PendingQuestion, QuestionAnswer } from './phone.ts';
@@ -16,7 +17,9 @@ export interface QuestionBridge {
 export function createQuestionBridge(on: (listener: (request: any, next: () => Promise<QuestionAnswer>) => Promise<QuestionAnswer>) => () => unknown): QuestionBridge {
   const pending = new Map<string, { sessionId: string; question: PendingQuestion; resolve: (value: QuestionAnswer) => void; reject: (error: unknown) => void }>();
   const dispose = on(async (request, next) => {
-    const sessionId = request.agent?.session?.id, callId = request.wait?.callId;
+    // The legacy tool supplies no wait metadata. Its blocking request can use
+    // a bridge-local handle; only timed/continued questions need the tool call ID.
+    const sessionId = request.agent?.session?.id, callId = request.wait === undefined ? `mobile-question:${randomUUID()}` : request.wait?.callId;
     const parsed = questionsOf([{ callId, questions: request.questions, state: 'open' }])[0];
     if (typeof sessionId !== 'string' || !parsed || !request.signal || request.signal.aborted || pending.size >= 128) return next();
     const key = JSON.stringify([sessionId, callId]);
