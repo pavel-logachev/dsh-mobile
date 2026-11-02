@@ -71,7 +71,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'relay npm ci failed' }
           npm run build
           if ($LASTEXITCODE -ne 0) { throw 'Host build failed' }
-          npm test
+          # Native ACL checks spawn PowerShell; serialize files to avoid CPU contention.
+          # Keep the complete package test glob; options must precede file arguments.
+          node --test --test-concurrency=1 test/*.test.ts
           if ($LASTEXITCODE -ne 0) { throw 'Host tests failed' }
 
   android:
@@ -105,4 +107,12 @@ jobs:
         shell: bash
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon --console=plain :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+          ./gradlew --no-daemon --console=plain :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest :app:assembleRelease :app:lintRelease
+      - name: Upload JVM test failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-test-results
+          path: android/app/build/test-results/testDebugUnitTest/
+          if-no-files-found: ignore
+          retention-days: 7

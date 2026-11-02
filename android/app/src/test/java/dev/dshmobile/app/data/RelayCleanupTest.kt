@@ -2,7 +2,7 @@ package dev.dshmobile.app.data
 
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.yield
+import kotlinx.coroutines.delay
 import okhttp3.CertificatePinner
 import okhttp3.Request
 import okhttp3.tls.HeldCertificate
@@ -66,13 +66,15 @@ class RelayCleanupTest {
         }
     }
 
-    private suspend fun awaitConnectionRefused(address: InetSocketAddress) = withTimeout(2_000) {
+    private suspend fun awaitConnectionRefused(address: InetSocketAddress) = withTimeout(10_000) {
         // JDK close can return before a blocked Linux accept releases its native listener.
-        // A final TCP handshake may still succeed; await actual refusal, not an IO timeout.
+        // Repeated handshakes can fill that listener's backlog before accept wakes.
+        // A connect timeout proves neither closure nor a leak: only refusal passes.
         while (true) {
             try { Socket().use { it.connect(address, 500) } }
             catch (_: ConnectException) { return@withTimeout }
-            yield()
+            catch (_: java.net.SocketTimeoutException) { /* Await the actual listener close. */ }
+            delay(25) // Do not flood the backlog while the accept thread releases it.
         }
     }
     @Test fun `closing during pending outer upgrade aborts actual TCP and prevents later startup`() = runBlocking {

@@ -416,19 +416,22 @@ test('concurrent exact HTTP replay returns its receipt when the last real adapte
   const input = () => ({ size: 3, name: 'synthetic.txt', mime: 'text/plain', data: (async function* () { yield Buffer.from('abc'); })() });
   for (let i = 0; i < 19; i++) await adapter.upload(row.sessionId, input(), signal, 'w');
   const root = dirname(frame.header.cwd), host = await startHostServer({ adapter, config: { bind: '127.0.0.1', port: 0, allowInsecureLoopback: true, hostName: 'Synthetic', statePath: join(root, 'state.sqlite'), workspaces: [{ id: 'w', name: 'Synthetic', path: frame.header.cwd }] } });
-  t.after(() => host.close()); const { baseUrl } = await host.start();
-  const device = host.state.consumePairing(host.state.createPairing({ readWorkspaceIds: ['w'], executeWorkspaceIds: ['w'] }).pairingToken, 'Synthetic'), headers = { Authorization: 'Bearer ' + device.deviceToken };
-  const pick = await fetch(`${baseUrl}/v1/sessions/${row.sessionId}/uploads`, { method: 'POST', headers: { ...headers, 'Content-Type': 'text/plain' }, body: 'abc' }); assert.equal(pick.status, 201); const { uploadId } = await pick.json();
   let releaseFirst!: () => void, releaseSecond!: () => void, enteredFirst!: () => void, enteredSecond!: () => void;
   const firstGate = new Promise<void>(r => { releaseFirst = r; }), secondGate = new Promise<void>(r => { releaseSecond = r; });
+  // Close the host before setup's root-removal hook, including a failed pick or
+  // pairing assertion. On Windows an open SQLite handle prevents that removal.
+  try {
+  const { baseUrl } = await host.start();
+  const device = host.state.consumePairing(host.state.createPairing({ readWorkspaceIds: ['w'], executeWorkspaceIds: ['w'] }).pairingToken, 'Synthetic'), headers = { Authorization: 'Bearer ' + device.deviceToken };
+  const pick = await fetch(`${baseUrl}/v1/sessions/${row.sessionId}/uploads`, { method: 'POST', headers: { ...headers, 'Content-Type': 'text/plain' }, body: 'abc' }); assert.equal(pick.status, 201); const { uploadId } = await pick.json();
   const firstEntry = new Promise<void>(r => { enteredFirst = r; }), secondEntry = new Promise<void>(r => { enteredSecond = r; });
   const reserve = adapter.reserveFileUploads.bind(adapter), prompt = adapter.prompt.bind(adapter); let reservations = 0;
   adapter.reserveFileUploads = async (...args) => { if (++reservations === 1) { const token = await reserve(...args); enteredFirst(); await firstGate; return token; } enteredSecond(); await secondGate; return reserve(...args); };
   adapter.prompt = async (...args) => { await prompt(...args); releaseSecond(); };
   const body = { requestId: randomUUID(), text: 'Synthetic', uploadIds: [uploadId] };
   const send = (payload = body) => fetch(`${baseUrl}/v1/sessions/${row.sessionId}/messages`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-  try { const first = send(); await firstEntry; const second = send(); await secondEntry; releaseFirst(); const results = await Promise.all([first, second]); assert.ok(results.every(r => [200, 202].includes(r.status)), results.map(r => r.status).join(',')); assert.equal(calls.length, 1); assert.equal((await send()).status, 200); assert.equal((await send({ ...body, text: 'conflict' })).status, 409); }
-  finally { releaseFirst(); releaseSecond(); await host.close(); }
+  const first = send(); await firstEntry; const second = send(); await secondEntry; releaseFirst(); const results = await Promise.all([first, second]); assert.ok(results.every(r => [200, 202].includes(r.status)), results.map(r => r.status).join(',')); assert.equal(calls.length, 1); assert.equal((await send()).status, 200); assert.equal((await send({ ...body, text: 'conflict' })).status, 409);
+  } finally { releaseFirst(); releaseSecond(); await host.close(); }
 });
 
 test('batch file quota reservations are atomic and release only unused upload slots', async t => {
