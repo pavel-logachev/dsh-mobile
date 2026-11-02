@@ -36,7 +36,6 @@ internal fun NotificationLocal.reconcileWatches(session: String, outcomes: Promp
         val watch = watched[outcome.requestId] ?: continue
         if (outcome.status in setOf("completed", "failed", "rejected"))
             local = local.copy(watches = local.watches.filterNot { it.requestId == watch.requestId })
-        if (outcome.status == "rejected") continue
         // Contract permits omitted turnId even on terminal outcomes. Use the request identity
         // in that case; never drop a proven outcome just because this optional field is absent.
         val turn = outcome.turnId ?: "request:${outcome.requestId}"

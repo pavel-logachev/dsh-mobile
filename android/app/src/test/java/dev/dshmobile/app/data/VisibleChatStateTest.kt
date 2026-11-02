@@ -32,6 +32,19 @@ class VisibleChatStateTest {
         state.clear(owner); queued()
         assertEquals(1, posts)
     }
+    @Test fun `opening acknowledges question under the same lock before queued dispatch can proceed`() {
+        val state = VisibleChat(); val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        val posted = AtomicBoolean(false)
+        val opening = Thread { state.show(Any(), "chat") { entered.countDown(); assertTrue(release.await(5, TimeUnit.SECONDS)) } }
+        val dispatching = CountDownLatch(1)
+        val dispatch = Thread { dispatching.countDown(); state.postUnlessVisible("chat") { posted.set(true) } }
+        try {
+            opening.start(); assertTrue(entered.await(5, TimeUnit.SECONDS))
+            dispatch.start(); assertTrue(dispatching.await(5, TimeUnit.SECONDS))
+            assertFalse(posted.get())
+        } finally { release.countDown(); opening.join(5000); dispatch.join(5000) }
+        assertFalse(opening.isAlive); assertFalse(dispatch.isAlive); assertFalse(posted.get())
+    }
     @Test fun `visibility update cannot interleave with platform dispatch`() {
         val state = VisibleChat(); val inPost = CountDownLatch(1); val release = CountDownLatch(1)
         val updating = CountDownLatch(1); val updated = AtomicBoolean(false)

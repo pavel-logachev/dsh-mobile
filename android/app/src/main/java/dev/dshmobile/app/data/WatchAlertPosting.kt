@@ -1,6 +1,5 @@
 package dev.dshmobile.app.data
 
-import android.app.NotificationManager
 import android.content.Context
 import androidx.core.app.NotificationCompat
 import dev.dshmobile.app.R
@@ -28,15 +27,17 @@ internal suspend fun postWatchAlert(context: Context, device: String, alert: Wat
         .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
         .setPublicVersion(NotificationCompat.Builder(context, channel).setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(strings.getString(R.string.app_name)).setContentText(title).build())
-        .setAutoCancel(true).setOnlyAlertOnce(replay).addExtras(alertLanguageExtras(if (alert.kind == "answer") "answers" else alert.kind, alert.title, alert.summary)).build()
+        .setAutoCancel(true).setOnlyAlertOnce(replay).addExtras(alertLanguageExtras(if (alert.kind == "answer") "answers" else alert.kind, alert.title, alert.summary).apply {
+            putString(WATCH_TURN_EXTRA, alert.turnId)
+        }).build()
     NotificationPosting.paced {
         // No suspension between permission/policy guard and platform notify.
         store.postIfCurrent(device, alert.key) {
             if (!watchAlertsAllowed(context)) throw MobileFailure("notifications_blocked")
-            val post = { context.getSystemService(NotificationManager::class.java).notify(tag, 2, notification) }
-            // Only successful completion is redundant while its chat is visible. Questions and
-            // failures retain their existing alert policy. The coordinator acknowledges either case.
-            if (alert.kind == "answer") visibleChat.postUnlessVisible(alert.sessionId, post) else post()
+            val post = { NotificationPosting.postAlert(context, tag, notification) }
+            // Questions and successful completions are redundant in the foreground target chat.
+            // Failures retain their alert policy. The coordinator acknowledges suppression too.
+            if (alert.kind in setOf("answer", "attention")) visibleChat.postUnlessVisible(alert.sessionId, post) else post()
         }
     }
 }

@@ -27,6 +27,18 @@ internal object NotificationPosting {
         pending.forEach { it.valid = false }
         safely { context.getSystemService(NotificationManager::class.java).cancelAll() }
     }
+    @Synchronized fun postAlert(context: Context, tag: String, notification: android.app.Notification) {
+        context.getSystemService(NotificationManager::class.java).notify(tag, 2, notification)
+    }
+    @Synchronized fun cancelQuestion(context: Context, matches: (android.service.notification.StatusBarNotification) -> Boolean) {
+        safely {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            manager.activeNotifications.filter { it.id == 2 && it.notification.channelId == "attention_alert_v2" && matches(it) }.forEach { shown ->
+                pending.filter { it.tag == shown.tag && it.id == shown.id }.forEach { it.valid = false }
+                manager.cancel(shown.tag, shown.id)
+            }
+        }
+    }
     fun safely(block: () -> Unit) {
         try { block() } catch (cancelled: CancellationException) { throw cancelled }
         catch (failure: Exception) { logFailure(failure) }

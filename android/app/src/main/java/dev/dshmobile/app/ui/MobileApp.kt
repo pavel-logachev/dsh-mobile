@@ -156,11 +156,14 @@ private fun PairedApp(state: MobileState, model: MobileViewModel) {
 @Composable
 private fun VisibleChatEffect(session: String?) {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val context = androidx.compose.ui.platform.LocalContext.current.applicationContext
     val token = remember { Any() }
-    DisposableEffect(lifecycle, session) {
+    DisposableEffect(lifecycle, session, context) {
         fun publish() {
             dev.dshmobile.app.data.visibleChat.show(token,
-                session.takeIf { lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) })
+                session.takeIf { lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) }) { visible ->
+                dev.dshmobile.app.data.cancelChatQuestionAlert(context, visible)
+            }
         }
         val observer = LifecycleEventObserver { _, _ -> publish() }
         lifecycle.addObserver(observer)

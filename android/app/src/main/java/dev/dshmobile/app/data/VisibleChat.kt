@@ -5,7 +5,10 @@ internal class VisibleChat {
     private var owner: Any? = null
     private var session: String? = null
 
-    @Synchronized fun show(owner: Any, session: String?) { this.owner = owner; this.session = session }
+    @Synchronized fun show(owner: Any, session: String?, onVisible: (String) -> Unit = {}) {
+        this.owner = owner; this.session = session
+        session?.let(onVisible)
+    }
     @Synchronized fun clear(owner: Any) { if (this.owner === owner) { this.owner = null; session = null } }
     // Posting and lifecycle updates use one lock: visibility is decided at platform dispatch,
     // not when an alert enters the paced queue. No suspension is allowed in post.

@@ -85,7 +85,8 @@ class NotificationService : Service() {
         try {
             ensureNotificationChannels(appLanguageContext(this))
             val coordinator = WatchCoordinator(store::read, store::update, transport::promptOutcomes,
-                post = { alert, replay -> postWatchAlert(this, host.deviceId, alert, replay) })
+                post = { alert, replay -> postWatchAlert(this, host.deviceId, alert, replay) },
+                clearResolved = { current -> cancelResolvedQuestionAlerts(this, current) })
             WatchPollLoop(store::update, coordinator,
                 supported = { transport.capabilities().capabilities.promptOutcomes },
                 online = { connectivity.activeNetwork != null }, allowed = { watchAlertsAllowed(this) }).run()

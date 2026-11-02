@@ -67,7 +67,7 @@ class VisibleChatNotificationTest {
         }
         return manager.activeNotifications.count { it.id == 2 }
     }
-    @Test fun `completion follows rendered chat and lifecycle while attention and error stay unchanged`() {
+    @Test fun `completion and question follow rendered chat and lifecycle while error stays unchanged`() {
         val vm = MobileViewModel(app) { Repo() }
         try {
             ensureNotificationChannels(app)
@@ -76,12 +76,13 @@ class VisibleChatNotificationTest {
             compose.onNodeWithTag("chat_screen").assertIsDisplayed()
             assertEquals("Visible target chat must not notify", 0, post())
             assertEquals("Another chat must notify", 1, post("other"))
-            assertEquals("Question alerts unchanged", 1, post(kind = "attention"))
+            assertEquals("Visible question must not notify", 0, post(kind = "attention"))
             assertEquals("Error alerts unchanged", 1, post(kind = "error"))
             capture("visible-chat.png")
 
             compose.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
             assertEquals("Background target chat must notify", 1, post())
+            assertEquals("Background question must notify", 1, post(kind = "attention"))
             compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
             compose.onNodeWithTag("chat_screen").assertIsDisplayed()
             assertEquals("Resume restores visible target suppression", 0, post())
@@ -89,13 +90,40 @@ class VisibleChatNotificationTest {
             compose.onNodeWithTag("chat_drawer").performClick()
             compose.onNodeWithTag("home_screen").assertIsDisplayed()
             assertEquals("Home must notify even with selected repository snapshot", 1, post())
+            assertEquals("Home question must notify", 1, post(kind = "attention"))
             compose.onNodeWithTag("settings").performClick()
             compose.onNodeWithTag("settings_screen").assertIsDisplayed()
             assertEquals("Settings must notify", 1, post())
+            assertEquals("Settings question must notify", 1, post(kind = "attention"))
             compose.onNodeWithTag("settings_back").performClick()
             compose.onNodeWithTag("session_other").performClick()
             compose.onNodeWithTag("chat_screen").assertIsDisplayed()
             assertEquals("Different open chat must notify", 1, post())
+            assertEquals("Different open chat question must notify", 1, post(kind = "attention"))
+        } finally {
+            compose.activityRule.scenario.moveToState(Lifecycle.State.DESTROYED)
+            androidx.lifecycle.ViewModelStore().apply { put("vm", vm); clear() }
+        }
+    }
+    @Test fun `opening a chat cancels only its question alert and resume clears background question`() {
+        val vm = MobileViewModel(app) { Repo() }
+        try {
+            ensureNotificationChannels(app)
+            compose.setContent { MaterialTheme { MobileApp(vm) } }
+            assertEquals(1, post(kind = "attention"))
+            val target = manager.activeNotifications.single { it.id == 2 }
+            manager.notify(watchNotificationTag("device", "other"), 2, target.notification)
+            compose.onNodeWithTag("session_chat").performClick()
+            compose.onNodeWithTag("chat_screen").assertIsDisplayed()
+            compose.runOnIdle {
+                assertEquals(listOf(watchNotificationTag("device", "other")), manager.activeNotifications.filter { it.id == 2 }.map { it.tag })
+            }
+            capture("question-opened.png")
+            compose.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
+            assertEquals("Background question posts", 1, post(kind = "attention"))
+            compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+            compose.onNodeWithTag("chat_screen").assertIsDisplayed()
+            compose.runOnIdle { assertTrue(manager.activeNotifications.none { it.id == 2 }) }
         } finally {
             compose.activityRule.scenario.moveToState(Lifecycle.State.DESTROYED)
             androidx.lifecycle.ViewModelStore().apply { put("vm", vm); clear() }

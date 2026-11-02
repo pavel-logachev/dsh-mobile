@@ -38,7 +38,9 @@ internal class NotificationStore internal constructor(private val file: AtomicSt
     suspend fun postIfCurrent(device: String, key: String, post: () -> Unit) = withContext(Dispatchers.IO) {
         mutex.withLock {
             val current = readLocked()
-            if (current.enabled && current.deviceId == device && current.outbox.any { it.key == key }) post()
+            val alert = current.outbox.firstOrNull { it.key == key }
+            val resolvedQuestion = alert?.kind == "attention" && current.questionResolved(alert.sessionId, alert.turnId)
+            if (current.enabled && current.deviceId == device && alert != null && !resolvedQuestion) post()
         }
     }
     suspend fun read(): NotificationLocal = withContext(Dispatchers.IO) { mutex.withLock { readLocked() } }

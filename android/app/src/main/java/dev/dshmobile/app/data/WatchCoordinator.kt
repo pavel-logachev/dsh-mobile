@@ -10,7 +10,8 @@ internal class WatchCoordinator(private val read: suspend () -> NotificationLoca
     private val update: suspend ((NotificationLocal) -> NotificationLocal) -> NotificationLocal,
     private val poll: suspend (String, List<String>, String?, Int) -> PromptOutcomes,
     private val post: suspend (WatchAlert, Boolean) -> Unit,
-    private val now: () -> Long = System::currentTimeMillis) {
+    private val now: () -> Long = System::currentTimeMillis,
+    private val clearResolved: (NotificationLocal) -> Unit = {}) {
     private val lock = Mutex()
     private data class Cut(val ids: List<String>, val token: String)
     private val tokens = mutableMapOf<String, Cut>()
@@ -57,6 +58,9 @@ internal class WatchCoordinator(private val read: suspend () -> NotificationLoca
     }
     suspend fun drain() = lock.withLock { drainLocked() }
     private suspend fun drainLocked() {
+        // Durable turn state also clears a question after process recreation, even when no
+        // completion is posted (waiting -> running, or visible-chat suppression).
+        clearResolved(read())
         for (alert in read().outbox) {
             val current = read()
             if (!current.enabled || current.outbox.none { it.key == alert.key } || alert.expiresAt <= now()) continue
