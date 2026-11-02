@@ -13,7 +13,7 @@ export interface QuestionBridge {
   settled(sessionId: string): ResolvedQuestion[];
   close(): void;
 }
-/** Competes with (never invokes or impersonates) the ordinary desktop answerer.
+/** Races the ordinary desktop answerer, cancelling only its losing waiter.
  * The upstream cancellation signal settles losing mobile waits and removes secrets.
  */
 export function createQuestionBridge(on: (listener: (request: any, next: () => Promise<QuestionAnswer>) => Promise<QuestionAnswer>) => () => unknown): QuestionBridge {
@@ -34,10 +34,18 @@ export function createQuestionBridge(on: (listener: (request: any, next: () => P
     const promise = new Promise<QuestionAnswer>((yes, no) => { resolve = yes; reject = no; });
     const answer = { promise, resolve, reject };
     pending.set(key, { sessionId, question: parsed, resolve: answer.resolve, reject: answer.reject });
-    const aborted = () => answer.reject(request.signal.reason);
-    request.signal.addEventListener('abort', aborted, { once: true });
+    const upstreamSignal: AbortSignal = request.signal, desktopLifetime = new AbortController();
+    const aborted = () => answer.reject(upstreamSignal.reason);
+    upstreamSignal.addEventListener('abort', aborted, { once: true });
+    // Cordis next() reuses this object, and the Remote gateway reads it asynchronously.
+    // Keep the desktop-only signal installed until downstream has actually settled.
+    request.signal = AbortSignal.any([upstreamSignal, desktopLifetime.signal]);
+    let desktopSettled = false;
     try {
-      const desktop = Promise.resolve().then(next).catch(error => {
+      const desktop = Promise.resolve().then(next).finally(() => {
+        desktopSettled = true;
+        request.signal = upstreamSignal;
+      }).catch(error => {
         if (error?.code !== 'NO_PROVIDER') throw error;
         return answer.promise;
       });
@@ -52,7 +60,10 @@ export function createQuestionBridge(on: (listener: (request: any, next: () => P
         }
       }
       return result;
-    } finally { pending.delete(key); request.signal.removeEventListener('abort', aborted); }
+    } finally {
+      pending.delete(key); upstreamSignal.removeEventListener('abort', aborted);
+      if (!desktopSettled) desktopLifetime.abort();
+    }
   });
   return {
     pending(sessionId) { return [...pending.values()].filter(p => p.sessionId === sessionId).map(p => p.question); },

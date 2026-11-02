@@ -28,8 +28,11 @@ test('real legacy ask_user_question exposes distinct mobile waits and returns th
   ctx.provide('tools', { register(value: any) { tool = value; return () => {}; } });
   await scope.ctx.plugin(toolPlugin);
   assert.equal(Object.hasOwn(tool.parameters, 'timeout'), false, 'exercise the legacy schema');
-  const desktop: ((value: typeof answer) => void)[] = [];
-  ctx.on('user-questions/request', () => new Promise(resolve => { desktop.push(resolve); }), { global: true });
+  const desktop: ((value: typeof answer) => void)[] = [], desktopSignals: AbortSignal[] = [];
+  ctx.on('user-questions/request', (request: any) => new Promise((resolve, reject) => {
+    desktop.push(resolve); desktopSignals.push(request.signal);
+    request.signal.addEventListener('abort', () => reject(Object.assign(new Error('Desktop cancelled'), { code: 'ASK_ABORTED' })), { once: true });
+  }), { global: true });
   const bridge = createQuestionBridge(listener => ctx.on('user-questions/request', listener, { global: true, prepend: true }));
   t.after(() => bridge.close());
   const executions: Promise<unknown>[] = [];
@@ -38,7 +41,8 @@ test('real legacy ask_user_question exposes distinct mobile waits and returns th
     executions.push(result); return result;
   };
   try {
-    const first = execute('legacy-one'), second = execute('legacy-two');
+    const agentSignal = new AbortController().signal;
+    const first = execute('legacy-one', agentSignal), second = execute('legacy-two');
     await new Promise(resolve => setImmediate(resolve));
     const pending = bridge.pending(agent.session.id);
     assert.equal(pending.length, 2, 'legacy requests omit wait but must still be answerable');
@@ -48,6 +52,9 @@ test('real legacy ask_user_question exposes distinct mobile waits and returns th
     assert.equal(bridge.answer(agent.session.id, pending[0]!.callId, answer), true);
     assert.equal(bridge.answer(agent.session.id, pending[0]!.callId, answer), false);
     assert.deepEqual(await first, answer);
+    assert.equal(desktopSignals[0]!.aborted, true, 'phone winner must cancel the desktop waiter');
+    assert.equal(agentSignal.aborted, false, 'phone answer must not abort the agent tool/turn signal');
+    assert.equal(desktopSignals[1]!.aborted, false, 'another question must remain open');
     assert.equal(bridge.pending(agent.session.id).length, 1);
     desktop[1]!(answer); assert.deepEqual(await second, answer);
     assert.equal(bridge.pending(agent.session.id).length, 0, 'desktop winner retires the phone handle');
@@ -64,6 +71,115 @@ test('real legacy ask_user_question exposes distinct mobile waits and returns th
   } finally {
     for (const release of desktop) release(answer);
     bridge.close(); await Promise.allSettled(executions);
+  }
+});
+
+test('installed Remote gateway carries phone cancellation to its client waterfall without aborting the agent', { skip: !process.env.DSH_MOBILE_CORDIS_MODULE, timeout: 10000 }, async t => {
+  const require = createRequire(process.env.DSH_MOBILE_CORDIS_MODULE!);
+  const load = (name: string) => import(pathToFileURL(require.resolve(name)).href);
+  const { Context } = await load('@deepseek-ai/cordis');
+  const { createScope, scopeTarget } = await load('@deepseek-ai/dsh-scope');
+  const { TypertGatewayService } = await load('@deepseek-ai/dsh-api-gateway');
+  const remotes = await load('@deepseek-ai/dsh-api-remotes');
+  const { ClientRemoteEvents } = await import(new URL('./types/client/remote-events.js', pathToFileURL(require.resolve('@deepseek-ai/dsh-api-gateway'))).href);
+  const host = new Context(), client = new Context(), lifetime = new AbortController();
+  t.after(async () => { lifetime.abort(); await client.fiber.dispose(); await host.fiber.dispose(); });
+  // No HTTP server, live sessions or private data: exercise the installed in-process carrier.
+  host.provide('typert', {}); host.provide('remoteAccess', {});
+  await host.plugin(TypertGatewayService); await host.plugin(remotes);
+  const gateway = host.get('typertGateway');
+  const agent: any = { id: 'synthetic-session', session: { id: 'synthetic-session' } };
+  const scope = createScope(host, agent); agent.ctx = scope.ctx;
+  t.after(() => scope.dispose());
+  client.provide('typert', { contexts: { getClient: () => ({ resolve: () => client }) } });
+  const peer = { signal: lifetime.signal, principal: { kind: 'owner' }, interactions: 'answer' };
+  const frames: any[] = [];
+  const events = new ClientRemoteEvents(client, {
+    registerGenerationSource: () => () => {},
+    rpc: { call: (_path: string, endpoint: string, payload: unknown, signal: AbortSignal) => gateway.dispatchRpc(endpoint, payload, signal, peer) },
+  }, async function* (endpoint: string, payload: unknown, signal: AbortSignal) {
+    const source = await gateway.wireStream.open(endpoint, payload, undefined, peer, signal);
+    for await (const frame of source) { frames.push(frame); yield frame; }
+  });
+  const ready = Promise.withResolvers();
+  const pump = events.runGeneration(lifetime.signal, ready.resolve);
+  t.after(async () => { lifetime.abort(); await pump; await events.dispose(); });
+  await ready.promise;
+  let received!: AbortSignal, desktopAnswer!: (value: typeof answer) => void;
+  const opened = () => Promise.withResolvers();
+  let waiting = opened(), cancelled = opened();
+  events.subscribe(client, 'user-questions/request', (request: any) => {
+    received = request.signal; waiting.resolve();
+    return new Promise((resolve, reject) => {
+      desktopAnswer = resolve;
+      const abort = () => { cancelled.resolve(); reject(Object.assign(new Error('Desktop cancelled'), { code: 'ASK_ABORTED' })); };
+      request.signal.addEventListener('abort', abort, { once: true });
+      if (request.signal.aborted) abort();
+    });
+  });
+  const bridge = createQuestionBridge(listener => host.on('user-questions/request', listener, { global: true, prepend: true }));
+  t.after(() => bridge.close());
+  for (const timed of [false, true]) {
+    for (const winner of ['phone', 'early-phone', 'desktop'] as const) {
+      waiting = opened(); cancelled = opened();
+      const deliveredBefore = frames.filter(f => f.type === 'waterfall').length;
+      const signal = new AbortController().signal;
+      const request = { agent, questions: question.questions, signal, ...(timed ? { wait: { callId: 'timed-call', timed: true } } : {}) };
+      const result = host.waterfall(scopeTarget(agent, agent), 'user-questions/request', request, () => Promise.reject(new Error('No answerer')));
+      const callId = bridge.pending(agent.session.id)[0]!.callId;
+      if (winner !== 'early-phone') await waiting.promise;
+      if (winner === 'desktop') desktopAnswer(answer);
+      else assert.equal(bridge.answer(agent.session.id, callId, answer), true);
+      assert.deepEqual(await result, answer);
+      if (winner === 'phone') {
+        await cancelled.promise;
+        assert.equal(received.aborted, true);
+      }
+      assert.equal(signal.aborted, false);
+      assert.deepEqual(bridge.pending(agent.session.id), []);
+      await new Promise(resolve => setImmediate(resolve));
+      if (winner === 'early-phone') assert.equal(frames.filter(f => f.type === 'waterfall').length, deliveredBefore, 'already-cancelled request must not reach the GUI');
+      assert.equal(request.signal, signal, 'restore the shared request only after downstream settles');
+    }
+  }
+  assert.equal(frames.filter(f => f.type === 'waterfall').length, 4);
+  assert.equal(frames.filter(f => f.type === 'cancel').length, 2);
+});
+
+test('desktop-only lifetime cleans up phone, upstream abort, close and downstream failures for legacy and timed requests', async () => {
+  for (const timed of [false, true]) {
+    for (const winner of ['phone', 'desktop', 'abort', 'close', 'error', 'no-provider'] as const) {
+      let listener: any, desktopSignal!: AbortSignal, release!: (value: typeof answer) => void;
+      const bridge = createQuestionBridge(fn => { listener = fn; return () => {}; });
+      const upstream = new AbortController(), started = Promise.withResolvers();
+      const request = { agent: { session: { id: 'session' } }, questions: question.questions, signal: upstream.signal, ...(timed ? { wait: { callId: 'timed-call' } } : {}) };
+      const result = listener(request, async () => {
+        // Like the Remote queue, downstream may not read the object immediately.
+        await new Promise(resolve => setImmediate(resolve)); desktopSignal = request.signal;
+        started.resolve();
+        if (winner === 'error' || winner === 'no-provider') throw Object.assign(new Error('Synthetic failure'), { code: winner === 'no-provider' ? 'NO_PROVIDER' : 'DESKTOP_ERROR' });
+        return new Promise((resolve, reject) => {
+          release = resolve;
+          desktopSignal.addEventListener('abort', () => reject(desktopSignal.reason), { once: true });
+          if (desktopSignal.aborted) reject(desktopSignal.reason);
+        });
+      });
+      const rejected = ['abort', 'close', 'error'].includes(winner) ? assert.rejects(result) : undefined;
+      const callId = bridge.pending('session')[0]!.callId;
+      if (winner === 'phone') bridge.answer('session', callId, answer);
+      if (winner === 'abort') upstream.abort();
+      if (winner === 'close') bridge.close();
+      await started.promise;
+      if (winner === 'desktop') release(answer);
+      if (winner === 'no-provider') bridge.answer('session', callId, answer);
+      if (rejected) await rejected; else assert.deepEqual(await result, answer);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(upstream.signal.aborted, winner === 'abort');
+      assert.equal(desktopSignal.aborted, ['phone', 'abort', 'close'].includes(winner));
+      assert.equal(request.signal, upstream.signal);
+      assert.deepEqual(bridge.pending('session'), []);
+      bridge.close();
+    }
   }
 });
 
