@@ -1,6 +1,6 @@
 # DSH Mobile 0.9.0 — release notes and acceptance checklist
 
-**Status: final private candidate built and host activated locally (2026-11-02); physical acceptance incomplete — one FAIL fixed in host awaiting re-test and several scenarios unverified (see Verification). Not releasable yet.** This is the single release record. It replaces the intermediate local acceptance drafts; their old measurements, hashes and machine-specific logs remain private historical evidence, not results for this candidate. No publication or production rollout is implied.
+**Status: final private candidate `761687d` (2026-11-02): host activated through the DSH change pipeline, signed APK installed on the test phone, physical acceptance done except the failure alert (unverified) and exact Doze delay (partial); open findings are listed in the Verification update. Release decision belongs to the owner.** This is the single release record. It replaces the intermediate local acceptance drafts; their old measurements, hashes and machine-specific logs remain private historical evidence, not results for this candidate. No publication or production rollout is implied.
 
 ## Versions and build identity
 
@@ -95,3 +95,60 @@ Recorded 2026-11-02 (MSK). Physical results come from one OnePlus CPH2747 sessio
 | Speed before/after (same route/data, cold/warm, samples/method) | UNVERIFIED — one cold Activity start sample (TotalTime 149 ms, WaitTime 151 ms); no comparable before series and no ≥3-sample online/chat/first-token series. No speed-up claimed. |
 | Upgrade preserves pairing/data; reviewed rollback available | PASS (host) — after both pipeline activations (02:25 and 03:35) the phone kept its pairing without re-pairing: app showed "PC online" at 02:30 and was used for the session above; at 03:40 host `remote-status` reported `connected=true, ready=true, activeGrants=1, stale=false`. Previous immutable host builds and the pipeline rollback point remain available; no rollback was executed. Phone app was not reinstalled in this session (same APK hash). |
 | Remaining findings and explicit release decision | **Not releasable yet.** Open: physical re-test of question answering on the fixed host; failure alert; process death; network; Doze; reboot (needs owner unlock / no secure lock); speed series; TXT view/download content; queue-remove transient error; private `host.json` still declares DSH `0.2.0-rc.2` while the runtime is rc.5 (operator review, step 3). Release decision belongs to the owner; no tag, push or publication. |
+
+### Verification update — final candidate (2026-11-02, 10:00–21:30 MSK)
+
+The table above records the 02:32–02:52 session and stays unchanged as history. This update records later physical runs on the same OnePlus CPH2747 and the fixes they caused. Times are MSK.
+
+**Final candidate.** Source `release/0.9.0` at `761687d`, local commits only, no tag or push. Fixes after `7a69796`, all found during physical acceptance:
+
+| Commit | Side | Fix |
+|---|---|---|
+| `e4d646d` | host | The phone shows «Ответ: …» for legacy questions answered on the phone, instead of «Агент продолжил без ответа». |
+| `f85dea2` | host | After a phone answer the desktop GUI question card closes; only the desktop waiter is cancelled, never the agent turn. |
+| `cf77a14` | host | Answers use the point session header instead of four full session-catalog scans; the scans were about 11 s of about 12.5 s from tap to tool result on a large session store. |
+| `6f9160a` | Android | A pending answer receipt is no longer shown as «Ответ не отправлен», and answer receipts are polled while pending. |
+| `3fc8910` | Android | Completion alerts carry the chat title, not «Чат без названия», also after reboot restore. |
+| `2e22481` | Android | A self-retired `HostApi` transport is replaced, so «Подключить снова» can recover from a stuck «Нет связи». The link to the observed 15:34 episode is unverified: no logcat survived. |
+| `4c4538f` | Android | Opening settings twice no longer makes settings its own back target; the screen could not be left without a restart. |
+| `1c99318` | Android | No completion alert for the chat currently visible in the foreground. |
+| `761687d` | Android | No question alert for the visible chat; a question alert is cancelled when that chat is opened or its question resolves. |
+
+**Checks and builds.**
+- Host `npm.cmd run check` at `cf77a14`: 360/360, 0 skipped, installed-Cordis tests included.
+- Android at `761687d`: `testDebugUnitTest` 480/480; lint 0 errors, 41 warnings.
+- Host ZIP from `1c99318` (host unchanged since): SHA-256 `d988ff5d4860cc9d0f189366f700cf2cc5b48b7b5cb66d849142e1387b072271`, built twice byte-identically; immutable digest `30e85c02a945757c75b96c4363f7f29717a19bf4e518ce2b9aa00f52939e3e3c`. N1: the two legacy `notifications.js/.d.ts` files are carried over from earlier builds, so whole-ZIP reproducibility from a clean checkout is not claimed.
+- Independent review PASS. Activated through the DSH change pipeline at 21:13:44: batch committed, 0 errors, smoke passed; relay `connected=true, ready=true, activeGrants=1`.
+- Signed APK from `761687d`: SHA-256 `73b73cf667f9933232b7cf668f2e20048354df75a57432b6b04c6af7a57cd6eb`; build tests up-to-date at 480/480; installed 21:51:10; `base.apk` on the phone has the same SHA-256; certificate `f9080c63…` (unchanged); version 0.9.0, code 17; installed with `adb install -r`; pairing kept.
+
+**Physical results.**
+
+| Scenario | Result |
+|---|---|
+| Question Alpha/Beta answered on phone, foreground and background | PASS (10:02–10:10 and 15:24, 18:18, 21:22). |
+| Desktop question card after a phone answer | PASS (18:19) — the owner observed the desktop card closing; timing not measured. |
+| Answer card after leaving and reopening the chat | PASS — «Ответ: Beta», no «Агент продолжил без ответа» (15:24, 18:22). |
+| Answer delivery feedback | PASS (21:22) — no «Ответ не отправлен», no stale «Отправляем…». |
+| Answer latency | 18:18, before `cf77a14`: «Отправляем…» until at least +12.6 s, settled card and reply at +16.9 s. 21:22, after `cf77a14`: settled card and agent reply already at the first sample, +2.2 s. 2 s sampling. |
+| Completion alert in background, tap opens the chat | PASS (10:02–10:35 run). |
+| Completion alert title | PASS (18:19) — the notification showed the actual chat title, not «Чат без названия». |
+| Process death with a pending watch | PASS (10:15) — «Ответ готов» delivered after the process died. |
+| Wi-Fi↔mobile switch and full offline/reconnect | PASS at the UI boundary — no duplicate command seen. Not an exactly-once claim. |
+| Forced Doze | PARTIAL — alert delivered under forced idle (10:20:23); the exact delay after turn end is not measurable from the 60 s UI timestamp. |
+| Reboot with a running phone task | PASS (15:39–15:40) — app restored by the boot broadcast without user launch; «Ответ готов» at 15:40:34.8; foreground service stopped at 15:40:35.1; no services at 15:49. The owner unlocked the phone. |
+| Idle: no foreground service | PASS (15:49, 18:10; also in the 10:02–10:35 run). |
+| TXT download and hash | PASS (10:02–10:35 run). |
+| Settings opened twice, then back or arrow | PASS (21:25). |
+| No completion alert for the visible chat | PASS (21:22). |
+| Question alert for the visible chat | FAIL on `1c99318` (21:22: «Нужен ответ» posted while the chat was open and left after the answer); fixed in `761687d`, physical re-check PASS (21:55): no «Нужен ответ» for the open chat, no alert left after the answer; settled card at +2.2–4.4 s. |
+| Failure alert | UNVERIFIED — no safe deterministic model or route failure was available. |
+| Speed, coarse 3–4 s sampling, no earlier baseline | Median cold start 106 ms; launch to online about 6.66 s; plain send to reply about 3.44 s (10:02–10:35 run). |
+
+**Open findings.**
+- Queue remove showed a transient «could not remove» error.
+- Legacy-question answer history is kept in host memory only and is lost on a host restart.
+- Private `host.json` declares DSH `0.2.0-rc.2` while the runtime is rc.5.
+- APK provenance is tied to the source only through the build log.
+- The trigger of the 15:34 «Нет связи» episode and of the double settings open is not established.
+
+**Release decision.** For the owner. No tag, push or publication.
