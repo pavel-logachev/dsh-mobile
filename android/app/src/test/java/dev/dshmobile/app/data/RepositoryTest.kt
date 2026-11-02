@@ -828,8 +828,12 @@ class RepositoryTest {
             val getCount = fixture.requests.count { it.path == "/v1/sessions/chat" }
             val eventsCount = fixture.requests.count { it.path == "/v1/sessions/chat/events" }
             val replacement = snapshot("""[{"id":"notification-fresh","role":"assistant","text":"New cut","createdAt":20}]""", cursor = 2)
+            val opening = "event: snapshot\ndata: $replacement\n\n"
+            // A complete finite body immediately reports EOF and races selection
+            // assertions with reconnect/offline handling. Advertise one more byte:
+            // the real socket stays open until cancellation, with no sleeping writer.
             fixture.events = { MockResponse().setHeader("Content-Type", "text/event-stream")
-                .setBody("event: snapshot\ndata: $replacement\n\n") }
+                .setBody(opening).setHeader("Content-Length", opening.toByteArray().size + 1) }
             repo.selectSession("chat")
             withTimeout(5_000) { repo.state.first { it.snapshot?.cursor == 2L } }
             assertEquals(getCount, fixture.requests.count { it.path == "/v1/sessions/chat" })
@@ -1216,7 +1220,11 @@ class RepositoryTest {
             val send = scope.async(start = CoroutineStart.UNDISPATCHED) { repo.sendMessage("Synthetic recovery") }
             val port = fixture.stopServer()
             val replacement = MockWebServer()
-            recover = { replacement.dispatcher = fixture; replacement.start(port) }
+            recover = {
+                replacement.dispatcher = fixture
+                try { replacement.start(java.net.InetAddress.getByName("127.0.0.1"), port) }
+                catch (failure: Exception) { throw AssertionError("Fixture could not rebind stopped port $port", failure) }
+            }
             val stop = scope.async(start = CoroutineStart.UNDISPATCHED) { repo.setForeground(false) }
             try {
                 store.gate!!.complete(Unit); send.await(); stop.await()

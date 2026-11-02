@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { assertPrivate } from '../src/private-files.ts';
 import { assertStagedFilePrivate } from './helpers/staged-file-acl.ts';
-import { mkdtemp, mkdir, readdir, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, realpath, rm, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { FileStaging } from '../src/file-staging.ts';
@@ -12,7 +12,7 @@ import { UPLOAD_LIMIT } from '../src/phone.ts';
 
 for (const budget of ['count', 'bytes']) test(`staging sweep retries first unlink failure and restores ${budget} budget`, async t => {
   t.mock.timers.enable({ apis: ['setInterval'] });
-  const root = await mkdtemp(join(tmpdir(), 'staging-retry-')), store = new FileStaging(join(root, 'host.sqlite'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'staging-retry-'))), store = new FileStaging(join(root, 'host.sqlite'));
   t.after(async () => { await store.close(); await rm(root, { recursive: true, force: true }); });
   const signal = new AbortController().signal, original = fs.unlink;
   let failedPath = '';
@@ -58,7 +58,7 @@ for (const budget of ['count', 'bytes']) test(`staging sweep retries first unlin
 });
 
 test('startup removes aged orphans but preserves fresh files until the grace expires', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'staging-age-')), first = new FileStaging(join(root, 'host.sqlite'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'staging-age-'))), first = new FileStaging(join(root, 'host.sqlite'));
   const data = () => (async function* () { yield Buffer.from('a'); })();
   const stale = await first.save(data(), 1, new AbortController().signal), fresh = await first.save(data(), 1, new AbortController().signal);
   const old = new Date(Date.now() - 25 * 60 * 60_000); await fs.utimes(stale, old, old);
@@ -74,7 +74,7 @@ test('startup removes aged orphans but preserves fresh files until the grace exp
 });
 
 test('staging rejects redirected directories and foreign reads, retains owner-only ACL and cleans ENOSPC', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'file-staging-security-')), store = new FileStaging(join(root, 'host.sqlite'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'file-staging-security-'))), store = new FileStaging(join(root, 'host.sqlite'));
   t.after(async () => { await store.close(); await rm(root, { recursive: true, force: true }); });
   const signal = new AbortController().signal, data = () => (async function* () { yield Buffer.from('abc'); })();
   const path = await store.save(data(), 3, signal); await assertPrivate(store.directory); await assertStagedFilePrivate(path); assert.match(path, /[a-f0-9]{48}\.tmp$/);
@@ -89,7 +89,7 @@ test('staging rejects redirected directories and foreign reads, retains owner-on
 });
 
 test('private staging reserves total disk bytes/count before intake and removes partial failures', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'file-staging-')), store = new FileStaging(join(root, 'host.sqlite'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'file-staging-'))), store = new FileStaging(join(root, 'host.sqlite'));
   t.after(async () => { await store.close(); await rm(root, { recursive: true, force: true }); });
   assert.throws(() => store.assertOutside([{ path: root }]), { code: 'unsafe_private_path' });
   const signal = new AbortController().signal;

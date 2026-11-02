@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,7 +9,8 @@ import { HostState } from '../src/state.ts';
 import { startHostServer } from '../src/server.ts';
 
 function fixture(t: any) {
-  const dir = mkdtempSync(join(tmpdir(), 'host-review-')), state = new HostState(join(dir, 'host.sqlite'));
+  // Match configuration's realpath canonicalization, including Windows TEMP case.
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'host-review-'))), state = new HostState(join(dir, 'host.sqlite'));
   const device = state.consumePairing(state.createPairing({ readWorkspaceIds: ['w'], executeWorkspaceIds: ['w'] }).pairingToken, 'Synthetic');
   t.after(() => { state.close(); rmSync(dir, { recursive: true, force: true }); });
   return { dir, state, device };

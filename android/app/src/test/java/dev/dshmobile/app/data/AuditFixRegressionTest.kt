@@ -23,7 +23,7 @@ class AuditFixRegressionTest {
     private class Fixture : Dispatcher() {
         var failures = 0
         var permanent = false
-        var calls = 0
+        @Volatile var calls = 0
         var beforeMessage: (() -> Unit)? = null
         var outcomes = true
         fun snapshot() = """{"session":{"id":"chat","title":"Synthetic","workspaceId":"w","updatedAt":1,"running":false,"canExecute":true},"messages":[],"cursor":1,"hasMore":false,"activity":"idle"}"""
@@ -86,7 +86,9 @@ class AuditFixRegressionTest {
         fixture(true) { repo, fixture, attempts ->
             fixture.failures = 100
             repo.refresh()
-            withTimeout(3000) { while (fixture.calls < 8) delay(5) }
+            // Seven real loopback requests plus CI scheduling/TLS setup are not a
+            // three-second contract. Still require exactly the six retry attempts.
+            withTimeout(15_000) { while (fixture.calls < 8) delay(5) }
             assertEquals(listOf(0, 1, 2, 3, 4, 5), attempts.toList())
             repo.leaveSession(); assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
         }
