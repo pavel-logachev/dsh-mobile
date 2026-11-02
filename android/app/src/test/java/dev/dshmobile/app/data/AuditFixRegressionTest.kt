@@ -24,6 +24,7 @@ class AuditFixRegressionTest {
         var failures = 0
         var permanent = false
         @Volatile var calls = 0
+        val snapshotCalls = kotlinx.coroutines.channels.Channel<Int>(kotlinx.coroutines.channels.Channel.UNLIMITED)
         var beforeMessage: (() -> Unit)? = null
         var outcomes = true
         fun snapshot() = """{"session":{"id":"chat","title":"Synthetic","workspaceId":"w","updatedAt":1,"running":false,"canExecute":true},"messages":[],"cursor":1,"hasMore":false,"activity":"idle"}"""
@@ -34,7 +35,7 @@ class AuditFixRegressionTest {
             "/v1/presets" -> json("""{"items":[]}""")
             "/v1/sessions" -> json("""{"items":[{"id":"chat","title":"Synthetic","workspaceId":"w","updatedAt":1,"running":false,"canExecute":true}],"nextCursor":null}""")
             "/v1/sessions/chat/messages" -> { beforeMessage?.invoke(); val requestId = mobileJson.parseToJsonElement(request.body.readUtf8()).jsonObject.getValue("requestId").jsonPrimitive.content; json("""{"requestId":"$requestId","status":"accepted","updatedAt":1}""") }
-            "/v1/sessions/chat" -> { calls++; if (failures-- > 0) json("""{"error":{"code":"${if (permanent) "payload_too_large" else "unavailable"}","message":"Synthetic","retryable":${!permanent}}}""", if (permanent) 413 else 503) else json(snapshot()) }
+            "/v1/sessions/chat" -> { snapshotCalls.trySend(++calls); if (failures-- > 0) json("""{"error":{"code":"${if (permanent) "payload_too_large" else "unavailable"}","message":"Synthetic","retryable":${!permanent}}}""", if (permanent) 413 else 503) else json(snapshot()) }
             else -> json("{}", 404)
         }
     }
@@ -43,7 +44,10 @@ class AuditFixRegressionTest {
         MockWebServer().use { server ->
             server.dispatcher = fixture; server.start()
             store.value = StoredState(host = PairedHost(HostEndpoint(server.url("/").newBuilder().host("127.0.0.1").build().toString().removeSuffix("/")), "device", "synthetic-device-token-for-tests", "Synthetic"), selectedSessionId = if (selected) "chat" else null)
-            val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            // Keep repository-owned retry scheduling on the calling test's event
+            // loop. HTTP still uses real MockWebServer/OkHttp threads; callbacks
+            // resume this owner rather than racing retry-job publication on Default.
+            val scope = CoroutineScope(currentCoroutineContext() + SupervisorJob())
             val repo = NetworkMobileRepository(store, scope, true, retryDelay = { attempts += it; 1L }, watchPrompt = watch)
             try { repo.setForeground(true); block(repo, fixture, attempts) }
             finally { repo.close(); scope.cancel() }
@@ -86,18 +90,12 @@ class AuditFixRegressionTest {
         fixture(true) { repo, fixture, attempts ->
             fixture.failures = 100
             repo.refresh()
-            // Seven real loopback requests plus CI scheduling/TLS setup are not a
-            // three-second contract. Still require exactly the six retry attempts.
-            var lastDiagnostic = ""
-            try {
-                withTimeout(15_000) {
-                    while (fixture.calls < 8) {
-                        val diagnostic = "calls=${fixture.calls}, attempts=${attempts.toList()}, state=${repo.state.value}"
-                        if (diagnostic != lastDiagnostic) { println("AND03 diagnostic: $diagnostic"); lastDiagnostic = diagnostic }
-                        delay(5)
-                    }
-                }
-            } finally { println("AND03 final: calls=${fixture.calls}, attempts=${attempts.toList()}, state=${repo.state.value}") }
+            // Await actual dispatch events, not polling a cross-thread counter.
+            // The original deadline is only a failure guard, not synchronization.
+            withTimeout(3_000) {
+                while (fixture.snapshotCalls.receive() < 8) { }
+                repo.state.first { !it.busy && it.error == "chat_unavailable" }
+            }
             assertEquals(listOf(0, 1, 2, 3, 4, 5), attempts.toList())
             repo.leaveSession(); assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
         }
