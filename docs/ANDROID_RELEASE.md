@@ -58,10 +58,10 @@ Owner steps after reviewing the draft (commands are instructions, not a performe
 3. Use the helper's newly printed output directory, not an arbitrary older artifact. Verify its receipt and APK hash, keep its matching R8 mapping privately, and perform the approved native/physical-device acceptance before publishing. Create a checksum and upload **only** the signed APK and checksum to the existing draft:
 
    ```powershell
-   $tag = 'v0.9.0'
+   $tag = 'v0.9.1'
    $releaseDir = '<new output directory printed by android-release.ps1>'
    $receipt = Get-Content -LiteralPath (Join-Path $releaseDir 'release-receipt.json') -Raw | ConvertFrom-Json
-   if ($tag -cne ('v' + $receipt.versionName) -or $receipt.versionCode -ne 17) { throw 'Wrong release version' }
+   if ($tag -cne ('v' + $receipt.versionName) -or $receipt.versionCode -ne 18) { throw 'Wrong release version' }
    $apk = Join-Path $releaseDir $receipt.apkName
    $hash = (Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToLowerInvariant()
    if ($hash -cne $receipt.apkSha256.ToLowerInvariant()) { throw 'APK hash mismatch' }
