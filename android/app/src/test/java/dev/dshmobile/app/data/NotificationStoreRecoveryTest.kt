@@ -7,6 +7,22 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class NotificationStoreRecoveryTest {
+    @Test fun restoredWatchCarriesChatTitleIntoEveryAlertPhase() = runBlocking {
+        // Synthetic persisted record; a recreated service has no repository/session list.
+        val restored = mobileJson.decodeFromString<NotificationLocal>("""{"deviceId":"device","watches":[{"sessionId":"chat","requestId":"00000000-0000-4000-8000-000000000001","expiresAt":1000,"title":"Синтетический чат 🚀"}]}""")
+        var local = restored
+        val posted = mutableListOf<WatchAlert>()
+        var status = "waiting"
+        val coordinator = WatchCoordinator({ local }, { change -> change(local).also { local = it } }, { _, ids, _, _ ->
+            PromptOutcomes("t", listOf(PromptOutcome(ids.single(), status, "2026-11-01T12:00:00Z", "turn")))
+        }, { alert, _ -> posted += alert }, { 101 })
+        coordinator.resync()
+        status = "completed"
+        coordinator.resync()
+        assertEquals(listOf("attention", "answer"), posted.map { it.kind })
+        assertEquals(listOf("Синтетический чат 🚀", "Синтетический чат 🚀"), posted.map { it.title })
+        assertTrue(local.watches.isEmpty())
+    }
     @Test fun encryptedWatchRecordSurvivesOwnerRecreationAndResync() = runBlocking {
         val key = SecretKeySpec(ByteArray(32) { 9 }, "AES")
         var bytes: ByteArray? = null
@@ -20,14 +36,15 @@ class NotificationStoreRecoveryTest {
         }
         val request = "00000000-0000-4000-8000-000000000001"
         val first = NotificationStore(record, StateCipher { key })
-        first.update { it.registerWatch("device", "chat", request, 100) }
+        first.update { it.registerWatch("device", "chat", request, 100, "Synthetic encrypted title 🚀") }
         assertFalse(bytes!!.toString(Charsets.UTF_8).contains(request))
+        assertFalse(bytes!!.toString(Charsets.UTF_8).contains("Synthetic encrypted title"))
         val recreated = NotificationStore(record, StateCipher { key })
         assertTrue(recreated.read().needsWatchService(101))
         var posts = 0
         WatchCoordinator(recreated::read, recreated::update, { _, _, _, _ ->
             PromptOutcomes("t", listOf(PromptOutcome(request, "completed", "2026-11-01T12:00:00Z", "turn")))
-        }, { _, _ -> posts++ }, { 101 }).resync()
+        }, { alert, _ -> assertEquals("Synthetic encrypted title 🚀", alert.title); posts++ }, { 101 }).resync()
         assertEquals(1, posts); assertTrue(recreated.read().watches.isEmpty())
     }
     @Test fun missingBaseRecoversApi26BackupInsteadOfForgettingLocalPolicyAndWatch() = runBlocking {

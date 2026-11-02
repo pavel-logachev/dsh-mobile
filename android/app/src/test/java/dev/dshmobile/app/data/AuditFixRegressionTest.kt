@@ -38,7 +38,7 @@ class AuditFixRegressionTest {
             else -> json("{}", 404)
         }
     }
-    private suspend fun fixture(selected: Boolean, watch: suspend (String, String, String) -> Unit = { _, _, _ -> }, outcomes: Boolean = true, block: suspend (NetworkMobileRepository, Fixture, MutableList<Int>) -> Unit) {
+    private suspend fun fixture(selected: Boolean, watch: suspend (String, String, String, String) -> Unit = { _, _, _, _ -> }, outcomes: Boolean = true, block: suspend (NetworkMobileRepository, Fixture, MutableList<Int>) -> Unit) {
         val store = Store(); val fixture = Fixture().also { it.outcomes = outcomes }; val attempts = CopyOnWriteArrayList<Int>()
         MockWebServer().use { server ->
             server.dispatcher = fixture; server.start()
@@ -51,7 +51,7 @@ class AuditFixRegressionTest {
     }
     @Test fun `N3 phone send persists its own request watch before HTTP admission`() = runBlocking {
         var watched: Triple<String, String, String>? = null
-        fixture(true, { device, session, request -> watched = Triple(device, session, request) }) { repo, fixture, _ ->
+        fixture(true, { device, session, request, title -> assertEquals("Synthetic", title); watched = Triple(device, session, request) }) { repo, fixture, _ ->
             fixture.beforeMessage = { assertEquals("device", watched?.first); assertEquals("chat", watched?.second); assertTrue(validRequestId(watched!!.third)) }
             repo.sendMessage("Synthetic phone prompt")
             assertNotNull(watched)
@@ -59,7 +59,7 @@ class AuditFixRegressionTest {
     }
     @Test fun capabilityFalseNeverRegistersWatchBeforePhoneAdmission() = runBlocking {
         var watches = 0
-        fixture(true, { _, _, _ -> watches++ }, outcomes = false) { repo, fixture, _ ->
+        fixture(true, { _, _, _, _ -> watches++ }, outcomes = false) { repo, fixture, _ ->
             var admitted = false
             fixture.beforeMessage = { admitted = true; assertEquals(0, watches) }
             repo.sendMessage("Synthetic phone prompt")

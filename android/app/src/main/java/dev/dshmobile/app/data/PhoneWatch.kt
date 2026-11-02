@@ -4,7 +4,7 @@ import kotlinx.serialization.Serializable
 
 internal const val WATCH_TTL_MS = 24 * 60 * 60 * 1000L
 private const val WATCH_CAP = 32
-@Serializable internal data class PhoneWatch(val sessionId: String, val requestId: String, val expiresAt: Long)
+@Serializable internal data class PhoneWatch(val sessionId: String, val requestId: String, val expiresAt: Long, val title: String = "")
 @Serializable internal data class WatchAlert(val key: String, val sessionId: String, val turnId: String,
     val kind: String, val title: String, val summary: String? = null, val expiresAt: Long,
     val attempted: Boolean = false, val aliases: List<String> = emptyList())
@@ -17,12 +17,12 @@ internal fun NotificationLocal.pruneWatches(now: Long) = copy(
     watchTurns = watchTurns.filter { it.expiresAt > now }.takeLast(2048),
     deliveredTurns = deliveredTurns.filter { it.at > now - WATCH_TTL_MS }.takeLast(2048))
 internal fun NotificationLocal.needsWatchService(now: Long) = enabled && watches.any { it.expiresAt > now }
-internal fun NotificationLocal.registerWatch(device: String, session: String, request: String, now: Long): NotificationLocal {
+internal fun NotificationLocal.registerWatch(device: String, session: String, request: String, now: Long, title: String = ""): NotificationLocal {
     if (!enabled) return this
     val current = (if (deviceId == null || deviceId == device) this else NotificationLocal(enabled = enabled)).pruneWatches(now)
     val id = request.lowercase()
     if (current.watches.any { it.requestId == id }) return current
-    return current.copy(deviceId = device, watches = (current.watches + PhoneWatch(session, id, now + WATCH_TTL_MS)).takeLast(WATCH_CAP))
+    return current.copy(deviceId = device, watches = (current.watches + PhoneWatch(session, id, now + WATCH_TTL_MS, title)).takeLast(WATCH_CAP))
 }
 internal fun watchTurnKey(session: String, turn: String) = "${session.length}:$session$turn"
 internal fun watchNotificationTag(device: String, session: String) = "$device:phone-chat:$session"
@@ -71,7 +71,7 @@ internal fun NotificationLocal.reconcileWatches(session: String, outcomes: Promp
         }
         val kind = when (outcome.status) { "failed" -> "error"; "waiting" -> "attention"; else -> "answer" }
         val key = keys.last()
-        local = local.copy(outbox = (local.outbox + WatchAlert(key, session, turn, kind, "", outcome.summary, watch.expiresAt,
+        local = local.copy(outbox = (local.outbox + WatchAlert(key, session, turn, kind, watch.title, outcome.summary, watch.expiresAt,
             aliases = keys)).takeLast(WATCH_CAP))
     }
     return local

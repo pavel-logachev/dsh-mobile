@@ -31,7 +31,7 @@ fun createMobileRepository(context: Context, scope: CoroutineScope): MobileRepos
     NetworkMobileRepository(EncryptedStateStore(context.applicationContext), scope, BuildConfig.DEBUG, observeRestoredSession = false,
         historyStore = EncryptedHistoryStore(context.applicationContext), prefetchEnabled = true,
         networkWake = repositoryNetworkWake(context.applicationContext),
-        watchPrompt = { device, session, request -> registerPhoneWatch(context.applicationContext, device, session, request) },
+        watchPrompt = { device, session, request, title -> registerPhoneWatch(context.applicationContext, device, session, request, title) },
         unwatchPrompt = { request -> NotificationStore(context.applicationContext).update { it.copy(watches = it.watches.filterNot { w -> w.requestId == request }) }; Unit },
         openAttachment = { source -> context.contentResolver.openInputStream(android.net.Uri.parse(source.uri)) ?: throw java.io.IOException("unavailable") })
 
@@ -61,7 +61,7 @@ internal class NetworkMobileRepository(
     private val prefetchEnabled: Boolean = false,
     private val preHeaderRetryDelay: (Int) -> Long = { attempt -> if (attempt == 0) 500L else 1_500L },
     private val openAttachment: ((dev.dshmobile.app.model.DraftAttachment) -> java.io.InputStream)? = null,
-    private val watchPrompt: suspend (String, String, String) -> Unit = { _, _, _ -> },
+    private val watchPrompt: suspend (String, String, String, String) -> Unit = { _, _, _, _ -> },
     private val unwatchPrompt: suspend (String) -> Unit = {},
     private val networkWake: (((() -> Unit)) -> (() -> Unit))? = null,
     private val firstSnapshotTimeoutMs: Long = 15_000L,
@@ -868,8 +868,12 @@ internal class NetworkMobileRepository(
     private suspend fun dispatchOn(mutation: HostApi, command: StoredCommand, drafts: Map<String, String>) {
         // Persist the watch BEFORE any prompt bytes can leave. A process death cannot admit a
         // phone task whose watch was never stored. No draft text or attachments enter this record.
-        if (command.kind == "send" && state.value.capabilities?.promptOutcomes == true)
-            watchPrompt(requireNotNull(stored.host).deviceId, requireNotNull(command.sessionId), command.requestId)
+        if (command.kind == "send" && state.value.capabilities?.promptOutcomes == true) {
+            val session = requireNotNull(command.sessionId)
+            val title = state.value.snapshot?.session?.takeIf { it.id == session }?.title
+                ?: state.value.sessions.firstOrNull { it.id == session }?.title.orEmpty()
+            watchPrompt(requireNotNull(stored.host).deviceId, session, command.requestId, title)
+        }
         try { persist(stored.copy(pending = command, drafts = drafts, notSentSessions = stored.notSentSessions.filterNot { it == command.sessionId }.toSet())) }
         catch (failure: Exception) { cleanupWatch(command.requestId); throw failure }
         mutableState.value = state.value.copy(pending = command.presentation(), draft = draftFor(stored.selectedSessionId), busy = true, error = null)

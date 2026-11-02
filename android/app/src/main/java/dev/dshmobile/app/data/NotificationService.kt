@@ -134,8 +134,8 @@ internal suspend fun resumePhoneWatches(context: Context) {
     ContextCompat.startForegroundService(context, Intent(context, NotificationService::class.java))
 }
 
-internal suspend fun registerPhoneWatch(context: Context, device: String, session: String, request: String) {
-    NotificationStore(context).update { it.registerWatch(device, session, request, System.currentTimeMillis()) }
+internal suspend fun registerPhoneWatch(context: Context, device: String, session: String, request: String, title: String) {
+    NotificationStore(context).update { it.registerWatch(device, session, request, System.currentTimeMillis(), title) }
     // Called at explicit prompt admission while UI is visible. A failed FGS start does not erase
     // durable watches or alter command delivery; a later permitted resume can recover them.
     try { resumePhoneWatches(context) }

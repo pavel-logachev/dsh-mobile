@@ -8,6 +8,13 @@ class PhoneWatchTest {
     private fun cut(status: String, id: String = request, turn: String? = "turn", at: String = "2026-11-01T12:00:00Z") =
         PromptOutcomes("token", listOf(PromptOutcome(id, status, at, turn)))
     private fun local() = NotificationLocal().registerWatch("device", "chat", request, 100)
+    @Test fun legacyAndEmptyTitlesKeepFallbackWhileFailurePreservesKnownTitle() {
+        val legacy = mobileJson.decodeFromString<NotificationLocal>("""{"watches":[{"sessionId":"chat","requestId":"$request","expiresAt":1000}]}""")
+        assertEquals("", legacy.reconcileWatches("chat", cut("completed"), 101).outbox.single().title)
+        assertEquals("", local().reconcileWatches("chat", cut("failed"), 101).outbox.single().title)
+        val named = NotificationLocal().registerWatch("device", "chat", request, 100, "Синтетический чат 🚀")
+        assertEquals("Синтетический чат 🚀", named.reconcileWatches("chat", cut("failed"), 101).outbox.single().title)
+    }
     @Test fun noServiceWithoutActiveWatchesAndDefaultPreferenceOn() {
         assertTrue(NotificationLocal().enabled); assertFalse(NotificationLocal().needsWatchService(100))
     }
