@@ -69,10 +69,14 @@ private fun PairedApp(state: MobileState, model: MobileViewModel) {
         if (model.notificationChat == null && route == "chat" && sessionId != null && chatNeedsSelection(sessionId!!, state, model.interactionBlocked))
             model.selectSession(sessionId!!)
     }
+    fun openSettings() {
+        // Repeated taps/intents must not replace the return destination with settings itself.
+        if (route != "settings") { previousRoute = route; route = "settings" }
+    }
     fun goBack() {
         model.cancelNotificationNavigation()
         if (route == "chat") model.leaveSession()
-        route = if (route == "settings") previousRoute else "home"
+        route = if (route == "settings" && previousRoute != "settings") previousRoute else "home"
     }
     LaunchedEffect(model.notificationRevision) {
         val target = model.notificationChat
@@ -91,7 +95,7 @@ private fun PairedApp(state: MobileState, model: MobileViewModel) {
         if (model.notificationChatList) { route = "home"; sessionId = null; project = null; search = ""; model.consumeNotificationChatList() }
     }
     LaunchedEffect(model.notificationSettings) {
-        if (model.notificationSettings) { previousRoute = route; route = "settings"; model.consumeNotificationSettings() }
+        if (model.notificationSettings) { openSettings(); model.consumeNotificationSettings() }
     }
     // Native predictive Back commits only on completion; a canceled gesture keeps the screen.
     PredictiveBackHandler(enabled = route != "home" && !newChat && !connection) { events ->
@@ -133,7 +137,7 @@ private fun PairedApp(state: MobileState, model: MobileViewModel) {
                         route = "chat"
                     },
                     onNewChat = { if (canCreate(state) && !model.interactionBlocked) newChat = true },
-                    onSettings = { previousRoute = route; route = "settings" }, onConnection = { connection = true },
+                    onSettings = ::openSettings, onConnection = { connection = true },
                     onRefresh = model::refresh, interactionBlocked = model.interactionBlocked,
                     pendingDelivery = { PendingDelivery(state, model, Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) })
             }
