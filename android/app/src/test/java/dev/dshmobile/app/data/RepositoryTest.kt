@@ -92,6 +92,42 @@ class RepositoryTest {
             }
         }
     }
+    @Test fun `manual reconnect replaces self retired read transport without replaying uncertain prompt`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            repo.sendMessage("Synthetic uncertain intent")
+            assertEquals(1, fixture.mutations.size)
+            assertNotNull(store.value.pending)
+            // Fault injection at the transport boundary: model a blocked cleanup + eight queued
+            // cancellations. The next real SSE cancel must retire HostApi through cancelOnIo.
+            val apiField = repo.javaClass.getDeclaredField("api").apply { isAccessible = true }
+            val transport = apiField.get(repo) as HostApi
+            val ioField = transport.javaClass.getDeclaredField("io").apply { isAccessible = true }
+            val io = ioField.get(transport) as TransportIoOwner
+            val entered = java.util.concurrent.CountDownLatch(1)
+            val release = java.util.concurrent.CountDownLatch(1)
+            assertTrue(io.submit { entered.countDown(); release.await(5, TimeUnit.SECONDS) })
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            try {
+                repeat(8) { assertTrue(io.submit {}) }
+                val source = transport.observe("chat", {}, {})
+                source.cancel() // Overflow invokes actual HostApi.close(), not a fake network.
+                try { transport.capabilities(); fail("Overflow must retire the read transport") }
+                catch (failure: MobileFailure) { assertEquals("network_unavailable", failure.key) }
+                // Replacement must not wait for old physical cleanup, and that late cleanup
+                // must not cancel the replacement's independent pool/requests.
+                repo.refresh()
+                assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
+                assertFalse((apiField.get(repo) as HostApi).isRetired)
+                assertNotSame(transport, apiField.get(repo))
+            } finally { release.countDown(); transport.awaitClosed() }
+            repo.refresh()
+            assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
+            assertEquals("chat", repo.state.value.snapshot?.session?.id)
+            assertNotNull(store.value.pending)
+            assertEquals("Reconnect must only reconcile the original uncertain request", 1, fixture.mutations.size)
+            assertTrue(fixture.requests.any { it.path?.startsWith("/v1/commands/") == true })
+        }
+    }
     @Test fun `network restored interrupts exhausted backoff without replay and coalesces flaps`() = runBlocking {
         val store = MemoryStore()
         val fixture = Fixture()

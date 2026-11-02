@@ -285,7 +285,9 @@ internal class NetworkMobileRepository(
     }
     private fun api(): HostApi = synchronized(lifecycle) {
         if (!foreground || !desiredForeground || closed) throw MobileFailure("network_unavailable")
-        api ?: run {
+        // Cleanup overflow can retire a transport independently of Activity lifecycle. Never
+        // keep handing that terminal instance to manual, backoff or restored-network reads.
+        api?.takeUnless { it.isRetired } ?: run {
             val host = stored.host ?: throw MobileFailure("not_paired")
             HostApi(host.endpoint, host.deviceToken).also { api = it }
         }

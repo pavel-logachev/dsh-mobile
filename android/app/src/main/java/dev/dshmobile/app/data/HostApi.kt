@@ -29,6 +29,7 @@ import kotlin.coroutines.resumeWithException
 internal class HostApi(val endpoint: HostEndpoint, private val token: String? = null) {
     private val io = TransportIoOwner()
     private val retired = java.util.concurrent.atomic.AtomicBoolean()
+    internal val isRetired: Boolean get() = retired.get()
     private val admission = Any()
     private val relayProxy = endpoint.relay?.let { RelayLoopbackProxy(endpoint, io, ::close) }
     private val client: OkHttpClient = try { SecureTransport.client(endpoint, relayProxy) }
