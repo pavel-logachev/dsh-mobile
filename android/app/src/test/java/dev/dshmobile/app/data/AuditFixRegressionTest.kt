@@ -88,7 +88,16 @@ class AuditFixRegressionTest {
             repo.refresh()
             // Seven real loopback requests plus CI scheduling/TLS setup are not a
             // three-second contract. Still require exactly the six retry attempts.
-            withTimeout(15_000) { while (fixture.calls < 8) delay(5) }
+            var lastDiagnostic = ""
+            try {
+                withTimeout(15_000) {
+                    while (fixture.calls < 8) {
+                        val diagnostic = "calls=${fixture.calls}, attempts=${attempts.toList()}, state=${repo.state.value}"
+                        if (diagnostic != lastDiagnostic) { println("AND03 diagnostic: $diagnostic"); lastDiagnostic = diagnostic }
+                        delay(5)
+                    }
+                }
+            } finally { println("AND03 final: calls=${fixture.calls}, attempts=${attempts.toList()}, state=${repo.state.value}") }
             assertEquals(listOf(0, 1, 2, 3, 4, 5), attempts.toList())
             repo.leaveSession(); assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
         }
