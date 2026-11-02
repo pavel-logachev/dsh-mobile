@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,21 +12,31 @@ import type { HistoryRecord } from './fixtures/history-surface.ts';
 async function recovered(t: { after(fn: () => Promise<void>): void }, records: HistoryRecord[], firstSeq: number, running = false, pollIntervalMs = 1000) {
   const dir = realpathSync.native(await mkdtemp(join(tmpdir(), 'dsh-mobile-surface-')));
   const cursor = () => records.at(-1)!.event.seq;
-  let resumed = 0, closed = 0, observing = false;
+  let resumed = 0, closed = 0;
+  // Concurrent readers each own their opening iterator. Cold pagination requires
+  // its own opening closed, not every unrelated opening in the process closed.
+  const observation = new AsyncLocalStorage<{ observing: boolean }>();
   let disposed: (id: string) => void = () => {};
   let observe: (value: import('../src/dsh-adapter.ts').DshObservation) => void = () => {};
   const reads: { throughSeq: number; beforeSeq: number; maxMessages: number }[] = [];
   const values = { userQuestions: { active: [], settled: [] } };
   const controller = {
     async list() { return { items: [{ sessionId: 'synthetic-session', cwd: dir, updatedAt: 1700000000000, running, agentAvailable: running }] }; },
-    async *follow(_request: unknown, signal: AbortSignal) {
-      observing = true;
-      try { yield { type: 'snapshot', cursor: cursor(), hasMore: firstSeq > 0, records: records.slice(firstSeq), header: { id: 'synthetic-session', cwd: dir }, projections: { asOfSeq: cursor(), values }, assistantStream: { revision: 0 } }; resumed++; throw new Error('Reads must never promote a cold session'); }
-      finally { assert.equal(signal.aborted, true); closed++; observing = false; }
+    follow(_request: unknown, signal: AbortSignal) {
+      const owner = { observing: false };
+      // enterWith runs before readOpening awaits iterator.next, so that caller
+      // carries this exact opening into the subsequent page calls.
+      observation.enterWith(owner);
+      return (async function* () {
+        owner.observing = true;
+        try { yield { type: 'snapshot', cursor: cursor(), hasMore: firstSeq > 0, records: records.slice(firstSeq), header: { id: 'synthetic-session', cwd: dir }, projections: { asOfSeq: cursor(), values }, assistantStream: { revision: 0 } }; resumed++; throw new Error('Reads must never promote a cold session'); }
+        finally { assert.equal(signal.aborted, true); closed++; owner.observing = false; }
+      })();
     },
     async page(request: { throughSeq: number; beforeSeq: number; maxMessages: number }, signal: AbortSignal) {
       signal.throwIfAborted(); reads.push(request);
-      assert.equal(observing, false, 'close the opening observation before cold pagination to avoid retaining live buffered events');
+      assert.ok(observation.getStore(), 'pagination must belong to an opening observation');
+      assert.equal(observation.getStore()!.observing, false, 'close the opening observation before cold pagination to avoid retaining live buffered events');
       assert.equal(request.throughSeq, cursor(), 'backward reads must stay on the immutable opening cut');
       return historyPage(records, request.throughSeq, request.beforeSeq, request.maxMessages);
     },
@@ -231,7 +242,11 @@ test('late settlement of an abandoned page cannot replace or delete a fresh same
   try {
     await newReading; settleOld(); await new Promise<void>(resolve => setImmediate(resolve));
     const other = h.adapter.snapshot('synthetic-session', AbortSignal.timeout(2000));
-    await new Promise<void>(resolve => setImmediate(resolve)); releaseNew();
+    // Resolving workspace paths performs real fs I/O. A single event-loop turn
+    // does not establish that the second reader joined the held recovery.
+    const flights = (h.adapter as unknown as { historyFlights: Map<string, { waiters: Set<unknown> }> }).historyFlights;
+    while (flights.get('synthetic-session')?.waiters.size !== 2) await new Promise<void>(resolve => setImmediate(resolve));
+    releaseNew();
     const snapshots = await Promise.all([wanted, other]);
     assert.ok(snapshots.every(snapshot => snapshot.messages.length === 64));
     assert.equal(h.reads.length, 4, 'only the abandoned first page plus one shared three-page recovery');
