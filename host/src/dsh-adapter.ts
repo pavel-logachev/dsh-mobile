@@ -1058,7 +1058,13 @@ export class DshAdapter implements HostAdapter {
   }
   async mutateSession(sessionId: string, mutation: SessionMutation, signal: AbortSignal, expectedWorkspaceId: string): Promise<void> {
     const active = this.signal(signal), c = this.options.sessionController;
-    const { view } = await this.permitted(sessionId, active, expectedWorkspaceId);
+    // Answers target one waiting question. Use the same fresh header authority as
+    // prompt admission instead of scanning every persisted session twice.
+    const pointAnswer = mutation.kind === 'answer' && this.options.sessionHeader;
+    const authority = pointAnswer ? await this.pointScope(sessionId, active) : undefined;
+    const legacy = authority ? undefined : await this.permitted(sessionId, active, expectedWorkspaceId);
+    const view = authority?.view ?? legacy!.view;
+    if (authority && authority.workspaceId !== expectedWorkspaceId) throw new HostError('not_found');
     active.throwIfAborted(); this.checkCurrent(view, sessionId);
     try {
       switch (mutation.kind) {
@@ -1074,7 +1080,12 @@ export class DshAdapter implements HostAdapter {
         case 'answer': {
           const snapshot = await this.snapshot(sessionId, active), pending = snapshot.pendingQuestions?.find(q => q.callId === mutation.callId);
           if (!pending) throw new HostError('question_expired'); const answer = mutationAnswer(mutation, pending); validateAnswer(pending, answer);
-          await this.permitted(sessionId, active, expectedWorkspaceId); active.throwIfAborted(); this.checkCurrent(view, sessionId);
+          if (authority) {
+            const fresh = await this.pointScope(sessionId, active);
+            if (fresh.workspaceId !== expectedWorkspaceId) throw new HostError('not_found');
+            this.checkLifecycle(sessionId, authority.revision);
+          } else await this.permitted(sessionId, active, expectedWorkspaceId);
+          active.throwIfAborted(); this.checkCurrent(view, sessionId);
           if (this.options.questionBridge?.answer(sessionId, mutation.callId, answer)) return;
           if (pending.state !== 'continued' || !await this.options.answerContinued?.(sessionId, mutation.callId, answer)) throw new HostError('question_expired');
         }

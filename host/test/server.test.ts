@@ -126,6 +126,37 @@ test('prompt admission bypasses a five-second catalog and retains point authoriz
   assert.equal(prompts, 1);
 });
 
+test('answer admission and settlement bypass the catalog with fresh point authority', { timeout: 10000 }, async t => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'answer-latency-'))), frame = structuredClone(opening);
+  frame.header.cwd = dir;
+  frame.projections.values.userQuestions.active = [{ callId: 'call', state: 'continued', questions: [{ id: 'q', question: 'Pick', options: [{ label: 'Yes' }] }] }] as any;
+  let lists = 0, answers = 0;
+  const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', workspaces: [{ id: 'alpha', name: 'Alpha', path: dir }],
+    sessionHeader: async () => frame.header, sessionStatus: () => ({ running: true, updatedAt: 0 }),
+    questionBridge: { pending: () => [], settled: () => [], answer: () => false, close() {} },
+    answerContinued: async () => { answers++; return true; },
+    sessionController: {
+      async list() { lists++; return { items: [{ sessionId: 'session-fixture', cwd: dir, running: true, updatedAt: 0, agentAvailable: true }] }; },
+      async *follow() { yield structuredClone(frame); }, async page() { throw Error('unexpected page'); }, async projections() { return frame.projections; },
+      async prompt() { throw Error('unexpected prompt'); }, async create() { throw Error('unexpected create'); }, cancel() {},
+    },
+  });
+  t.after(() => { adapter.dispose(); rmSync(dir, { recursive: true, force: true }); });
+  const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
+  const body = { requestId: randomUUID(), callId: 'call', answer: { answers: [{ id: 'q', selected: ['Yes'] }] } };
+  const start = performance.now();
+  const response = await request('/sessions/session-fixture/answers', deviceToken, 'POST', body);
+  const receipt = await response.json();
+  assert.equal(response.status, 200); assert.equal(receipt.status, 'accepted'); assert.equal(answers, 1);
+  assert.equal(lists, 0, 'answer must not scan every persisted session before resolving the waiter');
+  t.diagnostic(JSON.stringify({ answerMs: performance.now() - start, lists, answers }));
+  assert.equal((await request('/sessions/session-fixture/answers', deviceToken, 'POST', body)).status, 200);
+  assert.equal(answers, 1, 'receipt replay never redispatches');
+  frame.header.cwd = join(dir, 'missing');
+  assert.equal((await request('/sessions/session-fixture/answers', deviceToken, 'POST', { ...body, requestId: randomUUID() })).status, 404);
+  assert.equal(answers, 1, 'fresh point scope still rejects moved sessions');
+});
+
 test('SSE admission validates and publishes the first watch snapshot without a separate reconstruction', async t => {
   const adapter = new TestAdapter(); let snapshots = 0, watches = 0;
   const get = adapter.snapshot.bind(adapter);

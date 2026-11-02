@@ -250,6 +250,44 @@ test('failure scope uses fresh point headers, hides missing/child/archive and in
   assert.equal(h.cleanup().resumed, 0); assert.equal(h.cleanup().closed, 0);
 });
 
+test('answer point authority rechecks scope and lifecycle across an awaited question snapshot', async t => {
+  const h = await harness(t);
+  let archived: string[] = [], header: any = h.frame.header;
+  let registry = { list: () => [{ id: 'alpha', path: h.alpha, title: 'Alpha', async status() { return 'ok' as const; } }], get archivedSessionIds() { return archived; } };
+  const source = await createWorkspaceSource({ workspaceSource: 'dsh-registry' }, () => registry);
+  let entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let disposed: ((id: string) => void) | undefined, answers = 0;
+  const question = { callId: 'call', state: 'open' as const, questions: [{ id: 'q', question: 'Pick', options: [{ label: 'Yes' }], multiSelect: false, allowFreeText: true }] };
+  const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', workspaceSource: source,
+    sessionHeader: async () => header, sessionStatus: () => ({ running: true, updatedAt: 0 }),
+    sessionController: { ...h.controller, async list() { throw Error('Answer scanned the catalog'); }, async *follow() { entered.resolve(); await release.promise; yield structuredClone(h.frame); } },
+    questionBridge: { pending: () => [question], settled: () => [], answer: () => { answers++; return true; }, close() {} },
+    events: { subscribe: () => () => {}, subscribeDisposed: listener => { disposed = listener; return () => {}; } },
+  });
+  t.after(() => { release.resolve(); adapter.dispose(); });
+  const mutation = { kind: 'answer' as const, callId: 'call', answer: { answers: [{ id: 'q', selected: ['Yes'] }] } };
+  for (const boundary of ['moved', 'child', 'missing', 'archive', 'provider', 'disposed', 'abort']) {
+    entered = Promise.withResolvers<void>(); release = Promise.withResolvers<void>();
+    const abort = new AbortController();
+    const pending = adapter.mutateSession('session-fixture', mutation, abort.signal, 'alpha');
+    const rejected = assert.rejects(pending, boundary === 'abort' || boundary === 'disposed' ? { name: 'AbortError' } : { code: 'not_found' });
+    await entered.promise;
+    if (boundary === 'moved') header = { ...h.frame.header, cwd: h.dir };
+    if (boundary === 'child') header = { ...h.frame.header, origin: 'subagent' };
+    if (boundary === 'missing') header = undefined;
+    if (boundary === 'archive') archived = ['session-fixture'];
+    if (boundary === 'provider') registry = { ...registry };
+    if (boundary === 'disposed') disposed!('session-fixture');
+    if (boundary === 'abort') abort.abort();
+    release.resolve(); await rejected;
+    assert.equal(answers, 0, `${boundary} cannot reach the bridge`);
+    header = h.frame.header; archived = [];
+  }
+  release.resolve();
+  await adapter.mutateSession('session-fixture', mutation, new AbortController().signal, 'alpha');
+  assert.equal(answers, 1, 'fresh valid authority still resolves the bridge');
+});
+
 test('registry sessions map by canonical cwd, hide archived/missing roots, and create uses live admission scope', async t => {
   const h = await harness(t);
   const beta = join(h.dir, 'beta'); await mkdir(beta);

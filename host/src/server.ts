@@ -195,7 +195,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         await checkScope(deviceId, command.workspaceId, true, command.operation !== 'create');
         controller.signal.throwIfAborted();
         if (command.operation !== 'create') {
-          const snapshot = await sessionSnapshot(command.sessionId, deviceId, controller.signal, command.operation !== 'prompt');
+          const snapshot = await sessionSnapshot(command.sessionId, deviceId, controller.signal, command.operation !== 'prompt' && !(command.operation === 'mutate' && command.mutation.kind === 'answer'));
           controller.signal.throwIfAborted();
           if (snapshot.session.workspaceId !== command.workspaceId) throw new HostError('forbidden');
           if (command.operation === 'cancel' && (!snapshot.session.running || snapshot.cursor !== command.expectedCursor)) throw new HostError('conflict');
@@ -371,9 +371,9 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     throw error;
   }
   async function sessionSnapshot(sessionId: string, deviceId: string, signal: AbortSignal, catalogPreflight = true): Promise<HostSnapshot> {
-    // Non-prompt mutations retain their independent catalog preflight. Prompts
-    // and point observation use the adapter's fresh opening header, not a
-    // complete corpus scan (rc.2 reads every persisted header on list()).
+    // Other mutations retain their independent catalog preflight. Prompts,
+    // answers and point observation use the adapter's fresh opening header,
+    // not a complete corpus scan (list() reads every persisted header).
     const session = catalogPreflight ? await permittedSession(sessionId, deviceId, signal) : undefined;
     let snapshot: HostSnapshot;
     try { snapshot = await adapter.snapshot(sessionId, signal); }
@@ -811,7 +811,7 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         if (typeof body.workspaceId !== 'string' || (body.presetId !== undefined && (typeof body.presetId !== 'string' || !body.presetId || body.presetId.length > 256 || /[\x00-\x1f\x7f]/.test(body.presetId)))) throw new HostError('invalid_request');
         command = { operation: 'create', requestId, workspaceId: body.workspaceId, ...(body.presetId !== undefined ? { presetId: body.presetId as string } : {}) };
       } else if (segments.length === 3) {
-        const snapshot = await sessionSnapshot(segments[1]!, device.deviceId, signal, operation !== 'prompt');
+        const snapshot = await sessionSnapshot(segments[1]!, device.deviceId, signal, operation !== 'prompt' && mutation?.kind !== 'answer');
         await checkScope(device.deviceId, snapshot.session.workspaceId, true, true);
         if (state.getCommand(device.deviceId, requestId)) { await replay(); return; }
         const base = { requestId, sessionId: segments[1]!, workspaceId: snapshot.session.workspaceId };
