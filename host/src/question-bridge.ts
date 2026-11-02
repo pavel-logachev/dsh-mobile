@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { HostError } from './errors.ts';
 import { questionsOf, validateAnswer } from './phone.ts';
-import type { PendingQuestion, QuestionAnswer } from './phone.ts';
+import type { PendingQuestion, QuestionAnswer, ResolvedQuestion } from './phone.ts';
+import { settledQuestions } from './phone-projection.ts';
 
 export interface QuestionServices {
   answer(agent: unknown, callId: string, answer: QuestionAnswer): boolean;
@@ -9,6 +10,7 @@ export interface QuestionServices {
 export interface QuestionBridge {
   answer(sessionId: string, callId: string, answer: QuestionAnswer): boolean;
   pending(sessionId: string): PendingQuestion[];
+  settled(sessionId: string): ResolvedQuestion[];
   close(): void;
 }
 /** Competes with (never invokes or impersonates) the ordinary desktop answerer.
@@ -16,6 +18,10 @@ export interface QuestionBridge {
  */
 export function createQuestionBridge(on: (listener: (request: any, next: () => Promise<QuestionAnswer>) => Promise<QuestionAnswer>) => () => unknown): QuestionBridge {
   const pending = new Map<string, { sessionId: string; question: PendingQuestion; resolve: (value: QuestionAnswer) => void; reject: (error: unknown) => void }>();
+  // Legacy completions have no upstream projection. Keep only the wire whitelist,
+  // in completion order: twenty per session and 128 across the whole bridge.
+  const settled = new Map<string, { sessionId: string; question: ResolvedQuestion }>();
+  let closed = false;
   const dispose = on(async (request, next) => {
     // The legacy tool supplies no wait metadata. Its blocking request can use
     // a bridge-local handle; only timed/continued questions need the tool call ID.
@@ -35,16 +41,27 @@ export function createQuestionBridge(on: (listener: (request: any, next: () => P
         if (error?.code !== 'NO_PROVIDER') throw error;
         return answer.promise;
       });
-      return await Promise.race([answer.promise, desktop]);
+      const result = await Promise.race([answer.promise, desktop]);
+      if (request.wait === undefined && !closed) {
+        const question = settledQuestions([{ callId, answers: result.answers }])[0];
+        if (question) {
+          settled.set(key, { sessionId, question: structuredClone(question) });
+          const sessionKeys = [...settled].filter(([, entry]) => entry.sessionId === sessionId).map(([id]) => id);
+          if (sessionKeys.length > 20) settled.delete(sessionKeys[0]!);
+          if (settled.size > 128) settled.delete(settled.keys().next().value!);
+        }
+      }
+      return result;
     } finally { pending.delete(key); request.signal.removeEventListener('abort', aborted); }
   });
   return {
     pending(sessionId) { return [...pending.values()].filter(p => p.sessionId === sessionId).map(p => p.question); },
+    settled(sessionId) { return structuredClone([...settled.values()].filter(p => p.sessionId === sessionId).map(p => p.question)); },
     answer(sessionId, callId, answer) {
       const key = JSON.stringify([sessionId, callId]), entry = pending.get(key);
       if (!entry) return false;
       validateAnswer(entry.question, answer); pending.delete(key); entry.resolve(answer); return true;
     },
-    close() { dispose(); for (const entry of pending.values()) entry.reject(new HostError('unavailable')); pending.clear(); },
+    close() { closed = true; dispose(); for (const entry of pending.values()) entry.reject(new HostError('unavailable')); pending.clear(); settled.clear(); },
   };
 }

@@ -1016,7 +1016,16 @@ export class DshAdapter implements HostAdapter {
   private phoneSnapshot(transcript: Transcript): HostSnapshot {
     const snapshot = transcript.phoneSnapshot();
     const phone = phoneProjections.get(transcript);
-    snapshot.model = phone?.model ?? null; snapshot.resolvedQuestions = phone?.resolvedQuestions ?? [];
+    snapshot.model = phone?.model ?? null;
+    // Append live bridge completions to the projection baseline, so a full
+    // projection cannot hide a newly answered legacy question. On overlap keep
+    // the projection's content, but count the call only once.
+    const projected = new Map((phone?.resolvedQuestions ?? []).map(q => [q.callId, q]));
+    const settled = new Map(projected);
+    for (const question of this.options.questionBridge?.settled(snapshot.session.id) ?? []) {
+      settled.delete(question.callId); settled.set(question.callId, projected.get(question.callId) ?? question);
+    }
+    snapshot.resolvedQuestions = [...settled.values()].slice(-20);
     snapshot.session = { ...snapshot.session, model: snapshot.model };
     snapshot.messages = snapshot.messages.map(m => { const delivery = m.role === 'user' ? phone?.delivery(m.id) : undefined; return delivery ? { ...m, delivery } : m; });
     const live = this.options.questionBridge?.pending(snapshot.session.id) ?? [];

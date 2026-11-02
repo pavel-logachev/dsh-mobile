@@ -7,6 +7,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { attachmentRefs, questionsOf } from '../src/phone.ts';
 import { createDshAdapter } from '../src/dsh-adapter.ts';
+import { createQuestionBridge, type QuestionBridge } from '../src/question-bridge.ts';
 import { opening, summary, requestId } from './fixtures/rc2.ts';
 import { legacyModule } from './fixtures/legacy-module.ts';
 import { createRequire } from 'node:module';
@@ -77,7 +78,7 @@ test('installed FileUploads seeds empty and legacy receipt budgets through its r
   });
 });
 
-async function setup(t: any, hooks: { pollIntervalMs?: number; beforeFollow?: () => Promise<void>; events?: import('../src/dsh-adapter.ts').DshAdapterOptions['events']; fileUploads?: import('../src/dsh-adapter.ts').DshAdapterOptions['fileUploads']; resolveAgent?: () => Promise<{ agent: unknown }>; attachments?: import('../src/dsh-adapter.ts').DshAdapterOptions['attachments'] } = {}) {
+async function setup(t: any, hooks: { questionBridge?: QuestionBridge; pollIntervalMs?: number; beforeFollow?: () => Promise<void>; events?: import('../src/dsh-adapter.ts').DshAdapterOptions['events']; fileUploads?: import('../src/dsh-adapter.ts').DshAdapterOptions['fileUploads']; resolveAgent?: () => Promise<{ agent: unknown }>; attachments?: import('../src/dsh-adapter.ts').DshAdapterOptions['attachments'] } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'phone-adapter-'))); await mkdir(join(root, 'w'));
   const frame: any = structuredClone(opening); frame.header.cwd = join(root, 'w');
   const row = { ...structuredClone(summary), cwd: frame.header.cwd, running: true };
@@ -86,10 +87,128 @@ async function setup(t: any, hooks: { pollIntervalMs?: number; beforeFollow?: ()
   let answered: any;
   // Synthetic services start with an inspectable empty upstream inventory.
   if (hooks.fileUploads && !Reflect.get(hooks.fileUploads, Symbol.for('cordis.original'))) Object.assign(hooks.fileUploads, { stagedFiles: new WeakMap(), ctx: { sessions: { list: () => [] } } });
-  const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', events: hooks.events, pollIntervalMs: hooks.pollIntervalMs ?? 60000, workspaces: [{ id: 'w', name: 'Synthetic', path: frame.header.cwd }], sessionController: { ...controller, ...(hooks.resolveAgent ? { resolveAgent: hooks.resolveAgent } : {}) }, modelInfo: async () => ({ inputModalities: ['text', 'image'] }), questionBridge: { pending: () => [], answer: () => false, close() {} }, answerContinued: async (...args) => { answered = args; return true; }, fileUploads: { ...{ stagedFiles: new WeakMap(), ctx: { sessions: { list: () => [] } } }, async uploadStream(r) { let size = 0; for await (const data of r.data) size += data.length; return { receiptId: 'receipt', file: { attachmentId: 'file', name: r.name!, bytes: size } }; } }, ...(hooks.fileUploads ? { fileUploads: hooks.fileUploads } : {}), attachments: { async validateImage(r) { assert.equal(r.mediaType, 'image/png'); }, async *readFileStream(ref) { assert.equal(ref.attachmentId, 'file'); assert.equal(ref.name, 'synthetic.txt'); yield Buffer.from('abc'); } }, ...(hooks.attachments ? { attachments: hooks.attachments } : {}) });
+  const adapter = await createDshAdapter({ dshVersion: '0.2.0-rc.2', events: hooks.events, pollIntervalMs: hooks.pollIntervalMs ?? 60000, workspaces: [{ id: 'w', name: 'Synthetic', path: frame.header.cwd }], sessionController: { ...controller, ...(hooks.resolveAgent ? { resolveAgent: hooks.resolveAgent } : {}) }, modelInfo: async () => ({ inputModalities: ['text', 'image'] }), questionBridge: hooks.questionBridge ?? { pending: () => [], settled: () => [], answer: () => false, close() {} }, answerContinued: async (...args) => { answered = args; return true; }, fileUploads: { ...{ stagedFiles: new WeakMap(), ctx: { sessions: { list: () => [] } } }, async uploadStream(r) { let size = 0; for await (const data of r.data) size += data.length; return { receiptId: 'receipt', file: { attachmentId: 'file', name: r.name!, bytes: size } }; } }, ...(hooks.fileUploads ? { fileUploads: hooks.fileUploads } : {}), attachments: { async validateImage(r) { assert.equal(r.mediaType, 'image/png'); }, async *readFileStream(ref) { assert.equal(ref.attachmentId, 'file'); assert.equal(ref.name, 'synthetic.txt'); yield Buffer.from('abc'); } }, ...(hooks.attachments ? { attachments: hooks.attachments } : {}) });
   t.after(async () => { adapter.dispose(); await rm(root, { recursive: true, force: true }); });
   return { adapter, frame, row, calls, answered: () => answered, signal: new AbortController().signal };
 }
+
+function questionHarness(t: any) {
+  let listener: any;
+  const bridge = createQuestionBridge(fn => { listener = fn; return () => {}; });
+  t.after(() => bridge.close());
+  const answers = [{ id: 'q', selected: ['Yes'] }];
+  const start = (sessionId: string, options: { signal?: AbortSignal; callId?: string; desktop?: () => Promise<unknown> } = {}) => {
+    const promise = listener({ agent: { session: { id: sessionId } }, questions: [{ id: 'q', question: 'Pick', options: [{ label: 'Yes' }] }], signal: options.signal ?? new AbortController().signal, ...(options.callId ? { wait: { callId: options.callId } } : {}) }, options.desktop ?? (() => new Promise(() => {})));
+    return { promise, callId: bridge.pending(sessionId).at(-1)!.callId };
+  };
+  return { bridge, start, answers };
+}
+
+for (const skip of [false, true]) test(`legacy phone ${skip ? 'skip' : 'answer'} remains settled in a reopened phone snapshot`, async t => {
+  const { bridge, start, answers } = questionHarness(t);
+  const { adapter, row, signal } = await setup(t, { questionBridge: bridge });
+  const request = start(row.sessionId);
+  const pending = await adapter.snapshot(row.sessionId, signal);
+  assert.equal(pending.pendingQuestions!.at(-1)!.callId, request.callId);
+  await adapter.mutateSession(row.sessionId, skip ? { kind: 'answer', callId: request.callId, skip: true } : { kind: 'answer', callId: request.callId, answer: { answers } }, signal, 'w');
+  const expected = skip ? [{ id: 'q', selected: [] }] : answers;
+  assert.deepEqual(await request.promise, { answers: expected });
+  const snapshot = await adapter.snapshot(row.sessionId, signal);
+  assert.deepEqual(snapshot.pendingQuestions, []);
+  assert.deepEqual(snapshot.resolvedQuestions, [{ callId: request.callId, outcome: skip ? 'skipped' : 'answered', answers: expected }]);
+});
+
+test('legacy desktop winner is settled under the handle shown to the phone', async t => {
+  const { bridge, start, answers } = questionHarness(t);
+  const { adapter, row, signal } = await setup(t, { questionBridge: bridge });
+  let release!: (value: unknown) => void;
+  const desktop = new Promise(resolve => { release = resolve; });
+  const request = start(row.sessionId, { desktop: () => desktop });
+  assert.equal((await adapter.snapshot(row.sessionId, signal)).pendingQuestions![0]!.callId, request.callId);
+  release({ answers, private: 'not-phone-metadata' }); await request.promise;
+  assert.equal(bridge.answer(row.sessionId, request.callId, { answers }), false);
+  assert.deepEqual((await adapter.snapshot(row.sessionId, signal)).resolvedQuestions, [{ callId: request.callId, outcome: 'answered', answers }]);
+});
+
+test('legacy cancellation, desktop error and close without an answer do not settle', async t => {
+  const { bridge, start } = questionHarness(t);
+  const { adapter, row, signal } = await setup(t, { questionBridge: bridge });
+  const abort = new AbortController(), cancelled = start(row.sessionId, { signal: abort.signal });
+  const rejected = assert.rejects(cancelled.promise, { name: 'AbortError' });
+  abort.abort(); await rejected;
+  const failed = start(row.sessionId, { desktop: async () => { throw new Error('desktop failure'); } });
+  await assert.rejects(failed.promise, /desktop failure/);
+  const closing = start(row.sessionId), closed = assert.rejects(closing.promise, { code: 'unavailable' });
+  bridge.close(); await closed;
+  assert.deepEqual((await adapter.snapshot(row.sessionId, signal)).resolvedQuestions, []);
+});
+
+test('legacy history merges unique projection entries unchanged and stays at twenty latest entries', async t => {
+  const { bridge, start, answers } = questionHarness(t);
+  const { adapter, frame, row, signal } = await setup(t, { questionBridge: bridge });
+  const handles: string[] = [];
+  for (let i = 0; i < 21; i++) {
+    const request = start(row.sessionId); handles.push(request.callId);
+    assert.equal(bridge.answer(row.sessionId, request.callId, { answers }), true); await request.promise;
+  }
+  assert.deepEqual(bridge.settled(row.sessionId).map(q => q.callId), handles.slice(1), 'bridge storage itself, not only the snapshot, is bounded');
+  let snapshot = await adapter.snapshot(row.sessionId, signal);
+  assert.deepEqual(snapshot.resolvedQuestions!.map(q => q.callId), handles.slice(1));
+  // Projection wins an overlap; the older projection baseline is evicted before recent bridge answers.
+  frame.projections.values.userQuestions = { settled: [
+    { callId: handles[20], answers: [{ id: 'q', selected: [] }], private: 'not-phone-metadata' },
+    { callId: 'projection-only', answers },
+  ] };
+  snapshot = await adapter.snapshot(row.sessionId, signal);
+  assert.equal(snapshot.resolvedQuestions!.length, 20);
+  assert.equal(new Set(snapshot.resolvedQuestions!.map(q => q.callId)).size, 20);
+  assert.deepEqual(snapshot.resolvedQuestions!.find(q => q.callId === handles[20]), { callId: handles[20], outcome: 'skipped', answers: [{ id: 'q', selected: [] }] });
+  assert.equal(snapshot.resolvedQuestions!.some(q => q.callId === 'projection-only'), false);
+  assert.equal(snapshot.resolvedQuestions!.some(q => q.callId === handles[1]), true);
+  assert.doesNotMatch(JSON.stringify(snapshot.resolvedQuestions), /not-phone-metadata/);
+});
+
+test('a full settled projection cannot hide a newly answered legacy question', async t => {
+  const { bridge, start, answers } = questionHarness(t);
+  const { adapter, frame, row, signal } = await setup(t, { questionBridge: bridge });
+  frame.projections.values.userQuestions = { settled: [{ callId: 'projection-only', answers }] };
+  assert.deepEqual((await adapter.snapshot(row.sessionId, signal)).resolvedQuestions, [{ callId: 'projection-only', outcome: 'answered', answers }]);
+  frame.projections.values.userQuestions = { settled: Array.from({ length: 20 }, (_, i) => ({ callId: `projected-${i}`, answers })) };
+  assert.equal((await adapter.snapshot(row.sessionId, signal)).resolvedQuestions!.length, 20);
+  const request = start(row.sessionId); bridge.answer(row.sessionId, request.callId, { answers }); await request.promise;
+  const resolved = (await adapter.snapshot(row.sessionId, signal)).resolvedQuestions!;
+  assert.equal(resolved.length, 20);
+  assert.deepEqual(resolved[0], { callId: 'projected-1', outcome: 'answered', answers });
+  assert.deepEqual(resolved.at(-1), { callId: request.callId, outcome: 'answered', answers });
+});
+
+test('legacy settled memory is globally bounded, session isolated and cleared on close', async t => {
+  const { bridge, start, answers } = questionHarness(t);
+  const { adapter, row, signal } = await setup(t, { questionBridge: bridge });
+  const first = start(row.sessionId); bridge.answer(row.sessionId, first.callId, { answers }); await first.promise;
+  assert.equal((await adapter.snapshot(row.sessionId, signal)).resolvedQuestions!.length, 1);
+  for (let i = 0; i < 128; i++) {
+    const request = start(`other-${i}`); bridge.answer(`other-${i}`, request.callId, { answers }); await request.promise;
+  }
+  assert.deepEqual((await adapter.snapshot(row.sessionId, signal)).resolvedQuestions, []);
+  const last = start(row.sessionId); bridge.answer(row.sessionId, last.callId, { answers }); await last.promise;
+  assert.equal((await adapter.snapshot(row.sessionId, signal)).resolvedQuestions!.length, 1);
+  bridge.close();
+  assert.deepEqual((await adapter.snapshot(row.sessionId, signal)).resolvedQuestions, []);
+});
+
+test('timed questions still settle only from the authoritative projection', async t => {
+  const { bridge, start, answers } = questionHarness(t);
+  const { adapter, frame, row, signal } = await setup(t, { questionBridge: bridge });
+  const phone = start(row.sessionId, { callId: 'timed-phone' });
+  bridge.answer(row.sessionId, phone.callId, { answers }); await phone.promise;
+  const desktop = start(row.sessionId, { callId: 'timed-desktop', desktop: async () => ({ answers }) }); await desktop.promise;
+  const abort = new AbortController(), cancelled = start(row.sessionId, { callId: 'timed-abort', signal: abort.signal });
+  const rejected = assert.rejects(cancelled.promise, { name: 'AbortError' }); abort.abort(); await rejected;
+  assert.deepEqual((await adapter.snapshot(row.sessionId, signal)).resolvedQuestions, []);
+  frame.projections.values.userQuestions = { settled: [{ callId: 'timed-phone', answers }] };
+  assert.deepEqual((await adapter.snapshot(row.sessionId, signal)).resolvedQuestions, [{ callId: 'timed-phone', outcome: 'answered', answers }]);
+});
 
 test('list carries blank, empty localized title and open or continued question status', async t => {
   const { adapter, row, frame, signal } = await setup(t);

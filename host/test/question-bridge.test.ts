@@ -51,6 +51,8 @@ test('real legacy ask_user_question exposes distinct mobile waits and returns th
     assert.equal(bridge.pending(agent.session.id).length, 1);
     desktop[1]!(answer); assert.deepEqual(await second, answer);
     assert.equal(bridge.pending(agent.session.id).length, 0, 'desktop winner retires the phone handle');
+    assert.deepEqual(bridge.settled(agent.session.id), pending.map(q => ({ callId: q.callId, outcome: 'answered', answers: answer.answers })));
+    assert.deepEqual(bridge.settled('other-session'), []);
     const abort = new AbortController();
     const cancelled = execute('legacy-abort', abort.signal);
     const rejected = assert.rejects(cancelled, { code: 'ASK_ABORTED' });
@@ -83,6 +85,50 @@ test('legacy handles stay local, reject malformed requests and retire on bridge 
   bridge.close(); await rejected;
   assert.equal(bridge.answer('session', handle, answer), false);
   assert.deepEqual(bridge.pending('session'), []);
+});
+
+test('legacy winner stays answered after abort and late desktop cannot overwrite it', async t => {
+  let listener: any, release!: (value: typeof answer) => void;
+  const bridge = createQuestionBridge(fn => { listener = fn; return () => {}; }); t.after(() => bridge.close());
+  const abort = new AbortController(), desktop = new Promise<typeof answer>(resolve => { release = resolve; });
+  const request = listener({ agent: { session: { id: 'session' } }, questions: question.questions, signal: abort.signal }, () => desktop);
+  const callId = bridge.pending('session')[0]!.callId;
+  assert.equal(bridge.answer('session', callId, answer), true);
+  abort.abort(); await request;
+  release({ answers: [{ id: 'q', selected: ['B'] }] }); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(bridge.settled('session'), [{ callId, outcome: 'answered', answers: answer.answers }]);
+});
+
+test('abort and close cannot acquire settled history from late resolutions', async () => {
+  for (const cancel of ['abort', 'close'] as const) {
+    let listener: any, release!: (value: typeof answer) => void;
+    const bridge = createQuestionBridge(fn => { listener = fn; return () => {}; });
+    const abort = new AbortController(), desktop = new Promise<typeof answer>(resolve => { release = resolve; });
+    const request = listener({ agent: { session: { id: 'session' } }, questions: question.questions, signal: abort.signal }, () => desktop);
+    const rejected = assert.rejects(request);
+    if (cancel === 'abort') abort.abort(); else bridge.close();
+    await rejected; release(answer); await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(bridge.settled('session'), []); bridge.close();
+  }
+  // A phone promise can be fulfilled before close, while its continuation has not run.
+  let listener: any;
+  const bridge = createQuestionBridge(fn => { listener = fn; return () => {}; });
+  const request = listener({ agent: { session: { id: 'session' } }, questions: question.questions, signal: new AbortController().signal }, () => new Promise(() => {}));
+  bridge.answer('session', bridge.pending('session')[0]!.callId, answer); bridge.close();
+  await request; assert.deepEqual(bridge.settled('session'), []);
+});
+
+test('legacy history copies the settled whitelist without changing Unicode or newline answer values', async t => {
+  let listener: any;
+  const bridge = createQuestionBridge(fn => { listener = fn; return () => {}; }); t.after(() => bridge.close());
+  const custom = '\uFEFFОтвет 😀\r\nLF\nCR\rвнутри\uFEFF', value = { answers: [{ id: 'q', selected: [], custom }] };
+  const request = listener({ agent: { session: { id: 'session' } }, questions: question.questions, signal: new AbortController().signal }, async () => ({ ...value, private: 'not-wire-data' }));
+  const callId = bridge.pending('session')[0]!.callId; await request;
+  value.answers[0]!.custom = 'changed upstream';
+  const history = bridge.settled('session');
+  assert.deepEqual(history, [{ callId, outcome: 'answered', answers: [{ id: 'q', selected: [], custom }] }]);
+  history[0]!.answers[0]!.custom = 'changed snapshot';
+  assert.equal(bridge.settled('session')[0]!.answers[0]!.custom, custom);
 });
 
 test('question answer validates IDs, labels, single/multiple selection and free text', () => {
