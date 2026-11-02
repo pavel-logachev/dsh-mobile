@@ -32,8 +32,11 @@ internal suspend fun postWatchAlert(context: Context, device: String, alert: Wat
     NotificationPosting.paced {
         // No suspension between permission/policy guard and platform notify.
         store.postIfCurrent(device, alert.key) {
-            if (watchAlertsAllowed(context)) context.getSystemService(NotificationManager::class.java).notify(tag, 2, notification)
-            else throw MobileFailure("notifications_blocked")
+            if (!watchAlertsAllowed(context)) throw MobileFailure("notifications_blocked")
+            val post = { context.getSystemService(NotificationManager::class.java).notify(tag, 2, notification) }
+            // Only successful completion is redundant while its chat is visible. Questions and
+            // failures retain their existing alert policy. The coordinator acknowledges either case.
+            if (alert.kind == "answer") visibleChat.postUnlessVisible(alert.sessionId, post) else post()
         }
     }
 }

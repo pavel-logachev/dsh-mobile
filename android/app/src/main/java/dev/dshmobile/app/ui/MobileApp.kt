@@ -63,6 +63,7 @@ private fun PairedApp(state: MobileState, model: MobileViewModel) {
     var backProgress by remember { mutableFloatStateOf(0f) }
     val motion = LocalMotionEnabled.current
     val savedScreens = rememberSaveableStateHolder()
+    VisibleChatEffect(sessionId.takeIf { route == "chat" && !newChat && !connection })
     // Home owns no chat stream/history projection; a restored chat resumes its read explicitly.
     LaunchedEffect(route) { if (route == "home") model.leaveSession() }
     LaunchedEffect(route, sessionId, state.connection, state.busy, state.observingSession, model.interactionBlocked, state.error) {
@@ -149,6 +150,26 @@ private fun PairedApp(state: MobileState, model: MobileViewModel) {
             newChat = false; beforeCreate = state.snapshot?.session?.id; creating = true; model.createSession(workspace, preset, model.newTaskText)
         })
     if (connection) ConnectionDetails(state, onDismiss = { connection = false }, onRefresh = model::refresh)
+}
+
+/** Only the foreground route owns visibility; outgoing AnimatedContent must not republish it. */
+@Composable
+private fun VisibleChatEffect(session: String?) {
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val token = remember { Any() }
+    DisposableEffect(lifecycle, session) {
+        fun publish() {
+            dev.dshmobile.app.data.visibleChat.show(token,
+                session.takeIf { lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) })
+        }
+        val observer = LifecycleEventObserver { _, _ -> publish() }
+        lifecycle.addObserver(observer)
+        publish()
+        onDispose {
+            lifecycle.removeObserver(observer)
+            dev.dshmobile.app.data.visibleChat.clear(token)
+        }
+    }
 }
 
 /** Navigation target as AnimatedContent state: the leaving chat keeps its own session id. */
