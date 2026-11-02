@@ -1025,6 +1025,8 @@ export class DshAdapter implements HostAdapter {
     for (const question of this.options.questionBridge?.settled(snapshot.session.id) ?? []) {
       settled.delete(question.callId); settled.set(question.callId, projected.get(question.callId) ?? question);
     }
+    // The wire projection packs this complete candidate list once, against the
+    // actual metadata/newest-message reserve; do not pre-trim away smaller records.
     snapshot.resolvedQuestions = [...settled.values()].slice(-20);
     snapshot.session = { ...snapshot.session, model: snapshot.model };
     snapshot.messages = snapshot.messages.map(m => { const delivery = m.role === 'user' ? phone?.delivery(m.id) : undefined; return delivery ? { ...m, delivery } : m; });

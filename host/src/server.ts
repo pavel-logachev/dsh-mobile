@@ -4,6 +4,7 @@ import { outcomeToken, unknownOutcome } from './prompt-outcomes.ts';
 import type { PromptOutcome, PromptLookup } from './prompt-outcomes.ts';
 import { safeFailure } from './failure.ts';
 import { sessionModel, settledQuestions, mutationAnswer } from './phone-projection.ts';
+import { snapshotSettledQuestions } from './question-history.ts';
 import { gzipSync } from 'node:zlib';
 import { HOST_VERSION, parseMutation, validateAnswer, UPLOAD_LIMIT, UPLOAD_MIMES, identifier, safeAttachmentRefs, safeQueue, questionsOf } from './phone.ts';
 import type { SessionMutation, PromptOptions, UploadedAttachment } from './phone.ts';
@@ -331,6 +332,16 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
     if (runningSubagents !== undefined && session.runningSubagents !== undefined && runningSubagents !== session.runningSubagents) throw new HostError('internal_error');
     const count = runningSubagents ?? session.runningSubagents;
     const result = { ...(snapshot.model !== undefined ? { model: sessionModel(snapshot.model) } : {}), ...(snapshot.resolvedQuestions !== undefined ? { resolvedQuestions: settledQuestions(snapshot.resolvedQuestions) } : {}), ...(snapshot.pendingQueue ? { pendingQueue: safeQueue(snapshot.pendingQueue).map(q => ({ ...q, ...(q.requestId ? { requestId: mobileId(q.requestId) } : {}) })) } : {}), ...(snapshot.pendingQuestions ? { pendingQuestions: questionsOf(snapshot.pendingQuestions) } : {}), ...(count !== undefined ? { runningSubagents: count } : {}), ...(activityDetail ? { activityDetail } : {}), session, messages, cursor: snapshot.cursor, hasMore: snapshot.hasMore === true || snapshot.messages.length > 100, activity: snapshot.activity, ...(snapshot.notice === HISTORY_CUT_NOTICE ? { notice: HISTORY_CUT_NOTICE } : snapshot.activity === 'unknown' || (snapshot.activity === 'waiting' && !snapshot.pendingQuestions?.length) ? { notice: 'Return to the desktop to check this task.' } : {}), ...(snapshot.failure !== undefined ? { failure: safeFailure(snapshot.failure) } : {}) };
+    // Reserve actual metadata + the newest complete message (and the possible
+    // history-cut notice) before packing answers. This also covers old oversized
+    // SQLite rows and alternate adapters; never let optional history poison reads.
+    if (result.resolvedQuestions !== undefined) {
+      const recent = { ...result, resolvedQuestions: [], messages: result.messages.slice(-1), hasMore: true,
+        notice: 'Only recent complete messages are shown; open the desktop for earlier history.' };
+      const reserve = Math.max(Buffer.byteLength(JSON.stringify(recent), 'utf8'),
+        Buffer.byteLength(JSON.stringify({ ...result, resolvedQuestions: [], messages: result.messages.slice(-1) }), 'utf8'));
+      result.resolvedQuestions = snapshotSettledQuestions(result.resolvedQuestions, 2 * 1024 * 1024 - reserve + 2);
+    }
     // Keep complete messages and Unicode intact. Observation is a bounded latest-history view.
     while (Buffer.byteLength(JSON.stringify(result), 'utf8') > 2 * 1024 * 1024) {
       if (result.messages.length <= 1) throw new HostError('payload_too_large');

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { DatabaseSync } from 'node:sqlite';
 import { createQuestionBridge } from '../src/question-bridge.ts';
-import { MemoryQuestionHistory } from '../src/question-history.ts';
+import { MemoryQuestionHistory, snapshotSettledQuestions } from '../src/question-history.ts';
 import { apply } from '../src/plugin.ts';
 import { HostState } from '../src/state.ts';
 import { opening, summary } from './fixtures/rc2.ts';
@@ -141,6 +141,99 @@ test('durable history rejects late settlements after close/abort, and a late des
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(state.settledQuestions(winner), winner === 'phone' ? [{ callId, outcome: 'answered', answers }] : []);
   }
+});
+
+test('four maximum desktop legacy completions cannot poison HTTP snapshots after SQLite reopen (review F1)', async t => {
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'legacy-byte-restart-'))), path = join(root, 'state.sqlite');
+  const frame = structuredClone(opening); frame.header.cwd = root;
+  const row = { ...structuredClone(summary), cwd: root };
+  const probe = createServer(); await new Promise<void>(resolve => probe.listen(0, '127.0.0.1', resolve));
+  const port = (probe.address() as { port: number }).port; await new Promise<void>(resolve => probe.close(() => resolve()));
+  let listener: any, dispose: (() => Promise<void>) | undefined;
+  const ctx: any = { sessionController: {
+    async list() { return { items: [row] }; }, async *follow() { yield structuredClone(frame); },
+    async page() { return {}; }, async projections() { return frame.projections; }, async resolveAgent() { return { agent: {} }; },
+  }, userQuestions: { answer() { return false; } }, on(name: string, fn: any) { if (name === 'user-questions/request') listener = fn; return () => {}; } };
+  const config = { dshVersion: '0.2.1-rc.5', hostName: 'Synthetic', bind: '127.0.0.1', port, allowInsecureLoopback: true,
+    statePath: path, workspaces: [{ id: 'w', name: 'Synthetic', path: root }] };
+  t.after(async () => { await dispose?.(); rmSync(root, { recursive: true, force: true }); });
+  dispose = await apply(ctx, config);
+  let state = new HostState(path);
+  const paired = state.consumePairing(state.createPairing({ readWorkspaceIds: ['w'], executeWorkspaceIds: [] }).pairingToken, 'Synthetic phone'); state.close();
+  const largeAnswers = Array.from({ length: 20 }, (_, i) => ({ id: `q${i}`, selected: [], custom: 'a'.repeat(32768) }));
+  for (let i = 0; i < 4; i++) {
+    const result = await listener({ agent: { session: { id: row.sessionId } }, questions: largeAnswers.map(a => ({ id: a.id, question: 'Synthetic' })), signal: new AbortController().signal }, async () => ({ answers: largeAnswers }));
+    assert.deepEqual(result, { answers: largeAnswers }, 'retention must not change the selected upstream answer');
+  }
+  await dispose(); dispose = undefined;
+  // The already-oversized database must remain readable without migration or deletion.
+  state = new HostState(path); const stored = state.settledQuestions(row.sessionId); state.close();
+  assert.equal(stored.length, 4);
+  const get = async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/sessions/${row.sessionId}`, { headers: { authorization: `Bearer ${paired.deviceToken}` } });
+    assert.equal(response.status, 200, 'bounded valid answer history must not make the session unreadable');
+    const body = await response.text(); assert.ok(Buffer.byteLength(body) <= 2 * 1024 * 1024); return JSON.parse(body);
+  };
+  dispose = await apply(ctx, config);
+  assert.deepEqual((await get()).resolvedQuestions, stored.slice(-1), 'only the newest complete record fits the 1MiB answer budget');
+  await dispose(); dispose = undefined;
+  const latest = frame.records.at(-2)!.event as any;
+  latest.data.message.content = [{ type: 'text', text: '🦊'.repeat(384 * 1024) }]; // 1.5MiB, one complete message.
+  dispose = await apply(ctx, config);
+  const snapshot = await get();
+  assert.deepEqual(snapshot.resolvedQuestions, [], 'history yields room for the newest complete message and metadata');
+  assert.equal(snapshot.messages.at(-1).text, latest.data.message.content[0].text);
+  await dispose(); dispose = undefined;
+  state = new HostState(path);
+  state.rememberSettledQuestion(row.sessionId, { callId: 'new-small', outcome: 'answered', answers });
+  state.close();
+  dispose = await apply(ctx, config);
+  const withSmall = await get();
+  assert.deepEqual(withSmall.resolvedQuestions, [{ callId: 'new-small', outcome: 'answered', answers }]);
+  assert.equal(withSmall.messages.at(-1).text, latest.data.message.content[0].text);
+  const response = await fetch(`http://127.0.0.1:${port}/v1/sessions/${row.sessionId}/events`, { headers: { authorization: `Bearer ${paired.deviceToken}` } });
+  assert.equal(response.status, 200);
+  const reader = response.body!.getReader();
+  let event = ''; const decoder = new TextDecoder();
+  try {
+    while (!event.includes('\n\n')) { const chunk = await reader.read(); assert.equal(chunk.done, false); event += decoder.decode(chunk.value!, { stream: true }); }
+    const data = event.split('\n').find(line => line.startsWith('data: '))!;
+    assert.deepEqual(JSON.parse(data.slice(6)).resolvedQuestions, withSmall.resolvedQuestions, 'SSE uses the same bounded projection');
+  } finally { await reader.cancel(); }
+});
+
+test('settled snapshot byte budget counts JSON escaping and multi-byte UTF-8 at the exact edge', () => {
+  // Independent hand-count: []=2, fixed record/answer JSON=84, custom adds 23
+  // bytes: quote/backslash/LF/CR/tab/backspace/formfeed=14, Cyrillic=2,
+  // astral=4, ASCII=1 and combining mark=2.
+  const custom = '"\\\n\r\t\b\fЯ🦊e\u0301';
+  const record = { callId: 'c', outcome: 'answered' as const, answers: [{ id: 'q', selected: [], custom }] };
+  const serializedBytes = Buffer.byteLength(JSON.stringify([record]), 'utf8');
+  assert.equal(serializedBytes, 109);
+  assert.deepEqual(snapshotSettledQuestions([record], 109), [record]);
+  assert.deepEqual(snapshotSettledQuestions([record], 108), []);
+  assert.deepEqual(snapshotSettledQuestions([record], 110), [record]);
+  assert.equal(snapshotSettledQuestions([record], 109)[0]!.answers[0]!.custom, custom);
+  assert.deepEqual(snapshotSettledQuestions([], 0), []);
+  assert.deepEqual(snapshotSettledQuestions([record], -1), []);
+  const control = { ...record, answers: [{ id: 'q', selected: [], custom: '\u0001' }] };
+  assert.equal(Buffer.byteLength(JSON.stringify([control])), 92, 'six-byte JSON control escape');
+  assert.deepEqual(snapshotSettledQuestions([control], 91), []);
+  assert.deepEqual(snapshotSettledQuestions([control], 92), [control]);
+  const old = { ...record, callId: 'a' }, newer = { ...record, callId: 'b' };
+  assert.deepEqual(snapshotSettledQuestions([old, newer], 216), [newer]);
+  assert.deepEqual(snapshotSettledQuestions([old, newer], 217), [old, newer], 'array comma is part of the budget');
+  const huge = { ...record, callId: 'large', answers: [{ id: 'q', selected: [], custom: 'x'.repeat(1024 * 1024) }] };
+  assert.deepEqual(snapshotSettledQuestions([old, huge, newer]), [old, newer], 'skip an unfit complete record, retain newest fitting records');
+  assert.equal(snapshotSettledQuestions(Array.from({ length: 21 }, (_, i) => ({ ...record, callId: String(i) }))).length, 20);
+  const exact = { ...record, answers: Array.from({ length: 16 }, (_, i) => ({ id: `q${i}`, selected: [], custom: i < 15 ? '"'.repeat(32768) : '' })) };
+  const padding = 1024 * 1024 - Buffer.byteLength(JSON.stringify([exact]));
+  exact.answers[15]!.custom = '"'.repeat(Math.floor(padding / 2)) + (padding % 2 ? 'a' : '');
+  assert.ok(Buffer.byteLength(exact.answers[15]!.custom) <= 32768);
+  assert.equal(Buffer.byteLength(JSON.stringify([exact])), 1024 * 1024);
+  assert.deepEqual(snapshotSettledQuestions([exact]), [exact]);
+  const over = structuredClone(exact); over.answers[15]!.custom += 'a';
+  assert.deepEqual(snapshotSettledQuestions([over], 2 * 1024 * 1024), [], '1MiB ceiling is enforced even if caller supplies a larger budget');
 });
 
 test('history write failure never changes an upstream answer, and a closed bridge does not touch storage', async () => {

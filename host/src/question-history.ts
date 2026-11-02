@@ -3,6 +3,24 @@ import type { ResolvedQuestion } from './phone.ts';
 export const LEGACY_ANSWER_TTL_MS = 24 * 60 * 60_000;
 export const LEGACY_ANSWERS_PER_SESSION = 20;
 export const LEGACY_ANSWERS_GLOBAL = 128;
+// At most half the 2MiB snapshot ceiling; the server further reserves actual
+// metadata and the newest full message before selecting whole answer records.
+export const SNAPSHOT_ANSWER_BYTES = 1024 * 1024;
+
+/** Newest-first packing, returned in completion order. Count JSON punctuation,
+ * escaping and UTF-8 bytes, never truncate an answer string or record. */
+export function snapshotSettledQuestions(questions: readonly ResolvedQuestion[], maxBytes = SNAPSHOT_ANSWER_BYTES): ResolvedQuestion[] {
+  const selected: ResolvedQuestion[] = [];
+  let bytes = 2; // []
+  const budget = Math.min(SNAPSHOT_ANSWER_BYTES, maxBytes);
+  for (let i = questions.length - 1; i >= Math.max(0, questions.length - LEGACY_ANSWERS_PER_SESSION); i--) {
+    const question = questions[i]!;
+    const size = Buffer.byteLength(JSON.stringify(question), 'utf8') + (selected.length ? 1 : 0);
+    if (bytes + size > budget) continue;
+    selected.push(question); bytes += size;
+  }
+  return selected.reverse();
+}
 
 /** Only normalized phone answers, keyed by session and opaque mobile call handle. */
 export interface QuestionHistory {
