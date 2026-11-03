@@ -21,7 +21,7 @@ test('0.9.0 retired feed returns existing not-found and preserves unavailable ca
     const response = await request(path, method, body); assert.equal(response.status, 404); assert.deepEqual(await response.json(), envelope);
   }
   const capabilities = await (await request('/capabilities')).json();
-  assert.equal(capabilities.hostVersion, '0.9.1'); assert.equal(capabilities.capabilities.notifications, false);
+  assert.equal(capabilities.hostVersion, '0.9.2'); assert.equal(capabilities.capabilities.notifications, false);
   assert.deepEqual(capabilities.notificationCapabilities, { version: 1, coverage: 'degraded', feed: false, unifiedPush: false, retentionMs: 604800000 });
   assert.equal(oldSourceCalls, 0);
   const db = new DatabaseSync(host.state.path); try { assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE name IN ('notification_state','notification_settings','host_migrations')").all(), []); } finally { db.close(); }

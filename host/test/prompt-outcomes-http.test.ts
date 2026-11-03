@@ -67,7 +67,7 @@ async function json(response: Response) { assert.equal(response.status, 200); re
 test('capabilities.promptOutcomes and HTTP 0/1/32/33 UUIDs, duplicates, case, non-UUID and order', async t => {
   const h = await setup(t), phone = h.pair(), ids = Array.from({ length: 33 }, () => randomUUID());
   const capabilities = await json(await h.request('/capabilities', phone.deviceToken));
-  assert.equal(capabilities.hostVersion, '0.9.1'); assert.equal(capabilities.capabilities.promptOutcomes, true);
+  assert.equal(capabilities.hostVersion, '0.9.2'); assert.equal(capabilities.capabilities.promptOutcomes, true);
   for (const values of [[], ids, ['not-uuid'], ['１２３４５６７８-0000-4000-8000-000000000001'], ['\uFEFF' + ids[0]], [ids[0] + '\r'], [ids[0]!.slice(0, 4) + '\uFEFF' + ids[0]!.slice(4)]]) {
     const response = await h.request(h.url(values), phone.deviceToken); assert.equal(response.status, 400); assert.equal((await response.json()).error.code, 'invalid_request');
   }
