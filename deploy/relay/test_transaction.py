@@ -32,7 +32,7 @@ class TransactionTests(unittest.TestCase):
         self.candidate.write_bytes(b"additive relay candidate\n")
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name in ("docker", "systemctl", "loginctl"):
+        for name in ("docker", "systemctl", "loginctl", "curl"):
             script = self.bin / name
             script.write_text("#!" + sys.executable + "\n" + (ROOT / "test_fake_commands.py").read_text())
             script.chmod(0o700)
@@ -81,6 +81,279 @@ class TransactionTests(unittest.TestCase):
         data = self.fake_state()
         change(data)
         self.fake.write_text(json.dumps(data))
+
+    def seed_existing_relay(self):
+        self.arm("initial")
+        self.run_cli("apply", "initial")
+        self.run_cli("commit", "initial", "--candidate-sha256", hashlib.sha256(self.candidate.read_bytes()).hexdigest())
+        self.old_id = "e" * 64
+        return self.fake_state()["containers"][self.old_id]
+
+    def update(self, **extra):
+        return self.run_cli("update", "t1", "--live", str(self.live),
+                            "--caddy-id", CADDY, "--caddy-name", "example-site-caddy",
+                            "--mount-source", str(self.mount), "--mount-dest", "/etc/caddy",
+                            "--caddy-path", "/etc/caddy/Caddyfile", "--old-id", self.old_id,
+                            "--image-id", "sha256:" + "f" * 64,
+                            "--website-url", "https://example.test/",
+                            "--relay-health-url", "https://example.test/dsh-mobile-relay/healthz", **extra)
+
+    def test_update_roundtrip_then_rollback_preserves_exact_old_identity_name_alias(self):
+        original = self.seed_existing_relay()
+        result = self.update()
+        self.assertIn("restore spec verified", result.stdout)
+        self.assertEqual(self.state()["phase"], "armed")
+        self.assertEqual(self.fake_state()["containers"][self.old_id], original)
+        self.run_cli("cutover", "t1")
+        self.assertEqual(self.fake_state()["containers"][self.old_id]["Name"], "/dsh-mobile-relay-rollback-t1")
+        self.run_cli("rollback", "t1")
+        old = self.fake_state()["containers"][self.old_id]
+        self.assertEqual(old["Name"], "/dsh-mobile-relay")
+        self.assertTrue(old["State"]["Running"])
+        self.assertEqual(old["NetworkSettings"]["Networks"], original["NetworkSettings"]["Networks"])
+        self.assertEqual(old["Config"], original["Config"])
+        self.assertEqual(old["HostConfig"], original["HostConfig"])
+        self.assertEqual(set(self.fake_state()["containers"]), {CADDY, self.old_id})
+        self.assertIn("dsh-mobile-relay-data", self.fake_state()["volumes"])
+        self.assertEqual(self.live.read_bytes(), self.candidate.read_bytes())
+
+    def test_update_refuses_non_roundtripping_spec_before_stopping_old(self):
+        self.seed_existing_relay()
+        self.change_fake(lambda d: d["containers"][self.old_id]["HostConfig"].update(ShmSize=123456))
+        self.update(ok=False)
+        self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+        self.assertFalse(any(c[:1] == ["stop"] for c in self.fake_state()["calls"]))
+        self.assertEqual(self.state()["phase"], "rolledback")
+        self.assertEqual(set(self.fake_state()["containers"]), {CADDY, self.old_id})
+
+    def test_update_failed_roundtrip_cleanup_can_retry_after_remove_failure(self):
+        self.seed_existing_relay()
+        self.change_fake(lambda d: d["containers"][self.old_id]["HostConfig"].update(ShmSize=123456))
+        self.change_fake(lambda d: d.update(fail=["rm"]))
+        self.update(ok=False)
+        self.assertEqual(self.state()["phase"], "rollingback")
+        self.change_fake(lambda d: d.update(fail=None))
+        self.run_cli("rollback", "t1")
+        self.assertEqual(self.state()["phase"], "rolledback")
+        self.assertEqual(set(self.fake_state()["containers"]), {CADDY, self.old_id})
+
+    def test_update_gates_commit_disarms_and_keeps_stopped_rollback(self):
+        self.seed_existing_relay()
+        self.update()
+        result = self.run_cli("cutover", "t1")
+        self.assertIn("Cutover UTC:", result.stdout)
+        self.assertTrue(self.state()["gates_passed"])
+        self.run_cli("commit", "t1", "--image-id", "sha256:" + "f" * 64)
+        self.assertEqual(self.state()["phase"], "committed")
+        self.assertFalse(self.fake_state()["timers"]["dsh-mobile-relay-rollback-t1.timer"])
+        self.assertFalse(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+        self.run_cli("rollback", "t1")
+        self.assertEqual(self.fake_state()["containers"]["9" * 64]["Name"], "/dsh-mobile-relay")
+
+    def test_update_failed_http_gate_rolls_back_immediately(self):
+        self.seed_existing_relay()
+        self.update()
+        self.change_fake(lambda d: d.update(http_status=503))
+        self.run_cli("cutover", "t1", ok=False)
+        self.assertEqual(self.state()["phase"], "rolledback")
+        self.assertEqual(self.fake_state()["containers"][self.old_id]["Name"], "/dsh-mobile-relay")
+        self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+
+    def test_update_pinned_old_changed_refuses_cutover_without_stopping_it(self):
+        self.seed_existing_relay()
+        self.update()
+        self.change_fake(lambda d: d["containers"][self.old_id]["HostConfig"].update(Memory=123))
+        result = self.run_cli("cutover", "t1", ok=False)
+        self.assertIn("pinned old relay", result.stderr)
+        self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+        self.assertFalse(any(c[:1] == ["stop"] for c in self.fake_state()["calls"]))
+
+    def test_update_timer_snapshot_restores_after_cutover(self):
+        self.seed_existing_relay()
+        self.update()
+        self.run_cli("cutover", "t1")
+        unit = (self.home / ".config/systemd/user/dsh-mobile-relay-rollback-t1.service").read_text()
+        self.assertIn(str(self.txndir / "driver.py"), unit)
+        self.assertIn("--spec-sha256 " + self.state()["spec_sha256"], unit)
+        # Execute the exact service ExecStart at its recorded timer deadline.
+        # Fake systemd has no wall clock; rollback itself must not require an
+        # active/unexpired timer (including a missed persistent reboot deadline).
+        import shlex
+        command = shlex.split(next(line.split("=", 1)[1] for line in unit.splitlines() if line.startswith("ExecStart=")))
+        spec = json.loads((self.txndir / "spec.json").read_text())
+        harness = self.root / "expire.py"
+        harness.write_text("import runpy,sys,time\ntime.time=lambda: " + str(spec["deadline"] + 1) + "\nsys.argv=" + repr(command[1:]) + "\nrunpy.run_path(sys.argv[0],run_name='__main__')\n")
+        result = subprocess.run([sys.executable, str(harness)], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.state()["phase"], "rolledback")
+        self.assertEqual(self.fake_state()["containers"][self.old_id]["Name"], "/dsh-mobile-relay")
+
+    def test_update_cutover_and_rollback_crash_windows_are_retry_safe(self):
+        for action, cases in (("cutover", [["stop"], ["rename", "e" * 64], ["rename", "9" * 64], ["start", "9" * 64]]),
+                              ("rollback", [["stop", "9" * 64], ["rm", "9" * 64], ["rename", "e" * 64], ["start", "e" * 64]])):
+            for contains in cases:
+                for when in ("before", "after"):
+                    with self.subTest(action=action, command=contains, window=when):
+                        self.tearDown()
+                        self.setUp()
+                        self.seed_existing_relay()
+                        self.update()
+                        if action == "rollback":
+                            self.run_cli("cutover", "t1")
+                        proc, _ = self.spawn_barrier([action, "t1"], contains, when)
+                        self.kill_crash(proc)
+                        self.run_cli("rollback", "t1")
+                        old = self.fake_state()["containers"][self.old_id]
+                        self.assertEqual(old["Name"], "/dsh-mobile-relay")
+                        self.assertTrue(old["State"]["Running"])
+                        self.assertEqual(set(self.fake_state()["containers"]), {CADDY, self.old_id})
+                        self.assertEqual(self.state()["phase"], "rolledback")
+
+    def test_update_real_flock_orders_commit_and_timer_both_ways(self):
+        for winner in ("commit", "rollback"):
+            with self.subTest(winner=winner):
+                self.tearDown()
+                self.setUp()
+                self.seed_existing_relay()
+                self.update()
+                self.run_cli("cutover", "t1")
+                commit = ["commit", "t1", "--image-id", "sha256:" + "f" * 64]
+                first = commit if winner == "commit" else ["rollback", "t1"]
+                proc, release = self.spawn_barrier(first, ["systemctl", "show"] if winner == "commit" else ["stop"])
+                other = ["rollback", "t1"] if winner == "commit" else commit
+                loser = subprocess.Popen([sys.executable, str(ROOT / "transaction.py"), *other], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    time.sleep(0.2)
+                    self.assertIsNone(loser.poll())
+                    release.touch()
+                    out, err = proc.communicate(timeout=15)
+                    self.assertEqual(proc.returncode, 0, out + err)
+                    out, err = loser.communicate(timeout=15)
+                    self.assertEqual(loser.returncode, 0 if winner == "commit" else 1, out + err)
+                    self.assertEqual(self.state()["phase"], "committed" if winner == "commit" else "rolledback")
+                finally:
+                    release.touch()
+                    for child in (proc, loser):
+                        if child.poll() is None:
+                            child.kill()
+                            child.communicate()
+
+    def test_update_create_crash_and_parent_only_kill_are_recoverable(self):
+        for when in ("before", "after"):
+            for parent_only in (False, True):
+                with self.subTest(window=when, parent_only=parent_only):
+                    self.tearDown()
+                    self.setUp()
+                    self.seed_existing_relay()
+                    args = ["update", "t1", "--live", str(self.live), "--caddy-id", CADDY,
+                            "--caddy-name", "example-site-caddy", "--mount-source", str(self.mount),
+                            "--mount-dest", "/etc/caddy", "--caddy-path", "/etc/caddy/Caddyfile",
+                            "--old-id", self.old_id, "--image-id", "sha256:" + "f" * 64,
+                            "--website-url", "https://example.test/", "--relay-health-url", "https://example.test/healthz"]
+                    proc, release = self.spawn_barrier(args, ["create"], when)
+                    if not parent_only:
+                        self.kill_crash(proc)
+                        self.run_cli("rollback", "t1")
+                    else:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                        watcher = subprocess.Popen([sys.executable, str(ROOT / "transaction.py"), "rollback", "t1"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        try:
+                            time.sleep(0.2)
+                            self.assertIsNone(watcher.poll())
+                            release.touch()
+                            proc.communicate(timeout=10)
+                            out, err = watcher.communicate(timeout=15)
+                            self.assertEqual(watcher.returncode, 0, out + err)
+                        finally:
+                            release.touch()
+                            if watcher.poll() is None:
+                                watcher.kill()
+                                watcher.communicate()
+                    self.assertEqual(self.state()["phase"], "rolledback")
+                    self.assertEqual(set(self.fake_state()["containers"]), {CADDY, self.old_id})
+                    self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+
+    def test_update_health_other_ids_and_deadline_failures_restore_old(self):
+        for cause in ("health", "other-id", "timer"):
+            with self.subTest(cause=cause):
+                self.tearDown()
+                self.setUp()
+                self.seed_existing_relay()
+                self.update()
+                if cause == "health":
+                    self.change_fake(lambda d: d.update(start_health="unhealthy"))
+                    self.run_cli("cutover", "t1", ok=False)
+                elif cause == "other-id":
+                    self.change_fake(lambda d: d["containers"].update({"8" * 64: {"Id": "8" * 64, "Name": "/unrelated"}}))
+                    self.run_cli("cutover", "t1", ok=False)
+                else:
+                    self.run_cli("cutover", "t1")
+                    self.change_fake(lambda d: d["timers"].update({"dsh-mobile-relay-rollback-t1.timer": False}))
+                    self.run_cli("commit", "t1", "--image-id", "sha256:" + "f" * 64, ok=False)
+                self.assertEqual(self.state()["phase"], "rolledback")
+                self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+
+    def test_update_rejects_bad_cli_inputs_without_container_mutation(self):
+        self.seed_existing_relay()
+        base = ["update", "t1", "--live", str(self.live), "--caddy-id", CADDY,
+                "--caddy-name", "example-site-caddy", "--mount-source", str(self.mount),
+                "--mount-dest", "/etc/caddy", "--caddy-path", "/etc/caddy/Caddyfile",
+                "--old-id", self.old_id, "--image-id", "sha256:" + "f" * 64,
+                "--website-url", "https://example.test/", "--relay-health-url", "https://example.test/healthz"]
+        cases = [("--image-id", ""), ("--image-id", "sha256:" + "f" * 63),
+                 ("--old-id", "e" * 64 + "\n"), ("--website-url", "http://example.test/"),
+                 ("--website-url", "https://example.test/?secret=value"),
+                 ("--website-url", "https://name:pass@example.test/"),
+                 ("--live", str(self.home / "../caddy/Caddyfile"))]
+        for flag, value in cases:
+            with self.subTest(flag=flag, value=value):
+                args = list(base)
+                args[args.index(flag) + 1] = value
+                before = self.fake_state()["containers"]
+                self.run_cli(*args, ok=False)
+                self.assertEqual(self.fake_state()["containers"], before)
+        for delay in ("0", "-1", "999999999999999999999", "１", "600\r"):
+            self.run_cli(*base, "--delay", delay, ok=False)
+        for txn in ("", "../x", "t1\n", "тест", "x" * 49, "\ufefft1"):
+            args = list(base)
+            args[1] = txn
+            self.run_cli(*args, ok=False)
+        self.assertFalse(self.txndir.exists())
+
+    def test_update_caddy_drift_retains_guard_and_never_clobbers_file(self):
+        self.seed_existing_relay()
+        self.update()
+        self.live.write_bytes(b"unrelated change\n")
+        self.run_cli("cutover", "t1", ok=False)
+        self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+        self.assertEqual(self.live.read_bytes(), b"unrelated change\n")
+        self.assertTrue(self.fake_state()["timers"]["dsh-mobile-relay-rollback-t1.timer"])
+        self.live.write_bytes(self.candidate.read_bytes())
+        self.run_cli("rollback", "t1")
+
+    def test_update_wrong_spec_pin_and_corrupt_state_never_trigger_cleanup(self):
+        self.seed_existing_relay()
+        self.update()
+        before = self.fake_state()["containers"]
+        self.run_cli("cutover", "t1", "--spec-sha256", "0" * 64, ok=False)
+        self.assertEqual(self.fake_state()["containers"], before)
+        self.assertEqual(self.state()["phase"], "armed")
+        original = (self.txndir / "state.json").read_bytes()
+        changed = self.state()
+        changed["schema"] = 99
+        (self.txndir / "state.json").write_text(json.dumps(changed))
+        self.run_cli("cutover", "t1", ok=False)
+        self.assertEqual(self.fake_state()["containers"], before)
+        (self.txndir / "state.json").write_bytes(original)
+        self.run_cli("rollback", "t1")
+
+    def test_new_cutover_command_refuses_schema_one_without_mutation(self):
+        self.arm()
+        result = self.run_cli("cutover", "t1", ok=False)
+        self.assertIn("unsupported for first deployment", result.stderr)
+        self.assertEqual(self.state()["phase"], "armed")
+        self.assertEqual(self.fake_state()["networks"], {})
 
     def test_arm_pins_bytes_and_second_active_transaction_is_refused(self):
         self.arm()

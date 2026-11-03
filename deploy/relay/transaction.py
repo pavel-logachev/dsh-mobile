@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Bounded first additive relay deployment. Linux/Python3 standard library only.
+"""Bounded additive deployment and existing-relay container image update.
+
+Linux/Python3 standard library only (Docker, systemd and curl are external tools).
 
 One persistent flock serializes arming, forward mutations, commit and rollback.
 Immutable spec/bytes + write-ahead intents make interrupted operations recoverable.
 No SSH, generic updater, shell sourcing, existing Compose edits or volume deletion.
+Schema 1 is first deployment; schema 2 retains the old container for rollback.
 """
 import argparse
 import base64
@@ -23,6 +26,32 @@ import sys
 import tempfile
 import time
 import uuid
+import urllib.parse
+
+# Schema 2 adds container replacement without changing schema-1 deployment state.
+UPDATE_SPEC_KEYS = {"schema", "txn", "home", "live", "original_sha256", "caddy_id", "caddy_name", "mount_source", "mount_dest", "caddy_path", "baseline_networks", "image_id", "old_id", "old_spec", "caddy_spec", "other_ids", "nonce", "deadline", "tools", "driver_sha256", "website_url", "relay_health_url"}
+UPDATE_STATE_KEYS = {"schema", "spec_sha256", "phase", "new_intent", "new_id", "cutover_at", "gates_passed"}
+
+
+def run_spec(obj):
+    """Pin full Engine run configuration, excluding only image selection/name.
+
+    Docker's generated endpoint IDs/IPs and State are lifecycle output, not run
+    input. Preserve explicit aliases; Docker adds the current name/short ID.
+    """
+    cfg = dict(obj["Config"])
+    cfg.pop("Image", None)
+    cfg.pop("Hostname", None)  # Engine-generated container hostname is identity.
+    host = dict(obj["HostConfig"])
+    host.pop("NetworkMode", None)  # Pinned separately alongside endpoint inputs.
+    mounts = obj["Mounts"]
+    networks = {}
+    for name, endpoint in obj["NetworkSettings"]["Networks"].items():
+        aliases = sorted(set(endpoint.get("Aliases") or []) - {obj["Id"][:12]})
+        networks[name] = {"NetworkID": endpoint.get("NetworkID"), "Aliases": aliases,
+                          "IPAMConfig": endpoint.get("IPAMConfig"), "Links": endpoint.get("Links"),
+                          "DriverOpts": endpoint.get("DriverOpts"), "GwPriority": endpoint.get("GwPriority", 0)}
+    return {"image_id": obj["Image"], "config": cfg, "hostname": obj["Config"].get("Hostname"), "host": host, "network_mode": obj["HostConfig"].get("NetworkMode"), "mounts": mounts, "networks": networks}
 
 NETWORK = "dsh-mobile-relay-internal"
 RELAY = "dsh-mobile-relay"
@@ -195,6 +224,7 @@ class Driver:
                 need(time.monotonic() < until, "global lock budget exhausted; guard remains armed")
                 time.sleep(0.05)
         self.spec = self.state = None
+        self.update_loaded = False
         self.tools = None
         self.operation_deadline = time.monotonic() + 180
 
@@ -259,6 +289,9 @@ class Driver:
         spec_hash = read_file(self.dir / "spec.sha256", True).decode().strip()
         need(HEX.fullmatch(spec_hash) and digest(raw) == spec_hash and (pin is None or pin == spec_hash), "immutable spec hash changed")
         s = strict_json(raw)
+        if isinstance(s, dict) and s.get("schema") == 2:
+            self.load_update(txn, s, spec_hash)
+            return
         need(isinstance(s, dict) and set(s) == SPEC_KEYS and s["schema"] == 1 and s["txn"] == txn and s["home"] == str(self.home), "invalid spec schema/identity")
         for key in ("original_sha256", "candidate_sha256", "caddy_id", "driver_sha256"):
             need(isinstance(s[key], str) and HEX.fullmatch(s[key]), "invalid spec digest/ID")
@@ -545,6 +578,274 @@ class Driver:
         self.disarm()
         print("Rolled back; original config verified; only owned resources removed; durable volume retained")
 
+    def load_update(self, txn, spec, spec_hash):
+        need(set(spec) == UPDATE_SPEC_KEYS and spec["txn"] == txn and spec["home"] == str(self.home), "invalid update spec")
+        for key in ("original_sha256", "caddy_id", "old_id", "driver_sha256"):
+            need(isinstance(spec[key], str) and HEX.fullmatch(spec[key]), "invalid update ID/hash")
+        need(type(spec["deadline"]) is int and re.fullmatch(r"[a-f0-9]{32}", spec["nonce"]), "invalid update deadline/nonce")
+        for key in ("live", "mount_source", "mount_dest", "caddy_path"):
+            safe_path(spec[key])
+        self.site_paths(spec["mount_source"])
+        need(set(spec["tools"]) == {"docker", "systemctl", "loginctl", "python", "curl"}, "invalid update tools")
+        for value in spec["tools"].values():
+            check_chain(safe_path(value))
+        self.spec, self.tools = spec, spec["tools"]
+        self.state = strict_json(read_file(self.dir / "state.json", True, 16384))
+        need(set(self.state) == UPDATE_STATE_KEYS and self.state["schema"] == 2 and self.state["spec_sha256"] == spec_hash and self.state["phase"] in ACTIVE | {"committed", "rolledback"}, "invalid update state")
+        need(type(self.state["new_intent"]) is bool and type(self.state["gates_passed"]) is bool and (self.state["new_id"] is None or isinstance(self.state["new_id"], str) and HEX.fullmatch(self.state["new_id"]) and self.state["new_intent"]), "invalid update intent")
+        self.update_bytes()
+        self.update_loaded = True
+
+    def update_bytes(self):
+        need(digest(read_file(self.dir / "driver.py", True)) == self.spec["driver_sha256"], "update rollback driver changed")
+        need(digest(read_file(self.dir / "original.Caddyfile", True)) == self.spec["original_sha256"], "update Caddy snapshot changed")
+
+    def update_caddy(self):
+        obj = self.objects("inspect", self.spec["caddy_id"])
+        # Pin identity, startup, complete mounts and networks without storing env.
+        actual = {k: obj.get(k) for k in ("Id", "Name", "Path", "Args", "Mounts")}
+        actual["networks"] = {k: v.get("NetworkID") for k, v in obj["NetworkSettings"]["Networks"].items()}
+        need(actual == self.spec["caddy_spec"] and obj["State"]["Running"] is True, "update pinned Caddy changed")
+        need(digest(read_file(Path(self.spec["live"]))) == self.spec["original_sha256"], "update live Caddy hash changed")
+        mounted = self.docker("exec", obj["Id"], "sha256sum", self.spec["caddy_path"]).stdout.decode().split()
+        need(mounted and mounted[0] == self.spec["original_sha256"], "update mounted Caddy hash changed")
+
+    def update_guard(self):
+        need(self.state["phase"] in {"armed", "applying", "applied"}, "update is not mutable")
+        need(time.time() + 35 < self.spec["deadline"], "update rollback deadline reached/too close")
+        self.run("systemctl", "--user", "is-active", "--quiet", self.timer())
+        value = self.run("systemctl", "--user", "show", self.timer(), "--property=NextElapseUSecRealtime", "--value").stdout.decode().strip()
+        expected = dt.datetime.fromtimestamp(self.spec["deadline"], dt.timezone.utc).strftime("%a %Y-%m-%d %H:%M:%S UTC")
+        need(value == expected, "update timer deadline changed")
+        self.update_bytes()
+        self.update_caddy()
+
+    def update_names(self):
+        return RELAY + "-candidate-" + self.spec["txn"] + "-" + self.spec["nonce"][:12], RELAY + "-rollback-" + self.spec["txn"]
+
+    def update_object(self, identity):
+        if identity is None or not any(d.get("ID") == identity for d in self.listed("container")):
+            return None
+        obj = self.objects("inspect", identity)
+        need(obj["Id"] == identity, "update exact container ID changed")
+        return obj
+
+    def update_old(self):
+        obj = self.update_object(self.spec["old_id"])
+        need(obj is not None and obj["Name"] in {"/" + RELAY, "/" + self.update_names()[1]} and run_spec(obj) == self.spec["old_spec"], "pinned old relay run spec/name changed")
+        return obj
+
+    def update_new_spec(self, obj):
+        actual = run_spec(obj)
+        # Engine may leave NetworkID empty until the candidate's first start.
+        if obj["State"].get("Status") == "created" and not obj["State"].get("Running"):
+            endpoint = actual["networks"].get(NETWORK, {})
+            if endpoint.get("NetworkID") == "":
+                endpoint["NetworkID"] = self.spec["old_spec"]["networks"][NETWORK]["NetworkID"]
+        # A candidate's autogenerated name is not an explicit service alias.
+        endpoint = actual["networks"].get(NETWORK, {})
+        endpoint["Aliases"] = sorted(set(endpoint.get("Aliases", [])) - {self.update_names()[0]})
+        expected = strict_json(encoded(self.spec["old_spec"]))
+        expected["image_id"] = self.spec["image_id"]
+        need(actual == expected, "candidate run spec does not round-trip to pinned old spec")
+
+    def update_new(self):
+        if not self.state["new_intent"]:
+            return None
+        identity = self.state["new_id"]
+        if identity is None:
+            # Exact unpredictable name was absent at arm, with durable create intent.
+            item = self.named("container", self.update_names()[0])
+            if item is None:
+                return None
+            identity = item["ID"]
+        obj = self.update_object(identity)
+        if obj is not None:
+            need(obj["Name"] in {"/" + self.update_names()[0], "/" + RELAY}, "candidate name changed")
+            if self.state["new_id"] is None:
+                need(obj["Name"] == "/" + self.update_names()[0] and obj["Image"] == self.spec["image_id"] and obj["State"].get("Status") == "created" and obj["State"].get("Running") is False and obj["Config"].get("Labels") == self.spec["old_spec"]["config"].get("Labels"), "unrecorded candidate identity differs")
+                self.state["new_id"] = obj["Id"]
+                self.save()
+            self.update_new_spec(obj)
+        return obj
+
+    def update_arm(self, args):
+        need(TX.fullmatch(args.txn) and HEX.fullmatch(args.old_id) and re.fullmatch(r"sha256:[a-f0-9]{64}", args.image_id) and 60 <= args.delay <= 3600, "invalid update input")
+        for prior in self.transactions.iterdir():
+            need(prior.is_dir() and not prior.is_symlink(), "unexpected transaction entry")
+            state = strict_json(read_file(prior / "state.json", True, 16384))
+            need(state.get("phase") in {"committed", "rolledback"}, "another transaction is active; recover it first")
+        self.dir = self.transactions / args.txn
+        need(not self.dir.exists(), "transaction ID already used")
+        self.site_paths(args.mount_source)
+        live = check_chain(safe_path(args.live))
+        need(live.is_relative_to(self.home) and live.parent == safe_path(args.mount_source) and Path(args.caddy_path).parent == safe_path(args.mount_dest) and live.name == Path(args.caddy_path).name, "invalid update Caddy mapping")
+        self.tools = {name: str(check_chain(Path(shutil.which(name) or "missing").resolve())) for name in ("docker", "systemctl", "loginctl", "curl")}
+        self.tools["python"] = str(check_chain(Path(sys.executable).resolve()))
+        old = self.objects("inspect", args.old_id)
+        need(old["Id"] == args.old_id and old["Name"] == "/" + RELAY and old["State"].get("Running") is True and old["State"].get("Health", {}).get("Status") == "healthy", "existing relay not pinned/running/healthy")
+        self.spec = {"image_id": old["Image"]}
+        self.hardening(old)
+        self.spec = None
+        old_spec = run_spec(old)
+        need(set(old_spec["networks"]) == {NETWORK} and RELAY in old_spec["networks"][NETWORK]["Aliases"], "old relay requires explicit production alias")
+        network = self.objects("network", "inspect", NETWORK)
+        need(network["Id"] == old_spec["networks"][NETWORK]["NetworkID"] and network["Internal"] is True and network["Driver"] == "bridge" and set(network["Containers"]) == {args.old_id, args.caddy_id}, "existing relay topology differs")
+        caddy = self.objects("inspect", args.caddy_id)
+        need(caddy["Id"] == args.caddy_id and caddy["Name"] == "/" + args.caddy_name and caddy["Path"] == "caddy" and caddy["Args"] == ["run", "--config", args.caddy_path, "--adapter", "caddyfile"], "update Caddy identity/startup differs")
+        matches = [m for m in caddy["Mounts"] if m.get("Destination") == args.mount_dest]
+        need(len(matches) == 1 and matches[0].get("Type") == "bind" and matches[0].get("Source") == args.mount_source and matches[0].get("RW") is False, "update Caddy bind differs")
+        image = self.objects("image", "inspect", args.image_id)
+        need(image["Id"] == args.image_id and args.image_id != old["Image"] and image["Config"].get("User") == "10001:10001" and image["Config"].get("Entrypoint") == ["node", "dist/cli.js"], "update image identity/user/entrypoint differs")
+        for url in (args.website_url, args.relay_health_url):
+            parsed = urllib.parse.urlsplit(url)
+            need(parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment, "gate URL must be nonsecret HTTPS URL")
+        need(self.run("loginctl", "show-user", pwd.getpwuid(os.getuid()).pw_name, "--property=Linger", "--value").stdout.strip() == b"yes", "update requires user lingering")
+        original, code = read_file(live), read_file(Path(__file__).resolve())
+        caddy_spec = {k: caddy.get(k) for k in ("Id", "Name", "Path", "Args", "Mounts")}
+        caddy_spec["networks"] = {k: v.get("NetworkID") for k, v in caddy["NetworkSettings"]["Networks"].items()}
+        self.spec = dict(schema=2, txn=args.txn, home=str(self.home), live=str(live), original_sha256=digest(original), caddy_id=args.caddy_id, caddy_name=args.caddy_name, mount_source=args.mount_source, mount_dest=args.mount_dest, caddy_path=args.caddy_path, baseline_networks=caddy_spec["networks"], image_id=args.image_id, old_id=args.old_id, old_spec=old_spec, caddy_spec=caddy_spec, other_ids={d["Names"]: d["ID"] for d in self.listed("container") if d["ID"] != args.old_id}, nonce=uuid.uuid4().hex, deadline=int(time.time()) + args.delay, tools=self.tools, driver_sha256=digest(code), website_url=args.website_url, relay_health_url=args.relay_health_url)
+        for name in self.update_names():
+            need(self.named("container", name) is None, "update temporary/rollback name already exists")
+        self.state = dict(schema=2, spec_sha256=digest(encoded(self.spec)), phase="arming", new_intent=False, new_id=None, cutover_at=None, gates_passed=False)
+        self.update_caddy()
+        private_dir(self.dir)
+        for name, data in (("original.Caddyfile", original), ("driver.py", code), ("spec.json", encoded(self.spec)), ("spec.sha256", (self.state["spec_sha256"] + "\n").encode())):
+            exclusive(self.dir / name, data)
+        exclusive(self.dir / "state.json", encoded(self.state), 0o600)
+        self.update_loaded = True
+        service = self.timer().replace(".timer", ".service")
+        deadline = dt.datetime.fromtimestamp(self.spec["deadline"], dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        exclusive(self.units / service, ("[Unit]\nDescription=DSH Mobile image-update rollback\n[Service]\nType=oneshot\nEnvironment=TZ=UTC\nExecStart=" + self.tools["python"] + " " + str(self.dir / "driver.py") + " --home " + str(self.home) + " rollback " + args.txn + " --spec-sha256 " + self.state["spec_sha256"] + "\nTimeoutStartSec=300\nRestart=on-failure\nRestartSec=10s\n").encode(), 0o600)
+        exclusive(self.units / self.timer(), ("[Unit]\nDescription=DSH Mobile independent image-update deadline\n[Timer]\nOnCalendar=" + deadline + "\nAccuracySec=1s\nRandomizedDelaySec=0\nPersistent=true\nUnit=" + service + "\n[Install]\nWantedBy=timers.target\n").encode(), 0o600)
+        self.run("systemctl", "--user", "daemon-reload")
+        self.run("systemctl", "--user", "enable", "--now", self.timer())
+        self.state["phase"] = "armed"
+        self.save()
+        self.update_guard()
+        self.state["new_intent"] = True
+        self.save()
+        # Same policy as first deployment; compare the *entire* effective spec after
+        # create. Any extra/changed setting is refused before stopping the old relay.
+        cmd = ["create", "--name", self.update_names()[0], "--network", old_spec["network_mode"] or network["Id"], "--init", "--user", "10001:10001", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--memory", "512m", "--cpus", "0.5", "--pids-limit", "128", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777", "--mount", "type=volume,source=" + VOLUME + ",target=/data", "--health-cmd", 'node -e "' + HEALTH + '"', "--health-interval", "10s", "--health-timeout", "3s", "--health-retries", "3", "--health-start-period", "10s", "--restart", "unless-stopped", "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3"]
+        for alias in old_spec["networks"][NETWORK]["Aliases"]:
+            cmd.extend(["--network-alias", alias])
+        for key, value in (old["Config"].get("Labels") or {}).items():
+            cmd.extend(["--label", key + "=" + value])
+        for value in old["Config"].get("Env") or []:
+            cmd.extend(["--env", value])
+        for flag, key in (("--hostname", "Hostname"), ("--workdir", "WorkingDir"), ("--stop-signal", "StopSignal")):
+            if old["Config"].get(key):
+                cmd.extend([flag, old["Config"][key]])
+        created = self.docker(*cmd, args.image_id, *CMD).stdout.decode().strip()
+        need(HEX.fullmatch(created), "create did not return exact candidate ID; inspect before retry")
+        self.state["new_id"] = created
+        self.save()
+        self.update_new()
+        print("Update armed; restore spec verified by full candidate round-trip; old relay remains running; deadline=" + deadline)
+
+    def cutover(self):
+        need(self.state["phase"] == "armed", "cutover is single-shot; interrupted cutover must rollback")
+        self.update_guard()
+        old = self.update_old()
+        need(old["Name"] == "/" + RELAY and old["State"].get("Running") is True, "old relay changed before cutover")
+        new = self.update_new()
+        need(new is not None and new["State"].get("Status") == "created", "candidate missing/already started")
+        # Re-pin immediately before the first working-path mutation.
+        old = self.update_old()
+        need(old["State"].get("Running") is True, "old relay stopped before cutover")
+        self.state["phase"] = "applying"
+        self.state["cutover_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        self.save()
+        print("Cutover UTC: " + self.state["cutover_at"], flush=True)
+        self.docker("stop", "--time", "10", old["Id"])
+        self.docker("rename", old["Id"], self.update_names()[1])
+        self.update_guard()
+        self.docker("rename", new["Id"], RELAY)
+        self.docker("start", new["Id"])
+        self.state["phase"] = "applied"
+        self.save()
+        self.update_check()
+
+    def update_check(self):
+        need(self.state["phase"] == "applied", "update gates require applied transaction")
+        self.update_guard()
+        old, new = self.update_old(), self.update_new()
+        need(old["Name"] == "/" + self.update_names()[1] and not old["State"].get("Running") and new is not None and new["Name"] == "/" + RELAY, "update cutover identities differ")
+        until = time.monotonic() + 45
+        while new["State"].get("Health", {}).get("Status") == "starting" and time.monotonic() < until:
+            time.sleep(1)
+            new = self.update_new()
+            need(new is not None, "candidate disappeared")
+        need(new["State"].get("Running") is True and new["State"].get("Health", {}).get("Status") == "healthy", "update health gate failed")
+        for url in (self.spec["website_url"], self.spec["relay_health_url"]):
+            result = self.run("curl", "--fail", "--silent", "--output", "/dev/null", "--write-out", "%{http_code}", "--max-time", "10", url)
+            need(result.stdout.strip() == b"200", "update HTTPS gate failed")
+        current = {d["Names"]: d["ID"] for d in self.listed("container") if d["ID"] not in {self.spec["old_id"], self.state["new_id"]}}
+        need(current == self.spec["other_ids"], "other container IDs changed")
+        network = self.objects("network", "inspect", NETWORK)
+        need(network["Id"] == self.spec["old_spec"]["networks"][NETWORK]["NetworkID"] and network["Internal"] is True and set(network["Containers"]) == {self.spec["caddy_id"], new["Id"]}, "update network gate failed")
+        self.state["gates_passed"] = True
+        self.save()
+        print("Update gates passed; cutover UTC=" + self.state["cutover_at"] + "; WSS canary unverified; host reconnect must be checked separately before commit")
+
+    def update_commit(self, image_id):
+        need(image_id == self.spec["image_id"], "commit requires exact update image ID")
+        if self.state["phase"] == "committed":
+            self.disarm()
+            return
+        self.update_check()
+        need(time.time() < self.spec["deadline"], "deadline won update commit race")
+        self.state["phase"] = "committed"
+        self.save()
+        self.disarm()
+        print("Update committed; rollback container retained stopped; timer disarmed")
+
+    def update_rollback(self):
+        if self.state["phase"] in {"committed", "rolledback"}:
+            self.disarm()
+            return
+        self.update_bytes()
+        self.update_caddy()
+        old = self.update_old()
+        # Before cutover, a newly-created candidate may fail full round-trip.
+        # Exact returned ID + unpredictable absent-at-arm name + never-started
+        # state allow its cleanup without accepting the mismatched restore spec.
+        if self.state["cutover_at"] is None and self.state["new_intent"]:
+            identity = self.state["new_id"]
+            if identity is None:
+                item = self.named("container", self.update_names()[0])
+                identity = item["ID"] if item else None
+            new = self.update_object(identity)
+            if new:
+                need(new["Name"] == "/" + self.update_names()[0] and new["Image"] == self.spec["image_id"] and new["State"].get("Status") == "created" and new["State"].get("Running") is False and new["Config"].get("Labels") == self.spec["old_spec"]["config"].get("Labels"), "pre-cutover candidate identity changed")
+                self.state["new_id"] = new["Id"]
+        else:
+            new = self.update_new()
+        production = self.named("container", RELAY)
+        need(production is None or production["ID"] in {old["Id"], self.state["new_id"]}, "unrelated container owns production name")
+        self.state["phase"] = "rollingback"
+        self.save()
+        if new:
+            if new["State"].get("Running"):
+                self.docker("stop", "--time", "10", new["Id"])
+            need(not self.objects("inspect", new["Id"])["State"].get("Running"), "candidate did not stop")
+            self.docker("rm", new["Id"])
+        if old["Name"] != "/" + RELAY:
+            self.docker("rename", old["Id"], RELAY)
+        if not old["State"].get("Running"):
+            self.docker("start", old["Id"])
+        restored = self.update_old()
+        until = time.monotonic() + 45
+        while restored["State"].get("Health", {}).get("Status") == "starting" and time.monotonic() < until:
+            time.sleep(1)
+            restored = self.update_old()
+        need(restored["Name"] == "/" + RELAY and restored["State"].get("Running") is True and restored["State"].get("Health", {}).get("Status") == "healthy", "old relay restore failed/not healthy")
+        self.state["phase"] = "rolledback"
+        self.save()
+        self.disarm()
+        print("Update rolled back; exact old container/image/spec restored; volume/network/Caddy untouched")
+
     def provision(self, output):
         need(self.state["phase"] in {"applied", "committed"}, "route provisioning requires applied or committed transaction")
         if self.state["phase"] == "applied":
@@ -601,19 +902,44 @@ def main():
         command.add_argument("txn")
         command.add_argument("--spec-sha256")
         if name == "commit":
-            command.add_argument("--candidate-sha256", required=True)
+            command.add_argument("--candidate-sha256")
+            command.add_argument("--image-id")
         if name == "provision":
             command.add_argument("--output", required=True)
+    update = sub.add_parser("update", help="arm an existing-relay container image update (no cutover)")
+    update.add_argument("txn")
+    for name in ("live", "caddy-id", "caddy-name", "mount-source", "mount-dest", "caddy-path", "old-id", "image-id", "website-url", "relay-health-url"):
+        update.add_argument("--" + name, required=True)
+    def update_delay(value):
+        if not re.fullmatch(r"[0-9]{1,4}", value):
+            raise argparse.ArgumentTypeError("delay must be ASCII seconds")
+        return int(value)
+    update.add_argument("--delay", type=update_delay, default=600)
+    cutover = sub.add_parser("cutover")
+    cutover.add_argument("txn")
+    cutover.add_argument("--spec-sha256")
     args = parser.parse_args()
     os.umask(0o077)
     driver = None
     try:
-        driver = Driver(args.home, args.mount_source if args.command == 'arm' else None)
+        driver = Driver(args.home, args.mount_source if args.command in {"arm", "update"} else None)
         if args.command == "arm":
             driver.arm(args)
+        elif args.command == "update":
+            driver.update_arm(args)
         else:
             driver.load(args.txn, args.spec_sha256)
-            if args.command == "commit":
+            if driver.spec["schema"] == 2:
+                need(args.command in {"cutover", "check", "rollback", "commit"}, "command unsupported for image update")
+                if args.command == "cutover":
+                    driver.cutover()
+                elif args.command == "check":
+                    driver.update_check()
+                elif args.command == "commit":
+                    driver.update_commit(args.image_id)
+                else:
+                    driver.update_rollback()
+            elif args.command == "commit":
                 driver.commit(args.candidate_sha256)
             elif args.command == "provision":
                 driver.provision(args.output)
@@ -621,9 +947,16 @@ def main():
                 driver.topology(full=True)
                 print("Exact topology and reviewed hardening verified; phase=" + driver.state["phase"])
             else:
+                need(args.command in {"apply", "rollback"}, "command unsupported for first deployment")
                 getattr(driver, args.command)()
         return 0
     except (Refusal, OSError, KeyError, TypeError) as error:
+        if driver and driver.update_loaded and driver.spec and driver.spec.get("schema") == 2 and driver.state and driver.state.get("phase") not in {"committed", "rolledback"} and args.command != "rollback":
+            try:
+                driver.operation_deadline = time.monotonic() + 180
+                driver.update_rollback()
+            except (Refusal, OSError, KeyError, TypeError):
+                print("Immediate image rollback refused/failed; independent timer retained; inspect exact state", file=sys.stderr)
         print("relay-transaction refused: " + (str(error) if isinstance(error, Refusal) else "invalid/unavailable local state (" + type(error).__name__ + (" errno=" + str(error.errno) if isinstance(error, OSError) else " field=" + str(error) if isinstance(error, KeyError) else "") + "); guard retained"), file=sys.stderr)
         return 1
     finally:

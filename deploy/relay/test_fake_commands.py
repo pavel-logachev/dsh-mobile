@@ -28,7 +28,9 @@ with open(str(p) + ".lock", "a") as lock:
             time.sleep(0.01)
     out = ""
     code = 0
-    if command == "loginctl":
+    if command == "curl":
+        out = str(data.get("http_status", 200))
+    elif command == "loginctl":
         out = "yes"
     elif command == "systemctl":
         verb = args[1]
@@ -64,31 +66,42 @@ with open(str(p) + ".lock", "a") as lock:
         code = 0 if item else 1
     elif args[0] == "create":
         labels = dict(args[i + 1].split("=", 1) for i, value in enumerate(args) if value == "--label")
-        network = next(d for d in data["networks"].values() if d["Id"] == args[args.index("--network") + 1])
+        network = next(d for d in data["networks"].values() if args[args.index("--network") + 1] in (d["Id"], d["Name"]))
         image = next(value for value in args if value.startswith("sha256:"))
-        cid = "e" * 64
+        cid = "9" * 64 if "e" * 64 in data["containers"] else "e" * 64
+        container_name = args[args.index("--name") + 1]
+        aliases = [args[i + 1] for i, value in enumerate(args) if value == "--network-alias"]
         health = args[args.index("--health-cmd") + 1]
         data["containers"][cid] = {
-            "Id": cid, "Name": "/dsh-mobile-relay", "Image": image,
+            "Id": cid, "Name": "/" + container_name, "Image": image,
             "Config": {"User": "10001:10001", "Entrypoint": ["node", "dist/cli.js"], "Cmd": args[args.index(image) + 1:], "Labels": labels,
                        "Healthcheck": {"Test": ["CMD-SHELL", health], "Interval": 10000000000, "Timeout": 3000000000, "Retries": 3, "StartPeriod": 10000000000}},
             "HostConfig": {"ReadonlyRootfs": True, "Init": True, "Privileged": False, "CapDrop": ["ALL"], "CapAdd": None, "Devices": [], "SecurityOpt": ["no-new-privileges:true"],
                            "Memory": 536870912, "NanoCpus": 500000000, "PidsLimit": 128, "RestartPolicy": {"Name": "unless-stopped"}, "PortBindings": {}, "PublishAllPorts": False,
                            "LogConfig": {"Type": "json-file", "Config": {"max-size": "10m", "max-file": "3"}}, "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=16m,mode=1777"}},
             "Mounts": [{"Type": "volume", "Name": "dsh-mobile-relay-data", "Destination": "/data", "RW": True}],
-            "NetworkSettings": {"Networks": {network["Name"]: {"NetworkID": ""}}, "Ports": {"8088/tcp": None}},
+            "NetworkSettings": {"Networks": {network["Name"]: {"NetworkID": "", "Aliases": aliases}}, "Ports": {"8088/tcp": None}},
             "State": {"Running": False, "Status": "created", "Health": {"Status": "starting"}},
         }
         data["volumes"]["dsh-mobile-relay-data"] = {}
         out = cid
     elif args[0] == "start":
         item = data["containers"][args[1]]
-        item["State"] = {"Running": True, "Status": "running", "Health": {"Status": "healthy"}}
+        item["State"] = {"Running": True, "Status": "running", "Health": {"Status": data.get("start_health", "healthy") if args[1] == "9" * 64 else "healthy"}}
         n = data["networks"]["dsh-mobile-relay-internal"]
         item["NetworkSettings"]["Networks"][n["Name"]]["NetworkID"] = n["Id"]
         n["Containers"][args[1]] = {"Name": "dsh-mobile-relay"}
+    elif args[0] == "rename":
+        if any(c["Name"] == "/" + args[2] for c in data["containers"].values()):
+            code = 1
+        else:
+            data["containers"][args[1]]["Name"] = "/" + args[2]
     elif args[0] == "stop":
-        data["containers"][args[-1]]["State"]["Running"] = False
+        item = data["containers"][args[-1]]
+        item["State"]["Running"] = False
+        item["State"]["Status"] = "exited"
+        for n in data["networks"].values():
+            n["Containers"].pop(args[-1], None)
     elif args[0] == "rm":
         cid = args[-1]
         del data["containers"][cid]

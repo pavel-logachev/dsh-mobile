@@ -1,4 +1,4 @@
-# Relay: bounded first deployment
+# Relay: bounded first deployment and container image update
 
 This is a reusable operator procedure, not a record of any public deployment. Use your own Linux server, private SSH access and reviewed Caddy configuration. No shared service or existing personal infrastructure is supplied.
 
@@ -22,7 +22,7 @@ Each transaction stores strict JSON and immutable backup/candidate/spec/driver s
 
 Paths must be canonical absolute ASCII paths without spaces, `%`, dot segments or symlink components. SSH and the user manager must use the same HOME; nondefault XDG state/config locations are refused. Secret directories: 0700; snapshots: 0400; mutable JSON/units: 0600. Trusted nonsecret unit directories may be 0755. Only `.config`, `.config/systemd`, `.config/systemd/user`, `.local` and the configured site's direct HOME-child ancestor derived from the validated `mount_source` may be group-writable, with current UID/primary GID ownership, NSS proof of no other primary/supplementary group members, and no extended access/default POSIX ACL. This narrow exception is rechecked on every invocation, including snapshot rollback; it never applies to secret state or unknown siblings. No unrelated directory is chmodded.
 
-Arming requires named relay/network absent. Reusing a durable volume requires inspected explicit `--reuse-data`. Creation uses transaction and random guard labels, with saved intent before mutation and exact IDs recorded after inspect. Known absence + both labels recover a create/record crash. A never-started owned container may have empty NetworkID only with exact `Status=created`, `Running=false`; after startup the network ID must match.
+First-deployment `arm` requires named relay/network absent. Reusing a durable volume requires inspected explicit `--reuse-data`. Creation uses transaction and random guard labels, with saved intent before mutation and exact IDs recorded after inspect. Known absence + both labels recover a create/record crash. A never-started owned container may have empty NetworkID only with exact `Status=created`, `Running=false`; after startup the network ID must match.
 
 ## Additive candidate Caddyfile
 
@@ -46,7 +46,7 @@ References: [Caddy handle_path](https://caddyserver.com/docs/caddyfile/directive
 3. Arm a fresh transaction. It snapshots files, validates the candidate and verifies an independent user timer **before** production mutation. On failure inspect state and rollback; never reuse the transaction ID.
 4. Apply: labelled internal network + hardened relay, health, additive Caddy attachment, exact topology, atomic candidate install and pinned reload. This does not commit; failure leaves the guard armed.
 5. Within the deadline: namespace health 200, unauthorized WebSocket 401, a **separate temporary route** full WSS/inner-TLS canary and unchanged website certificate/redirect/fallback/application baseline. Privately provision/revoke the temporary route. Health alone is not acceptance.
-6. Explicitly commit the exact candidate hash only after all gates; otherwise rollback and verify restoration/cleanup. No deadline extension/updater is provided. Physical-phone acceptance is separate.
+6. Explicitly commit the exact candidate hash only after all gates; otherwise rollback and verify restoration/cleanup. No deadline extension is provided; existing relay image updates use the separate schema-2 path below. Physical-phone acceptance is separate.
 
 Example on your target (fill freshly reviewed IDs/hashes; no secrets in arguments):
 
@@ -102,4 +102,48 @@ Optional separate image checks: `python deploy/relay/verify_image.py` compares c
 
 Wrappers call only the coordinator. `record-resources.sh` is disabled and reconcile is read-only. Local fake systemd/Caddy tests do not prove live user-timer persistence or public service acceptance. A hung daemon, clock jump, hostile same-UID/root operator or externally changed resources needs operator diagnosis; this is not a generic disaster-recovery controller.
 
-Caddy's additive attachment survives restart of the same container, **not recreation** from unchanged Compose. A recreated Caddy requires independent identity checks and a separately reviewed rollback/reattachment plan. This first-deployment driver refuses replacement/update use; do not edit the site's Compose silently or reuse a finalized transaction.
+Caddy's additive attachment survives restart of the same container, **not recreation** from unchanged Compose. A recreated Caddy requires independent identity checks and a separately reviewed rollback/reattachment plan. The first-deployment `arm/apply` path still refuses replacement use. Use the separate `update/cutover` path below for image updates only; never edit the site's Compose silently or reuse a finalized transaction.
+
+## Existing relay: guarded container image update (schema 2)
+
+This is **not** a state migration or Caddy updater. Independently review the new image, state backward compatibility and the driver before use. Keep the exact old image/container; no pruning. Run the fresh preflight from step 1 above, export/load the verified immutable new image, and save before-state receipts privately. Require the existing hardened relay healthy, the dedicated internal bridge containing exactly Caddy and relay, and user lingering. Do not change Caddy, Compose, routes, tokens, volume or network ownership labels.
+
+`update TXN` snapshots the old full Config/HostConfig, image, complete mounts, explicit network inputs/aliases and Caddy identity/config hash in owner-private state. Engine-generated container ID/name, default hostname, IP/MAC/endpoint IDs and DNSNames are lifecycle output, not independently reconstructed run inputs; the old hostname itself is preserved on the candidate. It creates a **never-started** candidate under an unpredictable temporary name using the same durable volume, labels, environment and runtime policy. The candidate already has the production alias in its saved network settings but has no live endpoint until start. It is never run alongside the old relay. No isolated image canary is implemented here; an independently reviewed image smoke test can run with its own temporary volume/network before arming.
+
+Before stopping the old relay, the candidate's complete effective Config/HostConfig/mounts/network-input spec must round-trip to the pinned old spec, with only image ID changed. Unsupported extra settings or changed image defaults fail closed; diagnose and review rather than weakening the comparison. The old container is retained, not reconstructed on rollback. Specs may include private environment/config values: **never print/copy the spec or full docker inspect into shared logs or local evidence**. Only hashes and nonsecret identity/status receipts leave private server state.
+
+The same persistent flock serializes schema 1 and 2. `update` arms an immutable snapshot user-systemd rollback service and a UTC persistent timer (default 600 seconds) **before candidate creation/cutover**. External mutations inherit the lock. It checks active timer/deadline, Caddy file hash on host and in the pinned container, and the old and candidate specs again before cutover. The first working-path mutation follows a durable `applying` transition and printed UTC cutover timestamp. Interrupted cutover is rollback-only:
+
+1. Stop exact old ID; rename to `dsh-mobile-relay-rollback-TXN` and retain it.
+2. Rename candidate to `dsh-mobile-relay`; start it (its explicit production alias becomes live).
+3. Automatically check candidate health (up to 45 seconds while starting), HTTPS relay health and website **exactly 200** with curl TLS validation, unchanged other-container name/ID map, and exact Caddy/new-relay endpoint set. No redirects/TLS bypass. A failed forward operation or gate immediately attempts rollback; if refused/failed, independent timer stays armed and operator diagnosis is required.
+
+`check` repeats the gates; `commit --image-id EXACT_ID` repeats them and only then durably commits/disarms. The lead must separately check PC host reconnect using the printed cutover UTC timestamp, and compare other-service status/website baseline before committing. WSS/inner-TLS canary is optional for this update path and reported **unverified** unless a separately reviewed safe temporary-route procedure is available; schema-2 `provision` is deliberately unsupported. Phone/large-upload acceptance is separate. Do not commit a failed required host gate.
+
+Example (replace uppercase values with freshly verified nonsecret values):
+
+```sh
+TXN=image-update-unique
+python3 transaction.py update "$TXN" \
+  --live "$HOME/example-site/caddy/Caddyfile" \
+  --caddy-id PINNED_FULL_CADDY_ID --caddy-name example-site-caddy \
+  --mount-source "$HOME/example-site/caddy" --mount-dest /etc/caddy \
+  --caddy-path /etc/caddy/Caddyfile --old-id PINNED_FULL_OLD_RELAY_ID \
+  --image-id sha256:REVIEWED_NEW_IMAGE_DIGEST --delay 600 \
+  --website-url https://example.test/ \
+  --relay-health-url https://example.test/dsh-mobile-relay/healthz
+STATE="$HOME/.local/state/dsh-mobile-relay/transactions/$TXN"
+PIN=$(cat "$STATE/spec.sha256")
+# Independently verify timer is active, deadline and snapshot ExecStart, then:
+python3 "$STATE/driver.py" cutover "$TXN" --spec-sha256 "$PIN"
+python3 "$STATE/driver.py" check "$TXN" --spec-sha256 "$PIN"
+# After external host/status gates, choose ONE before the deadline:
+python3 "$STATE/driver.py" commit "$TXN" --spec-sha256 "$PIN" --image-id sha256:REVIEWED_NEW_IMAGE_DIGEST
+python3 "$STATE/driver.py" rollback "$TXN" --spec-sha256 "$PIN"
+```
+
+Rollback does **not** require an unexpired/active timer. It verifies immutable snapshots, pinned old identity/spec and Caddy hash, stops/removes only the candidate, renames the old container back if necessary, starts it and verifies its spec/running/health before finalizing and disarming. Candidate create/record and every cutover/rollback mutation have retry-idempotent recovery; unknown identities/configuration refuse destructive cleanup. It never edits Caddy, removes the durable volume or deletes/disconnects the network. Existing finalized schema-1 transactions remain immutable. A finalized schema-2 transaction is also a no-op on rollback, so do not use this as an after-commit downgrade command.
+
+After commit the old stopped rollback container remains for manual review/retention; automatic cleanup is outside this procedure. Because both containers retain `unless-stopped`, do not manually start the rollback container while the new one is serving. A later update must pin the current live relay, not an earlier retained container. The driver cannot undo database schema changes; incompatible state migration requires a separately reviewed backup/restore plan.
+
+Local fake tests cover round-trip refusal, full identity/name/alias restoration, failed gates, expired-deadline snapshot rollback, commit/disarm, old-spec drift, interrupted candidate creation/cutover/rollback, inherited flock, and both timer/commit orderings. These tests are not proof of live systemd persistence, production HTTP/WSS or physical-network acceptance.
