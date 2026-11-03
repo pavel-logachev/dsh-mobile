@@ -28,6 +28,17 @@ class MediaSafetyRegressionTest {
         assertFalse(file.exists())
     }
 
+    @Test fun `converted HEIF uses the same draft aware source lifetime`() {
+        val file = File(TemporaryMedia.directory(context), "camera-heif-converted.jpg").apply {
+            writeText("jpeg"); setLastModified(System.currentTimeMillis() - TemporaryMedia.CAMERA_TTL_MS - 1000)
+        }
+        val uri = android.net.Uri.parse("content://${context.packageName}.media/shared_media/${file.name}")
+        val draft = DraftAttachment("heif", uri.toString(), "photo.jpg", 4, "image/jpeg", temporary = true)
+        TemporaryMedia.cleanup(context, listOf(draft)); TemporaryMedia.requireReadable(file)
+        assertTrue(file.exists())
+        TemporaryMedia.cleanup(context, emptyList()); assertFalse(file.exists())
+    }
+
     @Test fun `expired share is refused even before cleanup`() {
         val file = File(TemporaryMedia.directory(context), "share-expired.jpg").apply {
             writeText("export"); setLastModified(System.currentTimeMillis() - TemporaryMedia.SHARE_TTL_MS - 1000)

@@ -39,6 +39,7 @@ class UploadImageStandTest {
         return requireNotNull(result)
     }
     private fun tap(n: AccessibilityNodeInfo) {
+        if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return
         val bounds = android.graphics.Rect(); n.getBoundsInScreen(bounds)
         shell("input tap ${bounds.centerX()} ${bounds.centerY()}")
     }
@@ -51,20 +52,28 @@ class UploadImageStandTest {
         val configFile = File(context.filesDir, "upload-stand.json")
         org.junit.Assume.assumeTrue("Private isolated upload stand config required", configFile.isFile)
         val config = JSONObject(configFile.readText())
-        runBlocking { EncryptedStateStore(context).write(StoredState(host = PairedHost(HostEndpoint("http://127.0.0.1:${config.getInt("port")}"), config.getString("deviceId"), config.getString("deviceToken"), "Synthetic upload stand"))) }
+        val endpoint = if (config.has("endpoint")) kotlinx.serialization.json.Json.decodeFromString<HostEndpoint>(config.getJSONObject("endpoint").toString()) else HostEndpoint("http://127.0.0.1:${config.getInt("port")}")
+        runBlocking { EncryptedStateStore(context).write(StoredState(host = PairedHost(endpoint, config.getString("deviceId"), config.getString("deviceToken"), "Synthetic upload stand"))) }
         val format = InstrumentationRegistry.getArguments().getString("uploadFormat") ?: "png"
         val jpeg = format == "jpeg"
-        val name = "upload-stand-${System.currentTimeMillis()}.${if (jpeg) "jpg" else "png"}"
+        val heic = format == "heic"
+        val name = "upload-stand-${System.currentTimeMillis()}.${if (heic) "heic" else if (jpeg) "jpg" else "png"}"
         val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, name); put(MediaStore.Images.Media.MIME_TYPE, if (jpeg) "image/jpeg" else "image/png")
+            put(MediaStore.Images.Media.DISPLAY_NAME, name); put(MediaStore.Images.Media.MIME_TYPE, if (heic) "image/heic" else if (jpeg) "image/jpeg" else "image/png")
+            put(MediaStore.Images.Media.DATE_TAKEN, System.currentTimeMillis() + 60_000)
+            put(MediaStore.Images.Media.DATE_ADDED, System.currentTimeMillis() / 1000 + 60)
         })!!
-        val width = if (jpeg) 2400 else 96
-        val height = if (jpeg) 1800 else 64
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val random = java.util.Random(73)
-        val row = IntArray(width)
-        for (y in 0 until height) { for (x in row.indices) row[x] = random.nextInt() or (0xff shl 24); bitmap.setPixels(row, 0, width, 0, y, width, 1) }
-        context.contentResolver.openOutputStream(uri)!!.use { assertTrue(bitmap.compress(if (jpeg) Bitmap.CompressFormat.JPEG else Bitmap.CompressFormat.PNG, 98, it)) }; bitmap.recycle()
+        if (heic) {
+            File(context.filesDir, "upload-sample.heic").inputStream().use { source -> context.contentResolver.openOutputStream(uri)!!.use { source.copyTo(it) } }
+        } else {
+            val width = if (jpeg) 2400 else 96
+            val height = if (jpeg) 1800 else 64
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val random = java.util.Random(73)
+            val row = IntArray(width)
+            for (y in 0 until height) { for (x in row.indices) row[x] = random.nextInt() or (0xff shl 24); bitmap.setPixels(row, 0, width, 0, y, width, 1) }
+            context.contentResolver.openOutputStream(uri)!!.use { assertTrue(bitmap.compress(if (jpeg) Bitmap.CompressFormat.JPEG else Bitmap.CompressFormat.PNG, 98, it)) }; bitmap.recycle()
+        }
         val size = context.contentResolver.openAssetFileDescriptor(uri, "r")!!.use { it.length }
         if (jpeg) assertTrue("JPEG must be several MB: $size", size > 3 * 1024 * 1024)
         File(context.filesDir, "upload-source-$format.json").writeText(JSONObject().put("name", name).put("size", size).toString())
@@ -75,21 +84,25 @@ class UploadImageStandTest {
             compose.onNodeWithTag("message_input").performTextReplacement("Synthetic picked $format upload")
             compose.onNodeWithContentDescription(context.getString(R.string.mobile_attach)).performClick()
             compose.onNodeWithText(context.getString(R.string.mobile_attach_photos)).performClick()
+            capture("picker-$format")
             val photo = node { n -> n.isVisibleToUser && (n.contentDescription?.startsWith("Photo taken") == true || n.contentDescription?.startsWith("Фото, дата") == true || n.text?.toString() == name) }
             tap(photo)
             instrumentation.uiAutomation.waitForIdle(500, 3000)
             val pkg = instrumentation.uiAutomation.rootInActiveWindow?.packageName?.toString().orEmpty()
             if (pkg.contains("photopicker") || pkg.contains("documentsui")) {
                 // Picker may finish between package inspection and confirmation lookup.
-                val next = node { n -> n.isVisibleToUser && (n.packageName?.toString() == context.packageName || n.text?.toString() in listOf("Add", "Добавить", "Done", "Готово", "Select", "Выбрать")) }
+                val next = node { n -> n.isVisibleToUser && (n.packageName?.toString() == context.packageName || listOf("Add", "Добавить", "Done", "Готово", "Select", "Выбрать").any { label -> n.text?.toString()?.startsWith(label) == true }) }
                 if (next.packageName?.toString() != context.packageName) tap(next)
             }
             compose.waitUntil(30_000) { compose.onAllNodesWithTag("send_message").fetchSemanticsNodes().isNotEmpty() }
             compose.waitUntil(30_000) {
                 compose.onAllNodesWithText(context.getString(R.string.mobile_attach_fix_errors)).fetchSemanticsNodes().isNotEmpty() ||
-                    try { compose.onNodeWithTag("send_message").assertIsEnabled(); true } catch (_: AssertionError) { false }
+                    runBlocking { EncryptedStateStore(context).read() }.attachmentDrafts["chat"]?.any { it.uploadId != null } == true
             }
             capture("picked-$format")
+            val draft = runBlocking { EncryptedStateStore(context).read() }.attachmentDrafts["chat"]?.singleOrNull()
+            File(context.filesDir, "upload-picked-$format.json").writeText(JSONObject().put("pickerMime", context.contentResolver.getType(uri)).put("draftMime", draft?.mime).put("draftSize", draft?.size).put("hasReceipt", draft?.uploadId != null).toString())
+            if (heic) assertEquals("HEIC must reach the agent as an image", "image/jpeg", draft?.mime)
             if (InstrumentationRegistry.getArguments().getString("uploadFailureCapture") == "true") {
                 // Explicit bounded operator window for adb exec-out screencap of the pre-fix failure.
                 instrumentation.uiAutomation.executeShellCommand("log -t UploadStand failure_capture_ready").close()

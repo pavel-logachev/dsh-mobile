@@ -103,6 +103,7 @@ internal class PhoneEditor(private val context: Context, private val repository:
             error = null; skippedLarge = 0
             var large = 0
             for (uri in uris) {
+                var convertedSource: DraftAttachment? = null
                 try {
                     val item = withContext(Dispatchers.IO) {
                         var name = "attachment"; var size = -1L
@@ -119,8 +120,15 @@ internal class PhoneEditor(private val context: Context, private val repository:
                             while (size <= PhoneRules.FILE_LIMIT) { val n = input.read(buffer); if (n < 0) break; size += n }
                         }
                         val mime = context.contentResolver.getType(uri)
-                        name = attachmentDisplayName(name, mime, context.getString(R.string.mobile_attach_photo_name, inSession(session).size + 1), temporary = temporary)
-                        DraftAttachment(UUID.randomUUID().toString(), uri.toString(), name, size, PhoneRules.uploadMime(mime), temporary = temporary)
+                        val fallback = context.getString(R.string.mobile_attach_photo_name, inSession(session).size + 1)
+                        if (HeifUpload.matches(mime, name) && size in 1..PhoneRules.FILE_LIMIT) {
+                            val (converted, bytes) = HeifUpload.convert(context, uri)
+                            val jpegName = attachmentDisplayName(name.substringBeforeLast('.', name) + ".jpg", "image/jpeg", fallback, temporary = temporary)
+                            DraftAttachment(UUID.randomUUID().toString(), converted.toString(), jpegName, bytes, "image/jpeg", temporary = true).also { convertedSource = it }
+                        } else {
+                            name = attachmentDisplayName(name, mime, fallback, temporary = temporary)
+                            DraftAttachment(UUID.randomUUID().toString(), uri.toString(), name, size, PhoneRules.uploadMime(mime), temporary = temporary)
+                        }
                     }
                     if (!PhoneRules.canAddAttachment(inSession(session).map { it.attachment.size }, item.size)) {
                         if (item.size > PhoneRules.FILE_LIMIT) { large++; skippedLarge = large }
@@ -128,12 +136,14 @@ internal class PhoneEditor(private val context: Context, private val repository:
                         clean(item)
                         continue
                     }
-                    if (!temporary) runCatching { context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                    if (!item.temporary) runCatching { context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) }
                     items = items + (session to (inSession(session) + UploadState(item)))
+                    convertedSource = null // Draft/editor now owns cleanup, including an uncertain send.
                     dev.dshmobile.app.data.notificationTrace("media_editor_chip bytes=${item.size} temporary=${item.temporary}")
                     persist(session, add = listOf(item)); retry(session, item.localId)
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) { error = R.string.mobile_attach_read_failed }
+                finally { convertedSource?.let { source -> withContext(NonCancellable + Dispatchers.IO) { clean(source) } } }
             }
             if (large > 0) { skippedLarge = large; error = R.plurals.mobile_attach_skipped_too_large }
         }
