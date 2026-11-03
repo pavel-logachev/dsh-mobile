@@ -125,7 +125,7 @@ jobs:
           if ($archives.Count -ne 1) { throw 'Expected exactly one host archive' }
           $zip = $archives[0]
           $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -LiteralPath ($zip.FullName + '.sha256') -Value ($hash + '  ' + $zip.Name) -Encoding ascii
+          [System.IO.File]::WriteAllText($zip.FullName + '.sha256', $hash + '  ' + $zip.Name + "`n", [System.Text.UTF8Encoding]::new($false))
       - name: Upload host assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
