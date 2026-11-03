@@ -42,9 +42,9 @@ The test-only correction passed GitHub CI run [41666680186](https://github.com/p
 
 APK signing certificate SHA-256, unchanged from earlier releases: `F9080C63B49A0BDE6B74AA2ADF7E9531D6C4F305978A24D3F5D271A39F1B7B95`.
 
-The host ZIP was built reproducibly: a repeat build produced identical bytes. Its exact contents are installed in the owner's DSH. The tag workflow independently builds and verifies an unsigned APK and host ZIP, then creates a draft. Retain the CI host ZIP only if its hash matches the table; otherwise replace it and its checksum with the tested ZIP, recording the CI hash and an entry-content comparison in the release operator's report. Replace CI-only assets with the tested signed APK and its checksum. The final draft must contain exactly the two artifacts above and their `.sha256` sidecars; unsigned verification APKs are not installable release downloads. See [ANDROID_RELEASE](ANDROID_RELEASE.md).
+The host ZIP was built reproducibly: a repeat build produced identical bytes. Its exact contents are installed in the owner's DSH. The tag workflow (run 41671180075) independently built and verified an unsigned APK and a host ZIP. Its ZIP (`80992b60…cd64`) has the same 86 entries; 84 are byte-identical and the other two, `package.json` and `dsh-mobile-host-release.json`, differ only in serialization: `package.json` parses to identical values (whitespace and escaping differ), and the manifest differs only in the recorded SHA-256 of that `package.json`. The release carries the tested ZIP and the tested signed APK with their `.sha256` sidecars; the unsigned CI APK is not a release download. See [ANDROID_RELEASE](ANDROID_RELEASE.md).
 
-GitHub CI run IDs, final release-head identity, downloaded-asset verification and draft URL are recorded in the release operator's report after the documentation commit; this record does not pre-claim those later checks.
+CI on the tagged commit `c11ba12`: runs 41671171742 (main) and 41671180092 (tag) green on Linux host, Windows host and Android. The four release assets were downloaded back from GitHub and match the tested files byte for byte; the APK certificate and version 0.9.2 / 19 were re-checked on the download.
 
 ## Upgrade
 
@@ -62,14 +62,14 @@ GitHub CI run IDs, final release-head identity, downloaded-asset verification an
 
 ## Verification
 
-Recorded 2026-11-03 (MSK). The following RC/device/production results were supplied as verified release evidence; the release operator does not repeat device or production actions.
+Recorded 2026-11-03 (MSK).
 
 | Gate | Result |
 |---|---|
 | Host RC checks on `48fc5b0` | `npm.cmd run check`: 374/374 with the installed Cordis module. |
 | Relay RC check | 19/19. |
 | Android RC checks on `48fc5b0` | `testDebugUnitTest`: 499/499; `lintRelease`: 0 errors, 40 warnings. |
-| Relay deployment tooling | POSIX suite on Linux with fake Docker: 41/41; two independent reviews, final PASS. This is tooling evidence, not a live Docker protocol test. |
+| Relay deployment tooling | POSIX suite on Linux with fake Docker: 41/41 on `0f78bd4`. Independent review of the transaction up to `d82a47c`: FAIL twice, PASS after fixes. `0f78bd4` (normalizing how a newer Docker Engine renders two unset defaults, `Dns` and `OomKillDisable`) was not independently reviewed; it rests on a diagnostic comparison on the production Engine and the suite above, and the guarded production update with it committed. This is tooling evidence, not a live Docker protocol test. |
 | Plugin 0.9.2 on the owner's DSH | Activated through the change pipeline at 16:45 MSK: batch committed, 0 errors, package post-check 3/3, smoke passed. |
 | Owner's production relay | Updated to the fixed image at 15:20 MSK using the guarded transaction; host reconnected in about 21 seconds, update committed. |
 | Phone identity and window | OnePlus CPH2747 / Android 16, 16:55–17:20 MSK. |
@@ -79,5 +79,3 @@ Recorded 2026-11-03 (MSK). The following RC/device/production results were suppl
 | HEIC converted to JPEG over relay | 231,274 B JPEG, HTTP 201 in 7.5 s, agent replied about its content. |
 | Large JPEG over relay | 5,155,222 B, HTTP 201 in 7.8 s, agent replied about its content. |
 | Fresh camera photo over relay | 2,669,234 B, HTTP 201 in 8.0 s, agent replied about its content. |
-
-Release publication is a separate owner/lead action after review. The release operator must leave v0.9.2 as a draft and must not mark it latest.
