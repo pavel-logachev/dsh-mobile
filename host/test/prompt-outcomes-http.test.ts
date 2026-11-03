@@ -285,11 +285,29 @@ test('R07 legacy false terminal HTTP checkpoint is replaced by authoritative res
   const result = await json(await h.request(h.url([id]), phone.deviceToken));
   assert.equal(result.outcomes[0].status, 'queued');
   const saved = h.host().state.outcomeCheckpoint(phone.deviceId, id, rpcId)!;
-  assert.equal(saved.nextSeq, 1); assert.equal(saved.consumptionVersion, 1);
+  assert.equal(saved.nextSeq, 1); assert.equal(saved.consumptionVersion, 2);
   // Late legacy writers and same-version lower cursors cannot restore false evidence.
   h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, consumptionVersion: undefined, nextSeq: 9000, outcome: { ...saved.outcome, status: 'completed' } });
   h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, nextSeq: 0, outcome: { ...saved.outcome, status: 'unknown' } });
   await h.restart(); assert.deepEqual(await json(await h.request(h.url([id]), phone.deviceToken)), result);
+});
+
+test('discarded queued prompt repairs persisted v1 unknown after restart without resending', async t => {
+  const h = await setup(t), phone = h.pair(), id = randomUUID();
+  assert.equal((await h.send(phone.deviceToken, id)).status, 200); const rpcId = h.prompted[0]!;
+  h.append('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [{ source: { kind: 'user', rpcId } }] });
+  h.append('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' });
+  h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { consumptionVersion: 1, nextSeq: 8000, caughtUp: true,
+    approvals: [], questions: [], outcome: { requestId: rpcId, status: 'unknown', updatedAt: '1970-01-01T00:00:01.001Z' } });
+  await h.restart();
+  const result = await json(await h.request(h.url([id]), phone.deviceToken));
+  assert.deepEqual(result.outcomes, [{ requestId: id, status: 'rejected', updatedAt: '1970-01-01T00:00:01.001Z' }]);
+  const saved = h.host().state.outcomeCheckpoint(phone.deviceId, id, rpcId)!;
+  assert.equal(saved.consumptionVersion, 2); assert.equal(saved.nextSeq, 2);
+  // A late v1 fold with a higher cursor cannot resurrect the already-cleared watch.
+  h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, consumptionVersion: 1, nextSeq: 9000, outcome: { ...saved.outcome, status: 'unknown' } });
+  assert.deepEqual(await json(await h.request(h.url([id]), phone.deviceToken)), result);
+  assert.equal(h.prompted.length, 1);
 });
 
 test('R09 session remap while reader.close yields cannot publish outcome or checkpoint', async t => {

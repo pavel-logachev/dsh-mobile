@@ -6,8 +6,8 @@ export type PromptStatus = 'unknown' | 'queued' | 'running' | 'waiting' | 'compl
 export interface PromptOutcome { requestId: string; status: PromptStatus; turnId?: string; summary?: string; updatedAt: string }
 export interface OutcomeCheckpoint {
   nextSeq: number; caughtUp?: boolean; openTurn?: number; turn?: number;
-  /** v1 binds consuming turns only to durable user/message, not inbox removal. */
-  consumptionVersion?: 1;
+  /** v1 proved consumption; v2 additionally distinguishes explicit inbox discard. */
+  consumptionVersion?: 1 | 2;
   pending?: { target: string; index: number }; approvals: string[]; questions: string[];
   outcome: PromptOutcome;
 }
@@ -22,7 +22,7 @@ function pendingResult(content: unknown): boolean {
   if (typeof text?.text !== 'string') return false;
   try { return object(JSON.parse(text.text)).pending === true; } catch { return false; }
 }
-export const provenTerminal = (c: OutcomeCheckpoint) => c.consumptionVersion === 1 && !c.pending && (c.outcome.status === 'completed' || c.outcome.status === 'failed');
+export const provenTerminal = (c: OutcomeCheckpoint) => c.consumptionVersion === 2 && !c.pending && (c.outcome.status === 'completed' || c.outcome.status === 'failed');
 const terminal = provenTerminal;
 export const unknownOutcome = (requestId: string): PromptOutcome => ({ requestId, status: 'unknown', updatedAt: '1970-01-01T00:00:00.000Z' });
 export function outcomeToken(outcomes: readonly PromptOutcome[]): string { return createHash('sha256').update(JSON.stringify(outcomes)).digest('base64url'); }
@@ -35,9 +35,9 @@ export function outcomeToken(outcomes: readonly PromptOutcome[]): string { retur
  */
 export async function derivePromptOutcomes(reader: JournalReader, lookups: readonly PromptLookup[], signal: AbortSignal): Promise<OutcomeCheckpoint[]> {
   if (lookups.length > 32) throw new HostError('invalid_request');
-  // Old checkpoints may contain a false consuming turn, including memoized terminal
-  // results. Re-scan once under the new proof rule rather than trust that evidence.
-  const states = lookups.map(item => item.checkpoint?.consumptionVersion === 1 ? structuredClone(item.checkpoint) : { consumptionVersion: 1, nextSeq: 0, approvals: [], questions: [], outcome: unknownOutcome(item.requestId) } as OutcomeCheckpoint);
+  // Re-scan old proof versions once: v1 lost explicit queue discard as unknown,
+  // and pre-v1 could contain a false consuming turn. Restoration is read-only.
+  const states = lookups.map(item => item.checkpoint?.consumptionVersion === 2 ? structuredClone(item.checkpoint) : { consumptionVersion: 2, nextSeq: 0, approvals: [], questions: [], outcome: unknownOutcome(item.requestId) } as OutcomeCheckpoint);
   const active = states.filter(c => !terminal(c));
   if (!active.length) return states;
   let offset = Math.min(...active.map(c => c.nextSeq)), bytes = 0, count = 0, caughtUp = false;
@@ -66,7 +66,10 @@ export async function derivePromptOutcomes(reader: JournalReader, lookups: reado
           const start = Number(d.start), removed = Number(d.removedCount ?? 0);
           if (c.pending && c.pending.target === d.target) {
             if (c.pending.index >= start && c.pending.index < start + removed) {
-              delete c.turn; update('unknown');
+              // Normal claims have no outcome and still need user/message proof.
+              // Explicit discard is terminal only if not reinserted (edit/steer)
+              // later in this scan. Do not memoize rejected during the fold.
+              delete c.turn; update(d.outcome === 'canceled' ? 'rejected' : 'unknown');
               delete c.pending;
             } else if (c.pending.index >= start + removed) c.pending.index += d.inserted.length - removed;
           }

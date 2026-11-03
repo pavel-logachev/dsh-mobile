@@ -96,13 +96,26 @@ test('continued timed questions and PTC pending calls remain waiting until a dur
 test('inbox reorder/removal and cancellation cannot attach a queued phone prompt to an unrelated turn', async () => {
   const events = [event('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [message('desktop'), message()] }, 0), event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' }, 1), event('turn/start', { turn: 5 }, 2), event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' }, 3), event('turn/end', { turn: 5, reason: { kind: 'completed' } }, 4)];
   const [checkpoint] = await derivePromptOutcomes(reader(events), [{ requestId: id }], signal());
-  assert.equal(checkpoint!.outcome.status, 'unknown'); assert.equal(checkpoint!.outcome.turnId, undefined);
+  assert.equal(checkpoint!.outcome.status, 'rejected'); assert.equal(checkpoint!.outcome.turnId, undefined);
+});
+
+test('explicit queue discard settles rejected and old unknown checkpoints are repaired without consumption', async () => {
+  const events = [event('turn/start', { turn: 1 }, 0), event('user/message', message('desktop'), 1),
+    event('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [message()] }, 2),
+    event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' }, 3)];
+  const legacy = { consumptionVersion: 1 as const, nextSeq: 4, caughtUp: true, openTurn: 1, approvals: [], questions: [],
+    outcome: { requestId: id, status: 'unknown' as const, updatedAt: '1970-01-01T00:00:01.003Z' } };
+  for (const checkpoint of [undefined, legacy]) {
+    const [result] = await derivePromptOutcomes(reader(events), [{ requestId: id, checkpoint }], signal());
+    assert.deepEqual(result!.outcome, { requestId: id, status: 'rejected', updatedAt: '1970-01-01T00:00:01.003Z' });
+    assert.equal(result!.pending, undefined);
+  }
 });
 
 test('R07 replacement and cross-inbox reinsertion stay queued through completed or failed unrelated turns', async () => {
   for (const target of ['next-turn', 'next-step']) for (const reason of [{ kind: 'completed' }, { kind: 'error', error: { message: 'unrelated' } }]) {
     const events = [event('turn/start', { turn: 1 }, 0), event('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [message('desktop'), message()] }, 1),
-      event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 2, inserted: target === 'next-turn' ? [message(), message('desktop')] : [] }, 2)];
+      event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 2, inserted: target === 'next-turn' ? [message(), message('desktop')] : [], outcome: 'canceled' }, 2)];
     if (target === 'next-step') events.push(event('agent/inbox/spliced', { target, start: 0, inserted: [message()] }, events.length));
     const [pending] = await derivePromptOutcomes(reader(events), [{ requestId: id }], signal());
     assert.equal(pending!.outcome.status, 'queued'); assert.equal(pending!.outcome.turnId, undefined);
@@ -110,6 +123,17 @@ test('R07 replacement and cross-inbox reinsertion stay queued through completed 
     const [result] = await derivePromptOutcomes(reader(events), [{ requestId: id, checkpoint: JSON.parse(JSON.stringify(pending)) }], signal());
     assert.equal(result!.outcome.status, 'queued'); assert.equal(result!.outcome.turnId, undefined); assert.equal(result!.pending?.target, target);
   }
+});
+
+test('discard at bounded scan edge cannot settle before a following steer reinsertion', async () => {
+  const events = Array.from({ length: 4095 }, (_, seq) => event('session/title', {}, seq));
+  events[0] = event('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [message()] }, 0);
+  events.push(event('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' }, 4095));
+  events.push(event('agent/inbox/spliced', { target: 'next-step', start: 0, inserted: [message()] }, 4096));
+  const [first] = await derivePromptOutcomes(reader(events), [{ requestId: id }], signal());
+  assert.equal(first!.caughtUp, false);
+  const [second] = await derivePromptOutcomes(reader(events), [{ requestId: id, checkpoint: first }], signal());
+  assert.equal(second!.outcome.status, 'queued'); assert.equal(second!.caughtUp, true);
 });
 
 test('R07 removal without durable consumption is unknown, even across checkpoint restart', async () => {
