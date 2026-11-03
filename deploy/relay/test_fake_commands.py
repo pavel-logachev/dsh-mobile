@@ -89,6 +89,8 @@ with open(str(p) + ".lock", "a") as lock:
             "NetworkSettings": {"Networks": {network["Name"]: {"NetworkID": "", "Aliases": aliases}}, "Ports": {"8088/tcp": None}},
             "State": {"Running": False, "Status": "created", "Health": {"Status": "starting"}},
         }
+        # Simulates a newer Engine rendering unset HostConfig defaults differently.
+        data["containers"][cid]["HostConfig"].update(data.get("create_host_extra") or {})
         if "--env-file" in args:
             env_file = Path(args[args.index("--env-file") + 1])
             data.setdefault("env_file_modes", []).append(env_file.stat().st_mode & 0o777)

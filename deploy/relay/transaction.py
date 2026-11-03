@@ -46,6 +46,15 @@ def run_spec(obj):
     cfg.pop("Hostname", None)  # Engine-generated container hostname is identity.
     host = dict(obj["HostConfig"])
     host.pop("NetworkMode", None)  # Pinned separately alongside endpoint inputs.
+    # Engine upgrades change only the *representation* of these unset defaults
+    # (observed on the production VPS, Engine 29.9: Dns [] -> null,
+    # OomKillDisable null -> false). Normalize exactly these equivalents; any
+    # explicitly configured value still has to match.
+    for key in ("Dns", "DnsOptions", "DnsSearch"):
+        if key in host and host[key] is None:
+            host[key] = []
+    if "OomKillDisable" in host and host["OomKillDisable"] is None:
+        host["OomKillDisable"] = False
     mounts = obj["Mounts"]
     networks = {}
     for name, endpoint in obj["NetworkSettings"]["Networks"].items():

@@ -268,6 +268,26 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(self.state()["phase"], "rolledback")
         self.assertEqual(set(self.fake_state()["containers"]), {CADDY, self.old_id})
 
+    def test_update_tolerates_engine_default_representation_drift_only(self):
+        # Production evidence 03.11.2026: an Engine upgrade after the old relay was
+        # created renders unset defaults differently (Dns [] vs null, OomKillDisable null vs false).
+        self.seed_existing_relay()
+        self.change_fake(lambda d: d["containers"][self.old_id]["HostConfig"].update(Dns=[], OomKillDisable=None))
+        self.change_fake(lambda d: d.update(create_host_extra={"Dns": None, "OomKillDisable": False}))
+        self.update()
+        self.assertEqual(self.state()["phase"], "armed")
+        self.run_cli("rollback", "t1")
+        for old_value, new_value in (({"Dns": ["192.0.2.53"]}, {"Dns": None}), ({"OomKillDisable": True}, {"OomKillDisable": False})):
+            with self.subTest(old=old_value):
+                self.tearDown()
+                self.setUp()
+                self.seed_existing_relay()
+                self.change_fake(lambda d: d["containers"][self.old_id]["HostConfig"].update(old_value))
+                self.change_fake(lambda d: d.update(create_host_extra=new_value))
+                self.update(ok=False)
+                self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+                self.assertEqual(self.state()["phase"], "rolledback")
+
     def test_update_failed_roundtrip_cleanup_can_retry_after_remove_failure(self):
         self.seed_existing_relay()
         self.change_fake(lambda d: d["containers"][self.old_id]["HostConfig"].update(ShmSize=123456))
