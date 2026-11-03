@@ -816,7 +816,9 @@ class Driver:
     def update_commit(self, image_id):
         need(image_id == self.spec["image_id"], "commit requires exact update image ID")
         if self.state["phase"] == "committed":
+            cleaned = self.update_env_cleanup()
             self.disarm()
+            need(cleaned, "env-file cleanup still failing; transaction already committed")
             return
         self.update_check()
         need(time.time() < self.spec["deadline"], "deadline won update commit race")
@@ -824,10 +826,31 @@ class Driver:
         self.save()
         self.disarm()
         print("Update committed; rollback container retained stopped; timer disarmed")
+        # Cleanup failure must not roll back a healthy committed relay: it is
+        # reported (nonzero exit) and retried by every later commit/rollback call.
+        need(self.update_env_cleanup(), "committed, but leftover candidate env-file could not be removed; fix and rerun commit")
+
+    def update_env_cleanup(self):
+        """Idempotently remove a leftover private candidate env-file; True when absent."""
+        env_file = self.dir / "candidate.env"
+        if not env_file.exists():
+            return True
+        try:
+            read_file(env_file, True)
+            env_file.unlink()
+            sync_dir(self.dir)
+            return True
+        except (Refusal, OSError):
+            return False
 
     def update_rollback(self):
         if self.state["phase"] in {"committed", "rolledback"}:
+            # A finalized transaction may still hold an env-file whose earlier
+            # removal failed; every later rollback/commit invocation retries it.
+            cleaned = self.update_env_cleanup()
             self.disarm()
+            if not cleaned:
+                raise Refusal("env-file cleanup still failing; transaction already " + self.state["phase"])
             return
         self.update_bytes()
         # Restore prerequisites are exact pinned IDs, never forward-only gates.
@@ -862,14 +885,8 @@ class Driver:
         need(restored is not None and restored["Name"] == "/" + RELAY and restored["State"].get("Running") is True, "old relay restore failed")
         # A killed create can leave its private env-file; mutation children inherit
         # the lock, so rollback cannot unlink it while Docker still reads it.
-        env_file = self.dir / "candidate.env"
-        if env_file.exists():
-            try:
-                read_file(env_file, True)
-                env_file.unlink()
-                sync_dir(self.dir)
-            except (Refusal, OSError):
-                warnings.append("env-file-cleanup-failed")
+        if not self.update_env_cleanup():
+            warnings.append("env-file-cleanup-failed; rerun rollback to retry")
         # Collect diagnostics only AFTER restoring; never gate stop/remove/rename/start.
         try:
             self.update_caddy()

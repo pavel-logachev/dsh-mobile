@@ -201,6 +201,45 @@ class TransactionTests(unittest.TestCase):
                 self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
                 self.assertEqual(self.state()["phase"], "rolledback")
 
+    def test_review_failed_env_cleanup_is_retried_after_finalization(self):
+        for final in ("rollback", "commit"):
+            with self.subTest(final=final):
+                self.tearDown()
+                self.setUp()
+                self.seed_existing_relay()
+                self.update()
+                env_file = self.txndir / "candidate.env"
+                if final == "rollback":
+                    env_file.mkdir()  # unremovable as a private file: cleanup must fail
+                    self.run_cli("rollback", "t1")
+                    self.assertEqual(self.state()["phase"], "rolledback")
+                    receipt = json.loads((self.txndir / "rollback-receipt.json").read_text())
+                    self.assertTrue(any(w.startswith("env-file-cleanup-failed") for w in receipt["warnings"]))
+                    self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+                    self.run_cli("rollback", "t1", ok=False)
+                    self.assertTrue(env_file.exists())
+                    env_file.rmdir()
+                    fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    os.write(fd, b"SYNTHETIC=value\n")
+                    os.close(fd)
+                    self.run_cli("rollback", "t1")
+                    self.assertFalse(env_file.exists())
+                    self.assertEqual(self.state()["phase"], "rolledback")
+                else:
+                    self.run_cli("cutover", "t1")
+                    env_file.mkdir()
+                    self.run_cli("commit", "t1", "--image-id", "sha256:" + "f" * 64, ok=False)
+                    # Healthy candidate stays committed and running; no rollback for a cleanup fault.
+                    self.assertEqual(self.state()["phase"], "committed")
+                    self.assertTrue(self.fake_state()["containers"]["9" * 64]["State"]["Running"])
+                    self.assertFalse(self.fake_state()["timers"]["dsh-mobile-relay-rollback-t1.timer"])
+                    self.run_cli("commit", "t1", "--image-id", "sha256:" + "f" * 64, ok=False)
+                    self.assertTrue(env_file.exists())
+                    env_file.rmdir()
+                    self.run_cli("commit", "t1", "--image-id", "sha256:" + "f" * 64)
+                    self.assertEqual(self.state()["phase"], "committed")
+                    self.assertFalse(env_file.exists())
+
     def test_update_roundtrip_then_rollback_preserves_exact_old_identity_name_alias(self):
         original = self.seed_existing_relay()
         result = self.update()
