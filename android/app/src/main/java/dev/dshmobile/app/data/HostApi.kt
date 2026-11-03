@@ -39,6 +39,9 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
     // Endpoint holds for up to 25 s: do not route it through the ordinary 15 s GET budget.
     private val outcomesClient = client.newBuilder().callTimeout(35, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(35, java.util.concurrent.TimeUnit.SECONDS).build()
+    // A 20 MiB upload can make steady progress for longer than a metadata GET.
+    // Match the host's bounded 120 s request lifetime; retain stall/TLS/replay policy.
+    private val uploadClient = client.newBuilder().callTimeout(120, java.util.concurrent.TimeUnit.SECONDS).build()
     private val base = endpoint.baseUrl.toHttpUrl()
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
@@ -64,7 +67,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             }
         } ?: throw MobileFailure("network_unavailable")
     }
-    private suspend fun executeOnce(request: Request, limit: Int, recoverClosedRead: Boolean = false, retryOf: Call? = null, transport: OkHttpClient = client): HttpResult = suspendCancellableCoroutine { continuation ->
+    private suspend fun executeOnce(request: Request, limit: Int, recoverClosedRead: Boolean = false, retryOf: Call? = null, transport: OkHttpClient = client, upload: Boolean = false): HttpResult = suspendCancellableCoroutine { continuation ->
         synchronized(admission) {
             if (!continuation.isActive) return@suspendCancellableCoroutine
             if (retired.get() || retryOf?.isCanceled() == true) {
@@ -78,7 +81,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             // GET/SSE reuse stays untouched. No recovery/replay is permitted for mutations.
             val mutationPool = if (request.method == "GET") null else okhttp3.ConnectionPool()
             val headersAttempted = java.util.concurrent.atomic.AtomicBoolean()
-            val callClient = mutationPool?.let { pool -> client.newBuilder().connectionPool(pool)
+            val callClient = mutationPool?.let { pool -> transport.newBuilder().connectionPool(pool)
                 .eventListener(object : okhttp3.EventListener() {
                     override fun requestHeadersStart(call: Call) { headersAttempted.set(true) }
                 }).build() } ?: transport
@@ -95,6 +98,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             continuation.invokeOnCancellation { cancelOnIo { call.cancel(); mutationPool?.evictAll() } }
             call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                if (upload) UploadDiagnostic.record("transport", UploadDiagnostic.code(e), endpoint.relay != null)
                 mutationPool?.evictAll()
                 val headerEof = e.javaClass == IOException::class.java && e.cause is java.io.EOFException
                 val socketClosed = e.javaClass == java.net.SocketException::class.java
@@ -105,6 +109,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
                         requestNotSent = mutationPool != null && !headersAttempted.get()))
             }
             override fun onResponse(call: Call, response: Response) {
+                if (upload) UploadDiagnostic.record("response", "ok", endpoint.relay != null, response.code)
                 try {
                     val result = response.use {
                         if (it.code in 300..399) throw MobileFailure("invalid_response")
@@ -279,27 +284,40 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
 
     suspend fun upload(sessionId: String, name: String, mime: String, size: Long, open: () -> java.io.InputStream, progress: (Int) -> Unit): UploadReceipt {
         if (size !in 1..dev.dshmobile.app.model.PhoneRules.FILE_LIMIT) throw MobileFailure("invalid_selection")
+        val started = System.nanoTime()
+        var sent = 0L
+        fun trace(stage: String, code: String, status: Int? = null) = UploadDiagnostic.record(stage, code, endpoint.relay != null, status, sent, size, (System.nanoTime() - started) / 1_000_000)
+        trace("start", "ok")
         val body = object : okhttp3.RequestBody() {
             override fun contentType() = mime.toMediaType()
             override fun contentLength() = size
             override fun isOneShot() = true
             override fun writeTo(sink: okio.BufferedSink) {
-                open().use { input ->
-                    val buffer = ByteArray(32 * 1024); var sent = 0L
+                val source = try { open() } catch (failure: Exception) { trace("source_open", UploadDiagnostic.code(failure)); throw failure }
+                source.use { input ->
+                    val buffer = ByteArray(32 * 1024)
                     while (sent < size) {
-                        val count = input.read(buffer, 0, minOf(buffer.size.toLong(), size - sent).toInt())
-                        if (count < 0) throw IOException("short_upload")
+                        val count = try { input.read(buffer, 0, minOf(buffer.size.toLong(), size - sent).toInt()) }
+                            catch (failure: Exception) { trace("source_read", UploadDiagnostic.code(failure)); throw failure }
+                        if (count < 0) { trace("source_read", "short_upload"); throw IOException("short_upload") }
                         sink.write(buffer, 0, count); sent += count; progress((sent * 100 / size).toInt())
                     }
-                    if (input.read() != -1) throw IOException("long_upload")
+                    if (input.read() != -1) { trace("source_read", "long_upload"); throw IOException("long_upload") }
                 }
             }
         }
-        val result = execute(request("sessions", sessionId, "uploads").header("X-File-Name", java.net.URLEncoder.encode(name, "UTF-8").replace("+", "%20")).post(body).build())
-        if (result.status != 201) { result.checked(); throw MobileFailure("invalid_response") }
-        return decodeWire<UploadReceipt>(result.text).also {
-            if (!validId(it.uploadId) || it.expiresAt < 0 || it.attachment.size != size || it.attachment.mime != mime) throw MobileFailure("invalid_response")
-        }
+        try {
+            val result = executeOnce(request("sessions", sessionId, "uploads").header("X-File-Name", java.net.URLEncoder.encode(name, "UTF-8").replace("+", "%20")).post(body).build(), 64 * 1024, transport = uploadClient, upload = true)
+            if (result.status != 201) {
+                trace("response", runCatching { decodeWire<ErrorEnvelope>(result.text).error.code }.getOrDefault("invalid_response"), result.status)
+                result.checked(); throw MobileFailure("invalid_response")
+            }
+            return decodeWire<UploadReceipt>(result.text).also {
+                if (!validId(it.uploadId) || it.expiresAt < 0 || it.attachment.size != size || it.attachment.mime != mime) throw MobileFailure("invalid_response")
+                trace("receipt", "ok", result.status)
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+        catch (failure: Exception) { trace("receipt", UploadDiagnostic.code(failure)); throw failure }
     }
 
     /** Memory-only bounded response; no HTTP disk cache contains private chat images. */

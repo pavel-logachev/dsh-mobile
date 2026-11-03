@@ -2,6 +2,7 @@ package dev.dshmobile.app.data
 
 import dev.dshmobile.app.model.*
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.launch
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.*
@@ -23,6 +24,81 @@ class PhoneTransportTest {
                 server.enqueue(MockResponse().setHeader("Content-Type", "image/png").setBody(okio.Buffer().write(byteArrayOf(1,2,3))))
                 assertArrayEquals(byteArrayOf(1,2,3), api.image("chat", "image")); assertEquals("/v1/sessions/chat/attachments/image", server.takeRequest().path)
             } finally { api.close() }
+        }
+    }
+    @Test fun `upload allows an active body beyond ordinary metadata deadline without replay`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start(); val api = api(server)
+            try {
+                server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setResponseCode(201).setBody("""{"uploadId":"slow-upload","expiresAt":1000,"attachment":{"id":"image","name":"slow.jpg","size":5242880,"mime":"image/jpeg","kind":"image"}}"""))
+                var position = 0
+                var nextChunkAt = System.nanoTime()
+                val stream = object : java.io.InputStream() {
+                    override fun read(): Int = if (position < 5242880) { position++; 73 } else -1
+                    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                        if (position >= 5242880) return -1
+                        // 160 * 110 ms = 17.6 s, with continuous forward progress.
+                        nextChunkAt += 110_000_000L
+                        val remaining = nextChunkAt - System.nanoTime()
+                        if (remaining > 0) java.util.concurrent.TimeUnit.NANOSECONDS.sleep(remaining)
+                        val count = minOf(length, 5242880 - position)
+                        java.util.Arrays.fill(buffer, offset, offset + count, 73.toByte()); position += count
+                        return count
+                    }
+                }
+                val receipt = api.upload("chat", "slow.jpg", "image/jpeg", 5242880, { stream }, {})
+                assertEquals("slow-upload", receipt.uploadId)
+                assertEquals(5242880L, server.takeRequest().bodySize)
+                assertEquals("Upload must not replay", 1, server.requestCount)
+            } finally { api.closeAndAwait() }
+        }
+    }
+    @Test fun `upload rejects invalid length without opening source or sending`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start(); val api = api(server)
+            try {
+                for (size in listOf(0L, -1L, PhoneRules.FILE_LIMIT + 1, Long.MAX_VALUE)) {
+                    try { api.upload("chat", "x.png", "image/png", size, { error("must not open") }, {}); fail("accepted $size") }
+                    catch (failure: MobileFailure) { assertEquals("invalid_selection", failure.key) }
+                }
+                assertEquals(0, server.requestCount)
+            } finally { api.closeAndAwait() }
+        }
+    }
+    @Test fun `upload HTTP rejection and closed response are never replayed`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start(); val api = api(server)
+            try {
+                server.enqueue(MockResponse().setResponseCode(415).setHeader("Content-Type", "application/json").setBody("""{"error":{"code":"unsupported_media_type","message":"Synthetic","retryable":false}}"""))
+                try { api.upload("chat", "x.png", "image/png", 1, { byteArrayOf(1).inputStream() }, {}); fail("accepted rejection") }
+                catch (failure: MobileFailure) { assertEquals("host_error", failure.key) }
+                assertEquals(1, server.requestCount)
+                server.enqueue(MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST))
+                try { api.upload("chat", "x.png", "image/png", 1, { byteArrayOf(1).inputStream() }, {}); fail("accepted closed response") }
+                catch (failure: MobileFailure) { assertEquals("network_unavailable", failure.key) }
+                assertEquals(2, server.requestCount)
+            } finally { api.closeAndAwait() }
+        }
+    }
+    @Test fun `cancelled upload closes source without replay and later upload still works`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start(); val api = api(server)
+            val closed = java.util.concurrent.CountDownLatch(1)
+            try {
+                server.enqueue(MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.NO_RESPONSE))
+                val job = launch {
+                    api.upload("chat", "x.png", "image/png", 1, { object : java.io.ByteArrayInputStream(byteArrayOf(1)) {
+                        override fun close() { super.close(); closed.countDown() }
+                    } }, {})
+                }
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { assertNotNull(server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)) }
+                job.cancel(); job.join()
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { assertTrue(closed.await(5, java.util.concurrent.TimeUnit.SECONDS)) }
+                assertEquals(1, server.requestCount)
+                server.enqueue(MockResponse().setResponseCode(201).setHeader("Content-Type", "application/json").setBody("""{"uploadId":"next","expiresAt":1000,"attachment":{"id":"image","name":"x.png","size":1,"mime":"image/png","kind":"image"}}"""))
+                assertEquals("next", api.upload("chat", "x.png", "image/png", 1, { byteArrayOf(1).inputStream() }, {}).uploadId)
+                assertEquals(2, server.requestCount)
+            } finally { api.closeAndAwait() }
         }
     }
     @Test fun `discard upload accepts empty 204 without JSON content type`() = runBlocking {

@@ -154,6 +154,7 @@ internal class PhoneEditor(private val context: Context, private val repository:
                 }
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: Exception) {
+                dev.dshmobile.app.data.UploadDiagnostic.record("editor", dev.dshmobile.app.data.UploadDiagnostic.code(failure))
                 if ((failure as? dev.dshmobile.app.data.MobileFailure)?.key in setOf("rate_limited", "staging_full")) error = R.string.mobile_attach_rate_limited
                 update(session, id) { it.copy(uploading = false, error = true) }
             }
