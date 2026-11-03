@@ -82,7 +82,12 @@ class PhoneTransportTest {
     }
     @Test fun `cancelled upload closes source without replay and later upload still works`() = runBlocking {
         MockWebServer().use { server ->
-            server.start(); val api = api(server)
+            // Bind and connect to the same address. On dual-stack localhost, cancellation can
+            // postpone the IPv4 route and select ::1, where this IPv4-only fixture isn't listening.
+            val loopback = java.net.InetAddress.getByName("127.0.0.1")
+            server.start(loopback, 0)
+            val endpoint = server.url("/").newBuilder().host(loopback.hostAddress!!).build().toString()
+            val api = HostApi(HostEndpoint(endpoint, null), "synthetic-device-token")
             val closed = java.util.concurrent.CountDownLatch(1)
             try {
                 server.enqueue(MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.NO_RESPONSE))
