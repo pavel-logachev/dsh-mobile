@@ -20,15 +20,20 @@
 | `025c516` | relay, host connector | Admit short TLS tails during large uploads. Previously the small-message limiter closed the stream at the 65th small TLS tail, cutting uploads of about 5 MB and larger over the relay. |
 | `48fc5b0` | Android, host | Bump app and plugin to 0.9.2, Android versionCode 19. |
 | `c59db09`, `df02a37`, `d82a47c`, `0f78bd4` | operator tooling, docs | Guarded relay image-update transaction (schema 2) and [RELAY_DEPLOYMENT](RELAY_DEPLOYMENT.md). These commits do not change the app, host or relay runtime source. |
+| `367bae5` | tests only | Bind the cancellation CI fixture and its client to the same explicit IPv4 loopback address, avoiding a dual-stack `localhost` route mismatch after cancellation. Product code unchanged. |
 
 ## Artifacts and provenance
 
-The signed APK is the exact APK tested on the owner's phone, built from `48fc5b0`. Later commits through `0f78bd4` change only relay deployment tooling and documentation. The release documentation commit must not change `android`, `host` or `relay`; verify at the release head:
+The signed APK is the exact APK tested on the owner's phone, built from `48fc5b0`. Later commits through `0f78bd4` change only relay deployment tooling and documentation; `367bae5` changes only the cancellation test fixture. The original full-directory check below therefore lists that test-only change, rather than being empty. Verify runtime-source equivalence separately:
 
 ```text
 git diff --stat 48fc5b0 HEAD -- android host relay
+# expected: PhoneTransportTest.kt only (6 insertions, 1 deletion)
+git diff --stat 48fc5b0 HEAD -- android/app/src/main host relay
 # expected: empty
 ```
+
+The test-only correction passed GitHub CI run [41666680186](https://github.com/pavel-logachev/dsh-mobile/actions/runs/41666680186) on `367bae5` (Android, Linux host and Windows host). CI must also pass on the final documentation commit before main is updated.
 
 | Artifact | SHA-256 |
 |---|---|
