@@ -10,17 +10,23 @@ import time
 p = Path(os.environ["FAKE_STATE"])
 command = Path(sys.argv[0]).name
 args = sys.argv[1:]
+docker_endpoint = None
+if command == "docker" and args[:1] == ["--host"]:
+    docker_endpoint, args = args[1], args[2:]
 with open(str(p) + ".lock", "a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     data = json.loads(p.read_text())
     call = ([command] if command != "docker" else []) + args
     data["calls"].append(call)
+    data.setdefault("child_environments", []).append({"command": command, "env_keys": sorted(k for k in os.environ if k != "FAKE_STATE"), "docker_endpoint": docker_endpoint, "path": os.environ.get("PATH"), "home": os.environ.get("HOME"), "tz": os.environ.get("TZ")})
     fail = data.get("fail")
     if fail and all(part in call for part in fail):
         p.write_text(json.dumps(data))
         sys.exit(1)
-    barrier = json.loads(Path(os.environ["FAKE_BARRIER"]).read_text()) if os.environ.get("FAKE_BARRIER") else None
+    barrier = json.loads(Path(data["barrier"]).read_text()) if data.get("barrier") else None
     match = barrier and all(part in call for part in barrier["contains"])
+    if match:
+        data.pop("barrier", None)  # One-shot seam; later rollback must not re-block.
     if match and barrier["when"] == "before":
         p.write_text(json.dumps(data))
         Path(barrier["ready"]).touch()
@@ -83,6 +89,14 @@ with open(str(p) + ".lock", "a") as lock:
             "NetworkSettings": {"Networks": {network["Name"]: {"NetworkID": "", "Aliases": aliases}}, "Ports": {"8088/tcp": None}},
             "State": {"Running": False, "Status": "created", "Health": {"Status": "starting"}},
         }
+        if "--env-file" in args:
+            env_file = Path(args[args.index("--env-file") + 1])
+            data.setdefault("env_file_modes", []).append(env_file.stat().st_mode & 0o777)
+            values = env_file.read_text().split("\n")
+            if values and values[-1] == "":
+                values.pop()
+            if values:
+                data["containers"][cid]["Config"]["Env"] = values
         data["volumes"]["dsh-mobile-relay-data"] = {}
         out = cid
     elif args[0] == "start":
@@ -129,7 +143,12 @@ with open(str(p) + ".lock", "a") as lock:
         with target.open("x") as stream:
             json.dump(data["capabilities"][stage], stream)
     elif args[0] == "exec" and "node" in args and "-e" in args:
-        data["capabilities"].pop(args[-1], None)
+        if "/healthz" in args[-1]:
+            data.setdefault("direct_health_ids", []).append(args[1])
+            out = str(data.get("direct_status", 200))
+            code = 0 if out == "200" else 1
+        else:
+            data["capabilities"].pop(args[-1], None)
     elif args[0] == "exec" and "validate" in args:
         sys.stdin.buffer.read()
     elif args[0] == "exec" and "sha256sum" in args:

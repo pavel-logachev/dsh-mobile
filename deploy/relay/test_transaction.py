@@ -34,7 +34,9 @@ class TransactionTests(unittest.TestCase):
         self.bin.mkdir()
         for name in ("docker", "systemctl", "loginctl", "curl"):
             script = self.bin / name
-            script.write_text("#!" + sys.executable + "\n" + (ROOT / "test_fake_commands.py").read_text())
+            # Fake backend location is embedded, not inherited through child env.
+            prefix = "import os\nos.environ['FAKE_STATE']=" + repr(str(self.root / "fake.json")) + "\n"
+            script.write_text("#!" + sys.executable + "\n" + prefix + (ROOT / "test_fake_commands.py").read_text())
             script.chmod(0o700)
         self.fake = self.root / "fake.json"
         self.fake.write_text(json.dumps({
@@ -98,6 +100,107 @@ class TransactionTests(unittest.TestCase):
                             "--website-url", "https://example.test/",
                             "--relay-health-url", "https://example.test/dsh-mobile-relay/healthz", **extra)
 
+    def test_review_caddy_drift_after_stop_cannot_block_snapshot_restore(self):
+        import shlex
+        self.seed_existing_relay()
+        self.update()
+        proc, _ = self.spawn_barrier(["cutover", "t1"], ["stop", self.old_id], "after")
+        self.kill_crash(proc)
+        self.live.write_bytes(b"legitimate unrelated Caddy update\n")
+        unit = (self.home / ".config/systemd/user/dsh-mobile-relay-rollback-t1.service").read_text()
+        command = shlex.split(next(line.split("=", 1)[1] for line in unit.splitlines() if line.startswith("ExecStart=")))
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+        self.assertEqual(self.fake_state()["containers"][self.old_id]["Name"], "/dsh-mobile-relay")
+        self.assertIn("caddy-drift", (self.txndir / "rollback-receipt.json").read_text())
+        self.assertEqual(self.live.read_bytes(), b"legitimate unrelated Caddy update\n")
+
+    def test_review_candidate_spec_drift_cannot_block_restore(self):
+        self.seed_existing_relay()
+        self.update()
+        self.run_cli("cutover", "t1")
+        self.change_fake(lambda d: d["containers"]["9" * 64]["HostConfig"].update(Memory=123))
+        self.run_cli("rollback", "t1")
+        self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+        self.assertNotIn("9" * 64, self.fake_state()["containers"])
+        self.assertIn("candidate-spec-drift", (self.txndir / "rollback-receipt.json").read_text())
+
+    def test_review_minimal_environment_pins_local_endpoint_and_rejects_remote(self):
+        import shlex
+        self.seed_existing_relay()
+        script = self.bin / "docker"
+        body = script.read_text()
+        # Reviewer's backend-by-DOCKER_HOST seam: any leaked override selects an
+        # empty backend; a clean process with --host uses the original fixture.
+        script.write_text(body.replace('p = Path(os.environ["FAKE_STATE"])', 'p = Path(os.environ["FAKE_STATE"]) if not os.environ.get("DOCKER_HOST") else Path(os.environ["FAKE_STATE"] + ".other")'))
+        self.env["DOCKER_HOST"] = "review-ssh-backend"
+        self.update(ok=False)
+        self.assertFalse(self.txndir.exists())
+        self.env.pop("DOCKER_HOST")
+        self.env["DOCKER_CONTEXT"] = "review-remote"
+        self.update(ok=False)
+        self.assertFalse(self.txndir.exists())
+        self.env["DOCKER_CONTEXT"] = "default"
+        self.env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+        self.env.update(DOCKER_CONFIG="/bad-config", DOCKER_TLS_VERIFY="1", HTTPS_PROXY="https://bad-proxy", CURL_HOME="/bad-curl", PYTHONPATH="/bad-python")
+        self.update()
+        self.run_cli("cutover", "t1")
+        unit = (self.home / ".config/systemd/user/dsh-mobile-relay-rollback-t1.service").read_text()
+        command = shlex.split(next(line.split("=", 1)[1] for line in unit.splitlines() if line.startswith("ExecStart=")))
+        self.env["DOCKER_HOST"] = "review-other-backend"
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+        for child in self.fake_state()["child_environments"]:
+            if child["command"] in {"docker", "curl"}:
+                self.assertFalse(any(k.startswith("DOCKER_") or "PROXY" in k or k == "CURL_HOME" for k in child["env_keys"]))
+                self.assertEqual(child["tz"], "UTC")
+                self.assertEqual(child["path"], "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                if child["command"] == "docker":
+                    self.assertEqual(child["docker_endpoint"], "unix:///var/run/docker.sock")
+
+    def test_review_health_url_is_distinct_site_relay_path_and_direct_gate_is_exact(self):
+        self.seed_existing_relay()
+        base = ["update", "t1", "--live", str(self.live), "--caddy-id", CADDY, "--caddy-name", "example-site-caddy", "--mount-source", str(self.mount), "--mount-dest", "/etc/caddy", "--caddy-path", "/etc/caddy/Caddyfile", "--old-id", self.old_id, "--image-id", "sha256:" + "f" * 64, "--website-url", "https://example.test/"]
+        for url in ("https://example.test/", "https://other.test/dsh-mobile-relay/healthz", "https://example.test/healthz", "https://example.test/dsh-mobile-relay/healthz/", "https://example.test/x/../dsh-mobile-relay/healthz"):
+            self.run_cli(*base, "--relay-health-url", url, ok=False)
+        self.update()
+        self.change_fake(lambda d: d.update(direct_status=503))
+        self.run_cli("cutover", "t1", ok=False)
+        self.assertEqual(self.state()["phase"], "rolledback")
+        self.assertEqual(self.fake_state()["direct_health_ids"], ["9" * 64])
+        self.assertFalse(any(c[0] == "curl" for c in self.fake_state()["calls"]))
+
+    def test_review_private_env_file_not_argv_and_removed_after_create(self):
+        self.seed_existing_relay()
+        marker = "REVIEW_SYNTHETIC_TOKEN=not-a-real-secret"
+        self.change_fake(lambda d: d["containers"][self.old_id]["Config"].update(Env=[marker]))
+        self.update()
+        self.assertEqual(self.fake_state()["env_file_modes"], [0o600])
+        self.assertFalse((self.txndir / "candidate.env").exists())
+        creates = [c for c in self.fake_state()["calls"] if c[0] == "create"]
+        self.assertNotIn(marker, json.dumps(creates))
+        self.assertNotIn("--env", creates[-1])
+        self.assertEqual((self.txndir / "spec.json").stat().st_mode & 0o777, 0o400)
+        self.assertEqual(self.fake_state()["containers"]["9" * 64]["Config"]["Env"], [marker])
+        self.run_cli("rollback", "t1")
+
+    def test_review_env_file_cleanup_on_create_failure_and_invalid_value(self):
+        for cause in ("create-failure", "newline"):
+            with self.subTest(cause=cause):
+                self.tearDown()
+                self.setUp()
+                self.seed_existing_relay()
+                marker = "SYNTHETIC=value" if cause == "create-failure" else "SYNTHETIC=value\nother"
+                self.change_fake(lambda d: d["containers"][self.old_id]["Config"].update(Env=[marker]))
+                if cause == "create-failure":
+                    self.change_fake(lambda d: d.update(fail=["create"]))
+                self.update(ok=False)
+                self.assertFalse((self.txndir / "candidate.env").exists())
+                self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+                self.assertEqual(self.state()["phase"], "rolledback")
+
     def test_update_roundtrip_then_rollback_preserves_exact_old_identity_name_alias(self):
         original = self.seed_existing_relay()
         result = self.update()
@@ -143,6 +246,9 @@ class TransactionTests(unittest.TestCase):
         result = self.run_cli("cutover", "t1")
         self.assertIn("Cutover UTC:", result.stdout)
         self.assertTrue(self.state()["gates_passed"])
+        self.assertEqual(self.fake_state()["direct_health_ids"], ["9" * 64])
+        curls = [c for c in self.fake_state()["calls"] if c[0] == "curl"]
+        self.assertTrue(curls and all(c[1] == "-q" for c in curls))
         self.run_cli("commit", "t1", "--image-id", "sha256:" + "f" * 64)
         self.assertEqual(self.state()["phase"], "committed")
         self.assertFalse(self.fake_state()["timers"]["dsh-mobile-relay-rollback-t1.timer"])
@@ -180,6 +286,9 @@ class TransactionTests(unittest.TestCase):
         # active/unexpired timer (including a missed persistent reboot deadline).
         import shlex
         command = shlex.split(next(line.split("=", 1)[1] for line in unit.splitlines() if line.startswith("ExecStart=")))
+        # Service uses env -i before Python. Extract its pinned Python/script
+        # segment for the artificial clock; snapshot execution is tested separately.
+        command = command[command.index(str(self.txndir / "driver.py")) - 1:]
         spec = json.loads((self.txndir / "spec.json").read_text())
         harness = self.root / "expire.py"
         harness.write_text("import runpy,sys,time\ntime.time=lambda: " + str(spec["deadline"] + 1) + "\nsys.argv=" + repr(command[1:]) + "\nrunpy.run_path(sys.argv[0],run_name='__main__')\n")
@@ -249,7 +358,7 @@ class TransactionTests(unittest.TestCase):
                             "--caddy-name", "example-site-caddy", "--mount-source", str(self.mount),
                             "--mount-dest", "/etc/caddy", "--caddy-path", "/etc/caddy/Caddyfile",
                             "--old-id", self.old_id, "--image-id", "sha256:" + "f" * 64,
-                            "--website-url", "https://example.test/", "--relay-health-url", "https://example.test/healthz"]
+                            "--website-url", "https://example.test/", "--relay-health-url", "https://example.test/dsh-mobile-relay/healthz"]
                     proc, release = self.spawn_barrier(args, ["create"], when)
                     if not parent_only:
                         self.kill_crash(proc)
@@ -273,6 +382,7 @@ class TransactionTests(unittest.TestCase):
                     self.assertEqual(self.state()["phase"], "rolledback")
                     self.assertEqual(set(self.fake_state()["containers"]), {CADDY, self.old_id})
                     self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
+                    self.assertFalse((self.txndir / "candidate.env").exists())
 
     def test_update_health_other_ids_and_deadline_failures_restore_old(self):
         for cause in ("health", "other-id", "timer"):
@@ -300,7 +410,7 @@ class TransactionTests(unittest.TestCase):
                 "--caddy-name", "example-site-caddy", "--mount-source", str(self.mount),
                 "--mount-dest", "/etc/caddy", "--caddy-path", "/etc/caddy/Caddyfile",
                 "--old-id", self.old_id, "--image-id", "sha256:" + "f" * 64,
-                "--website-url", "https://example.test/", "--relay-health-url", "https://example.test/healthz"]
+                "--website-url", "https://example.test/", "--relay-health-url", "https://example.test/dsh-mobile-relay/healthz"]
         cases = [("--image-id", ""), ("--image-id", "sha256:" + "f" * 63),
                  ("--old-id", "e" * 64 + "\n"), ("--website-url", "http://example.test/"),
                  ("--website-url", "https://example.test/?secret=value"),
@@ -328,9 +438,9 @@ class TransactionTests(unittest.TestCase):
         self.run_cli("cutover", "t1", ok=False)
         self.assertTrue(self.fake_state()["containers"][self.old_id]["State"]["Running"])
         self.assertEqual(self.live.read_bytes(), b"unrelated change\n")
-        self.assertTrue(self.fake_state()["timers"]["dsh-mobile-relay-rollback-t1.timer"])
-        self.live.write_bytes(self.candidate.read_bytes())
-        self.run_cli("rollback", "t1")
+        self.assertFalse(self.fake_state()["timers"]["dsh-mobile-relay-rollback-t1.timer"])
+        self.assertEqual(self.state()["phase"], "rolledback")
+        self.assertIn("caddy-drift", (self.txndir / "rollback-receipt.json").read_text())
 
     def test_update_wrong_spec_pin_and_corrupt_state_never_trigger_cleanup(self):
         self.seed_existing_relay()
@@ -426,7 +536,8 @@ class TransactionTests(unittest.TestCase):
         ready = barrier.with_suffix(".ready")
         release = barrier.with_suffix(".release")
         barrier.write_text(json.dumps({"contains": contains, "when": when, "ready": str(ready), "release": str(release)}))
-        env = dict(self.env, FAKE_BARRIER=str(barrier))
+        self.change_fake(lambda d: d.update(barrier=str(barrier)))
+        env = dict(self.env)
         proc = subprocess.Popen([sys.executable, str(ROOT / "transaction.py"), *command], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         until = time.monotonic() + 15
         while not ready.exists():

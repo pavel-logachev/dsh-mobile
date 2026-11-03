@@ -29,8 +29,10 @@ import uuid
 import urllib.parse
 
 # Schema 2 adds container replacement without changing schema-1 deployment state.
-UPDATE_SPEC_KEYS = {"schema", "txn", "home", "live", "original_sha256", "caddy_id", "caddy_name", "mount_source", "mount_dest", "caddy_path", "baseline_networks", "image_id", "old_id", "old_spec", "caddy_spec", "other_ids", "nonce", "deadline", "tools", "driver_sha256", "website_url", "relay_health_url"}
+UPDATE_SPEC_KEYS = {"schema", "txn", "home", "live", "original_sha256", "caddy_id", "caddy_name", "mount_source", "mount_dest", "caddy_path", "baseline_networks", "image_id", "old_id", "old_spec", "caddy_spec", "other_ids", "nonce", "deadline", "tools", "driver_sha256", "website_url", "relay_health_url", "docker_endpoint"}
 UPDATE_STATE_KEYS = {"schema", "spec_sha256", "phase", "new_intent", "new_id", "cutover_at", "gates_passed"}
+FIXED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+LOCAL_DOCKER = "unix:///var/run/docker.sock"
 
 
 def run_spec(obj):
@@ -245,8 +247,18 @@ class Driver:
     def run(self, tool, *args, data=None, allow=False, timeout=20):
         remaining = self.operation_deadline - time.monotonic()
         need(remaining > 0, "180-second operation budget exhausted; guard remains armed")
+        # Docker/curl never inherit SSH or manager transport/proxy configuration.
+        # systemctl needs only its user-bus address, not the caller's whole env.
+        env = {"PATH": FIXED_PATH, "HOME": str(self.home), "TZ": "UTC", "LC_ALL": "C"}
+        if tool == "systemctl":
+            env["XDG_RUNTIME_DIR"] = "/run/user/" + str(os.getuid())
+            env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/" + str(os.getuid()) + "/bus"
+        command = [self.tools[tool], *map(str, args)]
+        if tool == "docker":
+            endpoint = self.spec.get("docker_endpoint", LOCAL_DOCKER) if self.spec else LOCAL_DOCKER
+            command = [self.tools[tool], "--host", endpoint, *map(str, args)]
         try:
-            result = subprocess.run([self.tools[tool], *map(str, args)], input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=min(timeout, remaining), check=False, pass_fds=(self.fd,), env={**os.environ, "HOME": str(self.home), "TZ": "UTC", "LC_ALL": "C"})
+            result = subprocess.run(command, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=min(timeout, remaining), check=False, pass_fds=(self.fd,), env=env)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise Refusal(tool + " command unavailable/timed out; inspect state before retry") from error
         need(allow or result.returncode == 0, tool + " command failed; details intentionally suppressed")
@@ -579,7 +591,7 @@ class Driver:
         print("Rolled back; original config verified; only owned resources removed; durable volume retained")
 
     def load_update(self, txn, spec, spec_hash):
-        need(set(spec) == UPDATE_SPEC_KEYS and spec["txn"] == txn and spec["home"] == str(self.home), "invalid update spec")
+        need(set(spec) == UPDATE_SPEC_KEYS and spec["txn"] == txn and spec["home"] == str(self.home) and spec["docker_endpoint"] == LOCAL_DOCKER, "invalid update spec/local endpoint")
         for key in ("original_sha256", "caddy_id", "old_id", "driver_sha256"):
             need(isinstance(spec[key], str) and HEX.fullmatch(spec[key]), "invalid update ID/hash")
         need(type(spec["deadline"]) is int and re.fullmatch(r"[a-f0-9]{32}", spec["nonce"]), "invalid update deadline/nonce")
@@ -670,6 +682,7 @@ class Driver:
         return obj
 
     def update_arm(self, args):
+        need(os.environ.get("DOCKER_HOST", "") in {"", LOCAL_DOCKER} and os.environ.get("DOCKER_CONTEXT", "") in {"", "default"}, "update requires default local Docker socket/context")
         need(TX.fullmatch(args.txn) and HEX.fullmatch(args.old_id) and re.fullmatch(r"sha256:[a-f0-9]{64}", args.image_id) and 60 <= args.delay <= 3600, "invalid update input")
         for prior in self.transactions.iterdir():
             need(prior.is_dir() and not prior.is_symlink(), "unexpected transaction entry")
@@ -700,11 +713,14 @@ class Driver:
         for url in (args.website_url, args.relay_health_url):
             parsed = urllib.parse.urlsplit(url)
             need(parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment, "gate URL must be nonsecret HTTPS URL")
+        site, health = urllib.parse.urlsplit(args.website_url), urllib.parse.urlsplit(args.relay_health_url)
+        expected_health_path = site.path.rstrip("/") + "/dsh-mobile-relay/healthz"
+        need(args.website_url != args.relay_health_url and site.netloc == health.netloc and health.path == expected_health_path, "relay health URL must be the distinct relay /healthz path under the website")
         need(self.run("loginctl", "show-user", pwd.getpwuid(os.getuid()).pw_name, "--property=Linger", "--value").stdout.strip() == b"yes", "update requires user lingering")
         original, code = read_file(live), read_file(Path(__file__).resolve())
         caddy_spec = {k: caddy.get(k) for k in ("Id", "Name", "Path", "Args", "Mounts")}
         caddy_spec["networks"] = {k: v.get("NetworkID") for k, v in caddy["NetworkSettings"]["Networks"].items()}
-        self.spec = dict(schema=2, txn=args.txn, home=str(self.home), live=str(live), original_sha256=digest(original), caddy_id=args.caddy_id, caddy_name=args.caddy_name, mount_source=args.mount_source, mount_dest=args.mount_dest, caddy_path=args.caddy_path, baseline_networks=caddy_spec["networks"], image_id=args.image_id, old_id=args.old_id, old_spec=old_spec, caddy_spec=caddy_spec, other_ids={d["Names"]: d["ID"] for d in self.listed("container") if d["ID"] != args.old_id}, nonce=uuid.uuid4().hex, deadline=int(time.time()) + args.delay, tools=self.tools, driver_sha256=digest(code), website_url=args.website_url, relay_health_url=args.relay_health_url)
+        self.spec = dict(schema=2, txn=args.txn, home=str(self.home), live=str(live), original_sha256=digest(original), caddy_id=args.caddy_id, caddy_name=args.caddy_name, mount_source=args.mount_source, mount_dest=args.mount_dest, caddy_path=args.caddy_path, baseline_networks=caddy_spec["networks"], image_id=args.image_id, old_id=args.old_id, old_spec=old_spec, caddy_spec=caddy_spec, other_ids={d["Names"]: d["ID"] for d in self.listed("container") if d["ID"] != args.old_id}, nonce=uuid.uuid4().hex, deadline=int(time.time()) + args.delay, tools=self.tools, driver_sha256=digest(code), website_url=args.website_url, relay_health_url=args.relay_health_url, docker_endpoint=LOCAL_DOCKER)
         for name in self.update_names():
             need(self.named("container", name) is None, "update temporary/rollback name already exists")
         self.state = dict(schema=2, spec_sha256=digest(encoded(self.spec)), phase="arming", new_intent=False, new_id=None, cutover_at=None, gates_passed=False)
@@ -716,7 +732,7 @@ class Driver:
         self.update_loaded = True
         service = self.timer().replace(".timer", ".service")
         deadline = dt.datetime.fromtimestamp(self.spec["deadline"], dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        exclusive(self.units / service, ("[Unit]\nDescription=DSH Mobile image-update rollback\n[Service]\nType=oneshot\nEnvironment=TZ=UTC\nExecStart=" + self.tools["python"] + " " + str(self.dir / "driver.py") + " --home " + str(self.home) + " rollback " + args.txn + " --spec-sha256 " + self.state["spec_sha256"] + "\nTimeoutStartSec=300\nRestart=on-failure\nRestartSec=10s\n").encode(), 0o600)
+        exclusive(self.units / service, ("[Unit]\nDescription=DSH Mobile image-update rollback\n[Service]\nType=oneshot\nEnvironment=PATH=" + FIXED_PATH + " HOME=" + str(self.home) + " TZ=UTC\nExecStart=/usr/bin/env -i PATH=" + FIXED_PATH + " HOME=" + str(self.home) + " TZ=UTC LC_ALL=C " + self.tools["python"] + " " + str(self.dir / "driver.py") + " --home " + str(self.home) + " rollback " + args.txn + " --spec-sha256 " + self.state["spec_sha256"] + "\nTimeoutStartSec=300\nRestart=on-failure\nRestartSec=10s\n").encode(), 0o600)
         exclusive(self.units / self.timer(), ("[Unit]\nDescription=DSH Mobile independent image-update deadline\n[Timer]\nOnCalendar=" + deadline + "\nAccuracySec=1s\nRandomizedDelaySec=0\nPersistent=true\nUnit=" + service + "\n[Install]\nWantedBy=timers.target\n").encode(), 0o600)
         self.run("systemctl", "--user", "daemon-reload")
         self.run("systemctl", "--user", "enable", "--now", self.timer())
@@ -732,12 +748,18 @@ class Driver:
             cmd.extend(["--network-alias", alias])
         for key, value in (old["Config"].get("Labels") or {}).items():
             cmd.extend(["--label", key + "=" + value])
-        for value in old["Config"].get("Env") or []:
-            cmd.extend(["--env", value])
+        env_values = old["Config"].get("Env") or []
+        need(all(isinstance(v, str) and "=" in v and not any(c in v for c in "\r\n\x00") for v in env_values), "environment cannot round-trip through env-file")
         for flag, key in (("--hostname", "Hostname"), ("--workdir", "WorkingDir"), ("--stop-signal", "StopSignal")):
             if old["Config"].get(key):
                 cmd.extend([flag, old["Config"][key]])
-        created = self.docker(*cmd, args.image_id, *CMD).stdout.decode().strip()
+        env_file = self.dir / "candidate.env"
+        exclusive(env_file, ("\n".join(env_values) + ("\n" if env_values else "")).encode(), 0o600)
+        try:
+            created = self.docker(*cmd, "--env-file", str(env_file), args.image_id, *CMD).stdout.decode().strip()
+        finally:
+            env_file.unlink(missing_ok=True)
+            sync_dir(self.dir)
         need(HEX.fullmatch(created), "create did not return exact candidate ID; inspect before retry")
         self.state["new_id"] = created
         self.save()
@@ -778,8 +800,10 @@ class Driver:
             new = self.update_new()
             need(new is not None, "candidate disappeared")
         need(new["State"].get("Running") is True and new["State"].get("Health", {}).get("Status") == "healthy", "update health gate failed")
+        direct = self.docker("exec", new["Id"], "node", "-e", "fetch('http://127.0.0.1:8088/healthz',{signal:AbortSignal.timeout(5000),cache:'no-store',redirect:'error'}).then(r=>{console.log(r.status);if(r.status!==200)process.exit(1)}).catch(()=>process.exit(1))")
+        need(direct.stdout.strip() == b"200", "exact candidate direct health gate failed")
         for url in (self.spec["website_url"], self.spec["relay_health_url"]):
-            result = self.run("curl", "--fail", "--silent", "--output", "/dev/null", "--write-out", "%{http_code}", "--max-time", "10", url)
+            result = self.run("curl", "-q", "--fail", "--silent", "--output", "/dev/null", "--write-out", "%{http_code}", "--header", "Cache-Control: no-cache", "--max-time", "10", url)
             need(result.stdout.strip() == b"200", "update HTTPS gate failed")
         current = {d["Names"]: d["ID"] for d in self.listed("container") if d["ID"] not in {self.spec["old_id"], self.state["new_id"]}}
         need(current == self.spec["other_ids"], "other container IDs changed")
@@ -806,24 +830,23 @@ class Driver:
             self.disarm()
             return
         self.update_bytes()
-        self.update_caddy()
-        old = self.update_old()
+        # Restore prerequisites are exact pinned IDs, never forward-only gates.
+        # Caddy/candidate drift is diagnostic and cannot strand a stopped old relay.
+        old = self.update_object(self.spec["old_id"])
+        need(old is not None, "pinned old container missing; cannot restore")
+        warnings = []
         # Before cutover, a newly-created candidate may fail full round-trip.
         # Exact returned ID + unpredictable absent-at-arm name + never-started
         # state allow its cleanup without accepting the mismatched restore spec.
-        if self.state["cutover_at"] is None and self.state["new_intent"]:
-            identity = self.state["new_id"]
-            if identity is None:
-                item = self.named("container", self.update_names()[0])
-                identity = item["ID"] if item else None
+        if self.state["new_id"] is None and self.state["new_intent"]:
+            item = self.named("container", self.update_names()[0])
+            identity = item["ID"] if item else None
             new = self.update_object(identity)
             if new:
                 need(new["Name"] == "/" + self.update_names()[0] and new["Image"] == self.spec["image_id"] and new["State"].get("Status") == "created" and new["State"].get("Running") is False and new["Config"].get("Labels") == self.spec["old_spec"]["config"].get("Labels"), "pre-cutover candidate identity changed")
                 self.state["new_id"] = new["Id"]
         else:
-            new = self.update_new()
-        production = self.named("container", RELAY)
-        need(production is None or production["ID"] in {old["Id"], self.state["new_id"]}, "unrelated container owns production name")
+            new = self.update_object(self.state["new_id"])
         self.state["phase"] = "rollingback"
         self.save()
         if new:
@@ -835,16 +858,40 @@ class Driver:
             self.docker("rename", old["Id"], RELAY)
         if not old["State"].get("Running"):
             self.docker("start", old["Id"])
-        restored = self.update_old()
-        until = time.monotonic() + 45
-        while restored["State"].get("Health", {}).get("Status") == "starting" and time.monotonic() < until:
-            time.sleep(1)
-            restored = self.update_old()
-        need(restored["Name"] == "/" + RELAY and restored["State"].get("Running") is True and restored["State"].get("Health", {}).get("Status") == "healthy", "old relay restore failed/not healthy")
+        restored = self.update_object(self.spec["old_id"])
+        need(restored is not None and restored["Name"] == "/" + RELAY and restored["State"].get("Running") is True, "old relay restore failed")
+        # A killed create can leave its private env-file; mutation children inherit
+        # the lock, so rollback cannot unlink it while Docker still reads it.
+        env_file = self.dir / "candidate.env"
+        if env_file.exists():
+            try:
+                read_file(env_file, True)
+                env_file.unlink()
+                sync_dir(self.dir)
+            except (Refusal, OSError):
+                warnings.append("env-file-cleanup-failed")
+        # Collect diagnostics only AFTER restoring; never gate stop/remove/rename/start.
+        try:
+            self.update_caddy()
+        except (Refusal, OSError, KeyError, TypeError):
+            warnings.append("caddy-drift")
+        try:
+            if new:
+                self.update_new_spec(new)
+        except (Refusal, OSError, KeyError, TypeError):
+            warnings.append("candidate-spec-drift")
+        try:
+            if run_spec(restored) != self.spec["old_spec"]:
+                warnings.append("old-spec-drift")
+        except (KeyError, TypeError):
+            warnings.append("old-spec-unreadable")
+        if restored["State"].get("Health", {}).get("Status") != "healthy":
+            warnings.append("old-health-not-yet-healthy")
+        replace_file(self.dir / "rollback-receipt.json", encoded({"old_id": self.spec["old_id"], "candidate_id": self.state["new_id"], "restored": True, "warnings": warnings, "observed_at": dt.datetime.now(dt.timezone.utc).isoformat()}), 0o600)
         self.state["phase"] = "rolledback"
         self.save()
         self.disarm()
-        print("Update rolled back; exact old container/image/spec restored; volume/network/Caddy untouched")
+        print("Update rolled back; pinned old container restored; volume/network/Caddy untouched; warnings=" + ",".join(warnings))
 
     def provision(self, output):
         need(self.state["phase"] in {"applied", "committed"}, "route provisioning requires applied or committed transaction")
