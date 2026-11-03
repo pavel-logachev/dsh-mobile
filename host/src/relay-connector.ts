@@ -86,7 +86,11 @@ export function createRelayConnector(options: RelayConnectorOptions): RelayConne
     ws.on('message', (data, binary) => {
       if (Date.now() - messageEpoch >= 1000) { messageEpoch = Date.now(); messages = 0; smallMessages = 0; }
       const bytes = Buffer.isBuffer(data) ? data.length : MAX_CHUNK + 1;
-      if (!binary || !bytes || bytes > MAX_CHUNK || ++messages > 4096 || (bytes < 256 && ++smallMessages > 64)) ws.terminate();
+      if (!binary || !bytes || bytes > MAX_CHUNK || ++messages > 4096) { ws.terminate(); return; }
+      // Short opaque TLS record tails accompany substantial chunks during uploads.
+      // Replenish one bounded small-message slot per chunk; pure tiny floods still close.
+      if (bytes >= 256) smallMessages = Math.max(0, smallMessages - 1);
+      else if (++smallMessages > 64) ws.terminate();
     });
     ws.on('error', () => {});
     return ws;

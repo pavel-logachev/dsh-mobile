@@ -193,7 +193,11 @@ export function createRelayServer(options: RelayOptions): RelayServer {
   function messageAllowed(meta: PeerMeta, bytes: Buffer, isBinary: boolean): boolean {
     const now = Date.now(); meta.lastActivity = now;
     if (now - meta.rateStart >= 1000) { meta.rateStart = now; meta.rateCount = 0; }
-    return isBinary && bytes.length > 0 && bytes.length <= MESSAGE_LIMIT && ++meta.rateCount <= limits.messagesPerSecond && (bytes.length >= 256 || smallRate(meta));
+    if (!isBinary || bytes.length === 0 || bytes.length > MESSAGE_LIMIT || ++meta.rateCount > limits.messagesPerSecond) return false;
+    // Opaque TLS chunks may end in short record tails. Charge small messages against
+    // a bounded burst, replenishing one slot per substantial chunk (never a lifetime cap).
+    if (bytes.length >= 256) { meta.smallCount = Math.max(0, meta.smallCount - 1); return true; }
+    return smallRate(meta);
   }
   function send(ws: WebSocket, bytes: Buffer, source?: WebSocket): boolean {
     const meta = peers.get(ws);

@@ -166,6 +166,28 @@ test('raw stream crosses the 2-MiB API snapshot size without a tunnel lifetime c
   } finally { await f.close(); }
 });
 
+test('large opaque uploads admit short TLS tails in both directions but still reject a small-message flood', async () => {
+  const f = await fixture();
+  try {
+    await f.publish(); const mobile = f.mobile(); await mobile.opened(); const open = await f.control.json();
+    const host = f.join(open); await host.opened(); await mobile.json(); await host.json();
+    // Node TLS writes split into a full WS chunk and a short encrypted-record tail.
+    // A 5-MiB transfer has more than 64 such tails without being a tiny-message flood.
+    const chunks = Array.from({ length: 160 }, (_, i) => [Buffer.alloc(32768, i), Buffer.alloc(44, i)]).flat();
+    for (const [source, destination] of [[mobile, host], [host, mobile]]) {
+      for (const chunk of chunks) {
+        await new Promise<void>((resolve, reject) => source!.ws.send(chunk, { binary: true, fin: true, compress: false }, error => error ? reject(error) : resolve()));
+        assert.deepEqual(await destination!.next(), chunk);
+      }
+    }
+    assert.equal(f.relay.stats().active, 1);
+    const closed = mobile.closed();
+    for (let i = 0; i < 65; i++) mobile.ws.send(Buffer.alloc(44));
+    await closed; await host.closed();
+    assert.equal(f.relay.stats().active, 0);
+  } finally { await f.close(); }
+});
+
 test('malformed control, text payload, oversized payload and fragmented payload fail closed', async () => {
   for (const kind of ['control', 'text', 'oversize', 'fragment'] as const) {
     const f = await fixture();

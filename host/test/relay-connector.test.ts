@@ -6,7 +6,8 @@ import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { createRelayServer, RelayState } from '../../relay/src/index.ts';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createRelayConnector } from '../src/relay-connector.ts';
 import { HostState } from '../src/state.ts';
@@ -72,6 +73,36 @@ test('text and fragmented application controls fail closed without publication',
     } else f.control()!.send(JSON.stringify({ type: 'ack', requestId: f.snapshots[0].requestId }));
     await assert.rejects(wait, { code: 'unavailable' }); assert.equal(f.connector.status().connected, false);
   }
+});
+
+test('connector accepts a 5-MiB burst with short opaque TLS tails without weakening tiny-message flood bounds', { timeout: 15000 }, async t => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-mobile-connector-burst-')));
+  const state = new HostState(join(dir, 'host.sqlite')), relayState = new RelayState(':memory:'), route = relayState.provisionRoute();
+  const relay = createRelayServer({ state: relayState, port: 0 });
+  const outer = await relay.start();
+  const chunks: Buffer[] = [];
+  let received = 0;
+  const targetBytes = (32768 + 44) * 160;
+  let complete!: () => void;
+  const done = new Promise<void>(resolve => { complete = resolve; });
+  const tcp = createTcpServer(socket => socket.on('data', chunk => { chunks.push(chunk); received += chunk.length; if (received === targetBytes) complete(); }));
+  await new Promise<void>(resolve => tcp.listen(0, '127.0.0.1', resolve));
+  const connector = createRelayConnector({ relay: { url: outer.baseUrl, ...route }, state, targetPort: (tcp.address() as { port: number }).port, allowInsecureLoopback: true });
+  let mobile: WebSocket | undefined;
+  t.after(async () => { mobile?.terminate(); await connector.close(); await relay.close(); await new Promise<void>(resolve => tcp.close(() => resolve())); state.close(); relayState.close(); rmSync(dir, { recursive: true, force: true }); });
+  connector.start();
+  const offer = state.createRemotePairing(grants, route.routeId); await connector.waitPublished(offer.relayAccess.accessId);
+  mobile = new WebSocket(outer.baseUrl + '/v1/mobile', { headers: { Authorization: `Bearer ${offer.relayAccess.accessToken}`, 'X-DSH-Route': route.routeId, 'X-DSH-Access': offer.relayAccess.accessId }, perMessageDeflate: false });
+  mobile.on('error', () => {});
+  assert.equal(JSON.parse((await once(mobile, 'message'))[0].toString()).type, 'ready');
+  const expected = Array.from({ length: 160 }, (_, i) => [Buffer.alloc(32768, i), Buffer.alloc(44, i)]).flat();
+  const closed = once(mobile, 'close');
+  for (const part of expected) await new Promise<void>((resolve, reject) => mobile!.send(part, { binary: true, fin: true, compress: false }, error => error ? reject(error) : resolve()));
+  await Promise.race([done, closed.then(() => { throw new Error('closed_before_complete_upload'); })]);
+  assert.equal(received, targetBytes);
+  assert.equal(createHash('sha256').update(Buffer.concat(chunks)).digest('hex'), createHash('sha256').update(Buffer.concat(expected)).digest('hex'));
+  for (let i = 0; i < 65; i++) mobile.send(Buffer.alloc(44));
+  await closed;
 });
 
 test('missing ACK times out without publication and close rejects waiters safely', { timeout: 10000 }, async t => {
