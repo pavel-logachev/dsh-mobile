@@ -1,6 +1,6 @@
 import { HostError } from './errors.ts';
 
-export const HOST_VERSION = '0.9.2';
+export const HOST_VERSION = '0.9.3';
 export interface PhoneCapabilities { steer: boolean; queue: boolean; rename: boolean; models: boolean; questions: boolean; questionSkip?: boolean; fileDownload?: boolean; attachments: boolean }
 export type Delivery = 'queue' | 'steer';
 export interface AttachmentRef { id: string; name: string; size: number; mime: string; kind: 'image' | 'file' }
