@@ -45,7 +45,7 @@ internal fun Composer(state: MobileState, model: MobileViewModel, onCancel: () -
     val inputEnabled = canEditDraft(state, model.interactionBlocked)
     val motion = motionEnabled
     Surface(color = MaterialTheme.colorScheme.background) {
-        Column(Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 10.dp),
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             // Queue and delivery cards animate their own entry, exit and disclosure; the stack itself must not add a
             // second, lagging size animation on top (it showed as an empty card shrinking after its rows had gone).

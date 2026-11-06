@@ -12,6 +12,18 @@ class ChatSearchTest {
         assertTrue(searchHistory(messages, " ").isEmpty())
         assertTrue(searchHistory(messages, "absent").isEmpty())
     }
+    @Test fun `search excludes classified service but preserves user prefix and explicit human XML`() {
+        val messages = listOf(
+            ChatMessage("runtime", "user", "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nCANARY cwd", 1),
+            ChatMessage("system", "system", "CANARY system", 2),
+            ChatMessage("event", "user", "CANARY event", 3, kind = "agent_event"),
+            ChatMessage("mixed", "user", "CANARY user\n\n<system-reminder>CANARY suffix</system-reminder>", 4),
+            ChatMessage("explicit", "user", "CANARY human\n\n<system-reminder>CANARY literal XML</system-reminder>", 5, kind = "user"))
+        val matches = searchHistory(messages, "CANARY")
+        assertEquals(listOf("mixed", "explicit", "explicit"), matches.map { it.messageId })
+        assertTrue(searchHistory(messages, "cwd").isEmpty())
+        assertTrue(searchHistory(messages, "suffix").isEmpty())
+    }
     @Test fun `navigation wraps in both directions and empty results have no selection`() {
         assertEquals(0, nextSearchIndex(2, 3, 1))
         assertEquals(2, nextSearchIndex(0, 3, -1))

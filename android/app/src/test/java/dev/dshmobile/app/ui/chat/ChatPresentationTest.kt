@@ -53,14 +53,54 @@ class ChatPresentationTest {
         }
     }
 
-    @Test fun `timeline never publishes old or equal-copy inputs during replacement and clearing`() {
+    @Test fun `timeline never publishes removed content during replacement and clearing`() {
         val old = listOf(message("old", "Obsolete answer", role = "assistant"))
         val projection = TimelineProjection(old, chatItems(old))
         assertSame(projection.items, visibleTimeline(old, projection))
         assertNull(visibleTimeline(listOf(message("new", "Replacement", role = "assistant")), projection))
-        assertNull(visibleTimeline(old.toList(), projection))
+        assertEquals(projection.items, visibleTimeline(old.toList(), projection))
         assertEquals(emptyList<ChatItem>(), visibleTimeline(emptyList(), projection))
         assertNull(visibleTimeline(old, null))
+    }
+
+    @Test fun `pending append and streamed text retain overlapping timeline keys without stale text`() {
+        val user = message("u", "Question")
+        val answer = message("a", "Partial", role = "assistant")
+        val input = listOf(user, answer)
+        val projection = TimelineProjection(input, chatItems(input))
+        assertEquals(listOf("u", "a"), visibleTimeline(input + message("next", "Next question"), projection)!!.map { it.id })
+        val streamed = visibleTimeline(listOf(user, answer.copy(text = "Partial continued")), projection)!!
+        assertEquals("Partial continued", (streamed.last() as ChatItem.Message).message.text)
+        assertEquals(listOf("u"), visibleTimeline(listOf(user, answer.copy(role = "user", text = "Replaced")), projection)!!.map { it.id })
+        assertNull(visibleTimeline(listOf(answer.copy(role = "system", text = "Replacement")), projection))
+    }
+
+    @Test fun `completion and equal inputs keep new assistant content and source order`() {
+        val user = message("u", "Question")
+        val partial = message("provisional:a", "Answer", role = "assistant").copy(provisional = true)
+        val saved = partial.copy(id = "saved", provisional = false)
+        val projection = TimelineProjection(listOf(user, partial), chatItems(listOf(user, partial)))
+        assertEquals(listOf(ChatItem.Message(user), ChatItem.Message(saved)), visibleTimeline(listOf(user, saved), projection))
+        val single = TimelineProjection(listOf(partial), chatItems(listOf(partial)))
+        assertEquals(listOf(ChatItem.Message(saved)), visibleTimeline(listOf(saved), single))
+        assertNull(visibleTimeline(listOf(saved.copy(text = "Replacement")), single))
+        assertEquals(listOf("saved", "u"), visibleTimeline(listOf(saved, user), projection)!!.map { it.id })
+        val namedSuffix = message("suffix:real", "A real id", role = "assistant")
+        val suffixProjection = TimelineProjection(listOf(namedSuffix), chatItems(listOf(namedSuffix)))
+        assertEquals(listOf(ChatItem.Message(namedSuffix)), visibleTimeline(listOf(namedSuffix.copy()), suffixProjection))
+    }
+
+    @Test fun `pending projection drops removed or changed service content including legacy suffixes`() {
+        val user = message("u", "Question\n\n<system-reminder>Old context</system-reminder>")
+        val event = message("e", "Old event", "agent_event")
+        val answer = message("a", "Answer", role = "assistant")
+        val input = listOf(user, event, answer)
+        val projection = TimelineProjection(input, chatItems(input))
+        val retained = visibleTimeline(listOf(answer), projection)!!
+        assertEquals(listOf(ChatItem.Message(answer)), retained)
+        val changed = visibleTimeline(listOf(user.copy(text = "Changed"), event.copy(text = "New event"), answer), projection)!!
+        assertEquals(listOf(ChatItem.Message(answer)), changed)
+        assertEquals(emptyList<ChatItem>(), visibleTimeline(emptyList(), projection))
     }
 
     @Test fun `mixed legacy suffix stays available and explicit host human XML stays whole`() {

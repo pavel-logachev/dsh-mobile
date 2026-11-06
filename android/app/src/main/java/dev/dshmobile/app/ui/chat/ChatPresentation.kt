@@ -112,9 +112,55 @@ internal class TimelineInputKey(private val input: List<ChatMessage>) {
     override fun equals(other: Any?) = other is TimelineInputKey && input === other.input
     override fun hashCode() = System.identityHashCode(input)
 }
-/** null means loading; authoritative empty input never exposes a prior surface. */
-internal fun visibleTimeline(input: List<ChatMessage>, projection: TimelineProjection?): List<ChatItem>? =
-    if (input.isEmpty()) emptyList() else projection?.takeIf { it.input === input }?.items
+/**
+ * Keep overlapping rows mounted while the next off-main classification is pending. Removing every
+ * row for one loading frame destroys LazyColumn's key/offset anchor on each send or stream chunk.
+ * Never retain removed/replaced content: only equal source messages can reuse a classified row.
+ * Assistant text needs no legacy user-message classification, so streaming can render immediately.
+ */
+internal fun visibleTimeline(input: List<ChatMessage>, projection: TimelineProjection?): List<ChatItem>? {
+    if (input.isEmpty()) return emptyList()
+    projection ?: return null
+    if (projection.input === input) return projection.items
+    val current = input.associateBy { it.id }
+    val previous = projection.input.associateBy { it.id }
+    fun retained(message: ChatMessage): Boolean {
+        // Legacy service suffixes use a derived id, but belong to their original user message.
+        val sourceId = if (message.id !in previous && message.id.startsWith("suffix:")) message.id.removePrefix("suffix:") else message.id
+        val old = previous[sourceId] ?: return false
+        return current[sourceId] == old
+    }
+    val overlap = projection.items.mapNotNull { item ->
+        when (item) {
+            is ChatItem.Message -> {
+                val next = current[item.id]
+                when {
+                    retained(item.message) -> item
+                    next?.role == "assistant" && next.kind == null && item.message.role == "assistant" && item.message.kind == null -> ChatItem.Message(next)
+                    else -> null
+                }
+            }
+            is ChatItem.Activity -> item.messages.filter(::retained).takeIf { it.isNotEmpty() }?.let { item.copy(messages = it) }
+        }
+    }
+    // New assistant ids also arrive when a provisional reply becomes its saved message. Render
+    // these directly too; otherwise a long visible reply disappears until classification completes.
+    val completingReply = projection.input.lastOrNull()?.let { old ->
+        old.provisional && old.role == "assistant" && input.lastOrNull()?.let { it.role == "assistant" && it.text == old.text } == true
+    } == true
+    if (overlap.isEmpty() && !completingReply) return null
+    val represented = overlap.filterIsInstance<ChatItem.Message>().mapTo(HashSet()) { it.id }
+    val assistants = input.filter { it.role == "assistant" && it.kind !in setOf("context", "agent_event") && it.id !in represented }
+        .map { ChatItem.Message(it) }
+    val positions = input.withIndex().associate { it.value.id to it.index * 2 }
+    fun position(item: ChatItem): Int = when (item) {
+        is ChatItem.Message -> positions.getValue(item.id)
+        is ChatItem.Activity -> item.messages.minOf { message ->
+            positions[message.id] ?: (positions[message.id.removePrefix("suffix:")]?.plus(1) ?: Int.MAX_VALUE)
+        }
+    }
+    return (overlap + assistants).sortedBy(::position).takeIf { it.isNotEmpty() }
+}
 
 internal fun activityStartedAt(snapshot: SessionSnapshot): Long? = snapshot.activityDetail?.turnStartedAt
     ?: snapshot.messages.asReversed().firstOrNull { it.role == "user" && presentMessage(it).kind !in setOf("agent_event", "context") }?.createdAt

@@ -49,14 +49,14 @@ class UiPolishTest {
         compose.onNodeWithTag("select_message_text").performScrollTo().assertIsDisplayed()
         capture("message-select")
     }
-    @Test fun loadedSearchMovesToMatchIncludingCollapsedServiceText() {
+    @Test fun loadedSearchMovesToConversationMatchWithoutReclassifyingServiceText() {
         val messages = (0..30).map { ChatMessage("m$it", if (it == 15) "system" else "assistant", "Loaded match $it", it.toLong()) }
         val session = SessionSummary("s", "Synthetic", "w", 1, false, true)
-        val selected = mutableStateOf(SearchMatch("m15", 7, 12))
+        val selected = mutableStateOf(SearchMatch("m16", 7, 12))
         compose.setContent { MobileTheme { ChatTimeline(SessionSnapshot(session, messages, 1, true, "idle"), null, {},
             searchQuery = "match", selectedMatch = selected.value) } }
-        compose.waitUntil(timeoutMillis = 5_000) { compose.onAllNodesWithTag("search_text:m15", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithTag("search_text:m15", useUnmergedTree = true).assertIsDisplayed()
+        compose.waitUntil(timeoutMillis = 5_000) { compose.onAllNodesWithTag("search_text:m16", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("search_text:m16", useUnmergedTree = true).assertIsDisplayed()
         capture("search-match")
         compose.runOnIdle { selected.value = SearchMatch("m0", 7, 12) }
         compose.waitUntil(timeoutMillis = 5_000) { compose.onAllNodesWithTag("search_text:m0", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }

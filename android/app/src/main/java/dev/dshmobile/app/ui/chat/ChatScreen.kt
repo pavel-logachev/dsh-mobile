@@ -2,6 +2,8 @@ package dev.dshmobile.app.ui.chat
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -84,7 +86,15 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
     val modelName = currentModel?.let { selected -> model.modelCatalog?.items?.find { it.provider == selected.provider && it.id == selected.model }?.name ?: selected.model }
     val header = snapshot?.session ?: state.sessions.firstOrNull { it.id == requestedSession }
     val motion = motionEnabled
-    Scaffold(containerColor = MaterialTheme.colorScheme.background, snackbarHost = { SnackbarHost(snackbars) },
+    BoxWithConstraints(Modifier.fillMaxSize().imePadding()) {
+    // Reserve conversation space before measuring the non-weighted Scaffold bottom bar. In a
+    // short window the existing controls scroll in their own capped band, not over the question.
+    // With a landscape IME even the app bar and demo band can consume the physical viewport.
+    // Keep a usable layout extent and let the same screen scroll, rather than clipping questions.
+    val layoutHeight = maxOf(maxHeight, 360.dp)
+    val bottomLimit = layoutHeight * if (layoutHeight < 600.dp) 0.30f else 0.45f
+    Box(Modifier.verticalScroll(rememberScrollState()).testTag("chat_short_window_scroll")) {
+    Scaffold(modifier = Modifier.height(layoutHeight), containerColor = MaterialTheme.colorScheme.background, snackbarHost = { SnackbarHost(snackbars) },
         topBar = { CenterAlignedTopAppBar(navigationIcon = {
             IconButton(onClick = onBack, modifier = Modifier.testTag("chat_drawer")) { Icon(MobileIcons.ChevronLeft, stringResource(R.string.mobile_chats), Modifier.size(IconSize.Action)) }
         }, title = {
@@ -134,7 +144,7 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
         }, colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = MaterialTheme.colorScheme.background,
             scrolledContainerColor = MaterialTheme.colorScheme.background)) },
         bottomBar = {
-            Column {
+            Column(Modifier.heightIn(max = bottomLimit).verticalScroll(rememberScrollState()).testTag("chat_bottom_controls")) {
                 ChatActivity(visibleState, model.sendingSessionId == visibleState.snapshot?.session?.id && model.sendingSessionId != null)
                 Composer(visibleState, model, onCancel = { cancel = true }, onModels = { imagesNeeded = true; models = true; model.loadModels() })
             }
@@ -204,6 +214,8 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
                     stringResource(if (state.connection == ConnectionState.ONLINE) R.string.mobile_chat_unavailable_body else R.string.mobile_history_unavailable))
             }
         }
+    }
+    }
     }
     viewer?.let { (refs, index) ->
         val timestamp = snapshot?.messages?.firstOrNull { message -> message.attachments.any { a -> a.id == refs.firstOrNull()?.id } }?.createdAt

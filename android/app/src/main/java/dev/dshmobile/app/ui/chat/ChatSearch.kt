@@ -8,7 +8,9 @@ internal data class SearchMatch(val messageId: String, val start: Int, val end: 
 internal fun searchHistory(messages: List<ChatMessage>, query: String): List<SearchMatch> {
     if (query.isBlank()) return emptyList()
     return buildList {
-        messages.forEach { message ->
+        // Search the same presented user/assistant text as the timeline. Service-only messages
+        // and legacy suffixes remain available in Agent activity, never as conversation matches.
+        chatItems(messages).filterIsInstance<ChatItem.Message>().forEach { (message) ->
             var from = 0
             while (from <= message.text.length - query.length) {
                 val start = message.text.indexOf(query, from, ignoreCase = true)
