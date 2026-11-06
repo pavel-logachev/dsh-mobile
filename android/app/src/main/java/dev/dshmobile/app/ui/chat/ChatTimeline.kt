@@ -120,11 +120,8 @@ internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, o
         val previous = value?.items.orEmpty()
         value = TimelineProjection(input, classify(input, previous))
     }
-    // Search includes all loaded messages, including normally collapsed service activity.
-    val searchItems = remember(snapshot.messages, searchQuery.isNotBlank()) {
-        if (searchQuery.isNotBlank()) snapshot.messages.map { ChatItem.Message(it) } else null
-    }
-    val visible = searchItems ?: visibleTimeline(snapshot.messages, projection)
+    // Searching changes highlights/navigation, never the classification of service activity.
+    val visible = visibleTimeline(snapshot.messages, projection)
     val loading = visible == null
     val timeline = visible.orEmpty()
     val messageCount = timeline.size + if (unconfirmed != null) 1 else 0
