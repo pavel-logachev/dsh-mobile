@@ -99,10 +99,10 @@ internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, o
     questions: (@Composable () -> Unit)? = null,
     media: (@Composable (ChatMessage) -> Unit)? = null,
     questionTarget: String? = null,
+    list: LazyListState = rememberLazyListState(),
     classify: suspend (List<ChatMessage>, List<ChatItem>) -> List<ChatItem> = { messages, previous ->
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { chatItems(messages, previous) }
     }) {
-    val list = rememberLazyListState()
     val motion = motionEnabled
     // New items fade in where they land; existing rows do not glide, so following and restored scroll stay exact.
     val itemFade = remember(motion) { if (motion) Motion.tween<Float>(Motion.Medium, true) else null }
@@ -160,7 +160,14 @@ internal fun ChatTimeline(snapshot: SessionSnapshot, pending: PendingCommand?, o
     LaunchedEffect(questionTarget, questions != null, loading) {
         if (questionTarget != null && questions != null && !loading) { following = true; list.scrollToItem((if (snapshot.hasMore) 1 else 0) + timeline.size) }
     }
-    LaunchedEffect(messageCount, timeline, loading, questions != null) {
+    val sendRequestId = pending?.takeIf { it.kind == "send" && it.sessionId == snapshot.session.id && it.status == "sending" }?.requestId
+    var followedSend by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(messageCount, timeline, loading, questions != null, sendRequestId) {
+        if (sendRequestId != null && sendRequestId != followedSend) {
+            followedSend = sendRequestId
+            following = true
+            unread = false
+        }
         if (loading || searchQuery.isNotBlank()) return@LaunchedEffect
         if (following && totalItems > 0) {
             autoScrolling.intValue++
