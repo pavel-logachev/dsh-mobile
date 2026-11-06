@@ -285,7 +285,7 @@ test('R07 legacy false terminal HTTP checkpoint is replaced by authoritative res
   const result = await json(await h.request(h.url([id]), phone.deviceToken));
   assert.equal(result.outcomes[0].status, 'queued');
   const saved = h.host().state.outcomeCheckpoint(phone.deviceId, id, rpcId)!;
-  assert.equal(saved.nextSeq, 1); assert.equal(saved.consumptionVersion, 2);
+  assert.equal(saved.nextSeq, 1); assert.equal(saved.consumptionVersion, 3);
   // Late legacy writers and same-version lower cursors cannot restore false evidence.
   h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, consumptionVersion: undefined, nextSeq: 9000, outcome: { ...saved.outcome, status: 'completed' } });
   h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, nextSeq: 0, outcome: { ...saved.outcome, status: 'unknown' } });
@@ -303,9 +303,27 @@ test('discarded queued prompt repairs persisted v1 unknown after restart without
   const result = await json(await h.request(h.url([id]), phone.deviceToken));
   assert.deepEqual(result.outcomes, [{ requestId: id, status: 'rejected', updatedAt: '1970-01-01T00:00:01.001Z' }]);
   const saved = h.host().state.outcomeCheckpoint(phone.deviceId, id, rpcId)!;
-  assert.equal(saved.consumptionVersion, 2); assert.equal(saved.nextSeq, 2);
-  // A late v1 fold with a higher cursor cannot resurrect the already-cleared watch.
-  h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, consumptionVersion: 1, nextSeq: 9000, outcome: { ...saved.outcome, status: 'unknown' } });
+  assert.equal(saved.consumptionVersion, 3); assert.equal(saved.nextSeq, 2);
+  // Neither old proof version can resurrect the already-cleared watch.
+  for (const consumptionVersion of [1, 2] as const) h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, consumptionVersion, nextSeq: 9000, outcome: { ...saved.outcome, status: 'unknown' } });
+  assert.deepEqual(await json(await h.request(h.url([id]), phone.deviceToken)), result);
+  assert.equal(h.prompted.length, 1);
+});
+
+test('known stopped turn repairs a durable v2 unknown through HTTP after restart, without resending', async t => {
+  const h = await setup(t), phone = h.pair(), id = randomUUID();
+  assert.equal((await h.send(phone.deviceToken, id)).status, 200); const rpcId = h.prompted[0]!;
+  h.append('turn/start', { turn: 1 });
+  h.append('user/message', { source: { kind: 'user', rpcId } });
+  h.append('turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } });
+  h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { consumptionVersion: 2, nextSeq: 3, caughtUp: true,
+    turn: 1, approvals: [], questions: [], outcome: { requestId: rpcId, status: 'unknown', turnId: '1', updatedAt: '1970-01-01T00:00:01.002Z' } });
+  await h.restart();
+  const result = await json(await h.request(h.url([id]), phone.deviceToken));
+  assert.deepEqual(result.outcomes, [{ requestId: id, status: 'failed', turnId: '1', summary: 'Задача остановлена до получения результата.', updatedAt: '1970-01-01T00:00:01.002Z' }]);
+  const saved = h.host().state.outcomeCheckpoint(phone.deviceId, id, rpcId)!;
+  assert.equal(saved.consumptionVersion, 3);
+  h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, consumptionVersion: 2, nextSeq: 9000, outcome: { ...saved.outcome, status: 'unknown' } });
   assert.deepEqual(await json(await h.request(h.url([id]), phone.deviceToken)), result);
   assert.equal(h.prompted.length, 1);
 });
