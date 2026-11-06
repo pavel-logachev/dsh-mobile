@@ -16,6 +16,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.core.content.edit
 import dev.dshmobile.app.R
 import dev.dshmobile.app.data.*
 import dev.dshmobile.app.model.MobileState
@@ -32,10 +33,22 @@ import kotlinx.coroutines.launch
     var failed by remember { mutableStateOf(false) }
     var permissionPending by remember { mutableStateOf(false) }
     var permitted by remember { mutableStateOf(watchAlertsAllowed(context)) }
+    val permissionHistory = remember(context) { context.getSharedPreferences("notification-permissions", android.content.Context.MODE_PRIVATE) }
+    val activity = remember(context) { generateSequence(context) { (it as? android.content.ContextWrapper)?.baseContext }.filterIsInstance<android.app.Activity>().firstOrNull() }
+    // Android retains a previous denial on upgrade even before this local history exists.
+    var permissionDenied by remember { mutableStateOf(permissionHistory.getBoolean("denied", false) ||
+        (Build.VERSION.SDK_INT >= 33 && activity != null && androidx.core.app.ActivityCompat.shouldShowRequestPermissionRationale(activity, Manifest.permission.POST_NOTIFICATIONS))) }
+    fun recordDenial(denied: Boolean) {
+        permissionDenied = denied
+        permissionHistory.edit { putBoolean("denied", denied) }
+    }
     val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current
     DisposableEffect(lifecycle, context) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) permitted = watchAlertsAllowed(context)
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                permitted = watchAlertsAllowed(context)
+                if (permitted) recordDenial(false)
+            }
         }
         lifecycle.lifecycle.addObserver(observer)
         onDispose { lifecycle.lifecycle.removeObserver(observer) }
@@ -58,9 +71,10 @@ import kotlinx.coroutines.launch
     }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         permissionPending = false; permitted = allowed
+        recordDenial(!allowed)
         change(allowed)
     }
-    NotificationSettingsContent(enabled, loading || permissionPending, failed, !permitted,
+    NotificationSettingsContent(enabled, loading || permissionPending, failed || (permissionDenied && !permitted), !permitted,
         onEnabled = { value ->
             if (value && Build.VERSION.SDK_INT >= 33 && !watchAlertsAllowed(context)) {
                 permissionPending = true; permission.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -79,6 +93,7 @@ import kotlinx.coroutines.launch
     }
     Text(stringResource(if (supported) R.string.notif_rationale else R.string.notif_outcomes_unavailable), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-    if (failed || permissionMissing) Text(stringResource(R.string.notif_blocked), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+    if (failed) Text(stringResource(R.string.notif_blocked), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+    else if (permissionMissing) Text(stringResource(R.string.notif_permission_needed), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     SettingsLinkRow(stringResource(R.string.notif_system), onSystem)
 }

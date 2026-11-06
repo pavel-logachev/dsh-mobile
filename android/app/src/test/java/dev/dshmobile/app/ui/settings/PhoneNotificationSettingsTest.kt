@@ -45,6 +45,20 @@ class PhoneNotificationSettingsTest {
     @Test fun `N6 permission missing and busy render honest disabled controls`() {
         compose.setContent { MaterialTheme { Column { NotificationSettingsContent(true, true, false, true, {}, {}) } } }
         compose.onNode(isToggleable()).assertIsOff().assertIsNotEnabled()
+        compose.onNodeWithText("Не удалось включить уведомления.", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Разрешите уведомления, чтобы узнавать о результате задач.").assertIsDisplayed()
+    }
+    @Test fun firstPermissionRequestIsNeutralAndEnableActionRemainsAvailable() {
+        var enabledRequested = false
+        compose.setContent { MaterialTheme { Column { NotificationSettingsContent(true, false, false, true, { enabledRequested = it }, {}) } } }
+        compose.onNodeWithText("Не удалось включить уведомления.", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Разрешите уведомления, чтобы узнавать о результате задач.").assertIsDisplayed()
+        compose.onNode(isToggleable()).assertIsOff().assertIsEnabled().performClick()
+        assertTrue(enabledRequested)
+    }
+    @Test fun actualFailureKeepsErrorInsteadOfNeutralPermissionHint() {
+        compose.setContent { MaterialTheme { Column { NotificationSettingsContent(false, false, true, true, {}, {}) } } }
         compose.onNodeWithText("Не удалось включить уведомления.", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("Разрешите уведомления, чтобы узнавать о результате задач.").assertDoesNotExist()
     }
 }

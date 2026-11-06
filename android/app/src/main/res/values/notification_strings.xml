@@ -6,6 +6,7 @@
     <string name="notif_needs_decision">Response needed</string>
     <string name="notif_rationale">Notify when a task sent from this phone finishes or needs your response. Tap to open its chat. With no active phone tasks, the background connection is stopped.</string>
     <string name="notif_blocked">Notifications could not be enabled. Check notification access and system restrictions, then try again.</string>
+    <string name="notif_permission_needed">Allow notifications to hear when tasks finish.</string>
     <string name="notif_system">System notification settings</string>
     <string name="notif_unnamed_chat">Untitled chat</string>
     <string name="notif_watch_channel">Phone tasks</string>
