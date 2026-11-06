@@ -70,6 +70,43 @@ class ChatScrollRegressionTest {
             assertEquals("Completion moved the viewport", position, list.firstVisibleItemIndex to list.firstVisibleItemScrollOffset)
         } finally { compose.runOnIdle { gate.complete(Unit) }; trace("finish-projected"); save("finish-regression") }
     }
+    // Completion shrinks the content. The invariant is the bottom gap, not the old maximum
+    // absolute offset. This passes on c031419 too; it records the clarified owner contract.
+    @Test fun finishingAtBottomKeepsBottomEdgePinnedEveryFrame() {
+        val reply = ChatMessage("provisional:bottom", "assistant", "Streamed line\n\n".repeat(60), 50, provisional = true)
+        val state = mutableStateOf(SessionSnapshot(session, history + reply, 1, false, "running"))
+        val gaps = mutableListOf<Int>()
+        var sample = false
+        compose.setContent { MaterialTheme {
+            list = rememberLazyListState()
+            DisposableEffect(list) {
+                val choreographer = android.view.Choreographer.getInstance()
+                val callback = object : android.view.Choreographer.FrameCallback {
+                    override fun doFrame(time: Long) {
+                        val info = list.layoutInfo
+                        val tail = info.visibleItemsInfo.lastOrNull { it.index == info.totalItemsCount - 1 }
+                        if (sample) gaps.add(tail?.let { it.offset + it.size + info.afterContentPadding - info.viewportEndOffset } ?: Int.MAX_VALUE)
+                        choreographer.postFrameCallback(this)
+                    }
+                }
+                choreographer.postFrameCallback(callback)
+                onDispose { choreographer.removeFrameCallback(callback) }
+            }
+            androidx.compose.foundation.layout.Column(Modifier.height(480.dp)) {
+                ChatTimeline(state.value, null, {}, Modifier.weight(1f), list = list)
+                ChatActivity(MobileState(connection = ConnectionState.ONLINE, snapshot = state.value))
+            }
+        } }
+        compose.waitUntil(10000) { compose.onAllNodesWithTag("chat_classification_loading").fetchSemanticsNodes().isEmpty() }
+        compose.waitForIdle()
+        compose.runOnIdle { sample = true; state.value = state.value.copy(messages = history + reply.copy(id = "saved-bottom", provisional = false), activity = "idle", cursor = 2) }
+        compose.waitForIdle(); Thread.sleep(200); compose.waitForIdle()
+        compose.runOnIdle { sample = false }
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        java.io.File(context.cacheDir, "finish-bottom-gaps.csv").writeText("frame,bottomGapPx\n" + gaps.mapIndexed { index, gap -> "$index,$gap" }.joinToString("\n"))
+        assertTrue("No finish frames observed", gaps.isNotEmpty())
+        assertTrue("Bottom moved relative to viewport: $gaps", gaps.all { it == 0 })
+    }
     @Test fun streamingDoesNotResetReaderPositionWhileProjectionWaits() {
         val reply = ChatMessage("reply", "assistant", "Streaming line", 50, provisional = true)
         val state = mutableStateOf(SessionSnapshot(session, history + reply, 1, false, "running"))

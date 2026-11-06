@@ -52,7 +52,10 @@ class ChatScrollStandTest {
                 val callback = object : android.view.Choreographer.FrameCallback {
                     override fun doFrame(time: Long) {
                         val info = list.layoutInfo
-                        traces.add("$time,$stage,${list.firstVisibleItemIndex},${list.firstVisibleItemScrollOffset},${info.totalItemsCount},${list.canScrollForward}")
+                        val tail = info.visibleItemsInfo.lastOrNull { it.index == info.totalItemsCount - 1 }
+                        val bottomGap = tail?.let { it.offset + it.size + info.afterContentPadding - info.viewportEndOffset }
+                        traces.add("$time,$stage,${list.firstVisibleItemIndex},${list.firstVisibleItemScrollOffset},${info.totalItemsCount},${list.canScrollForward},$bottomGap")
+                        if (stage == "finish-bottom" && bottomGap != 0) violations.add("finish-bottom gap=$bottomGap px")
                         if (stage in setOf("send", "stream", "read-stream") && info.totalItemsCount < 10) violations.add("$stage collapsed to ${info.totalItemsCount} items")
                         if (stage == "read-stream" && readingIndex >= 0 && (list.firstVisibleItemIndex != readingIndex || list.firstVisibleItemScrollOffset != readingOffset)) violations.add("reader moved to ${list.firstVisibleItemIndex}/${list.firstVisibleItemScrollOffset}")
                         if (sampling) choreographer.postFrameCallback(this)
@@ -122,9 +125,21 @@ class ChatScrollStandTest {
             compose.runOnIdle { stage = "finish-reply" }
             control("finish"); update(); capture("finished-reply")
             if (insideReply != (list.firstVisibleItemIndex to list.firstVisibleItemScrollOffset)) violations.add("completion moved reader inside reply")
+            // Finish at the exact bottom, including the disappearing provisional/footer and activity row.
+            compose.runOnIdle { stage = "bottom-setup" }
+            compose.onNodeWithTag("new_messages").performClick(); settle()
+            val third = UUID.randomUUID().toString()
+            assertEquals("accepted", api.command(StoredCommand(third, "send", session, "SCROLL_SYNTHETIC_REPLY", delivery = "queue")).status)
+            update()
+            repeat(30) { control("step"); delay(50); update() }
+            if (list.canScrollForward) violations.add("not at bottom before finish")
+            capture("before-finish-bottom")
+            compose.runOnIdle { stage = "finish-bottom" }
+            control("finish"); update(); capture("finished-bottom")
+            compose.runOnIdle { stage = "done" }
         } finally {
             compose.runOnIdle { sampling = false }
-            File(context.cacheDir, "$run-trace.csv").writeText("nanos,stage,index,offset,count,canScrollForward\n" + traces.joinToString("\n"))
+            File(context.cacheDir, "$run-trace.csv").writeText("nanos,stage,index,offset,count,canScrollForward,bottomGapPx\n" + traces.joinToString("\n"))
             File(context.cacheDir, "$run-violations.txt").writeText(violations.distinct().joinToString("\n"))
             api.closeAndAwait()
         }
