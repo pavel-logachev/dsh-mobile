@@ -6,6 +6,7 @@
     <string name="notif_needs_decision">Нужен ответ</string>
     <string name="notif_rationale">Сообщим, когда задача, отправленная с этого телефона, завершится или потребует ответа. Нажатие открывает чат. Когда таких задач нет, фоновое подключение отключено.</string>
     <string name="notif_blocked">Не удалось включить уведомления. Проверьте разрешение и системные ограничения, затем повторите попытку.</string>
+    <string name="notif_permission_needed">Разрешите уведомления, чтобы узнавать о результате задач.</string>
     <string name="notif_system">Системные настройки уведомлений</string>
     <string name="notif_unnamed_chat">Чат без названия</string>
     <string name="notif_watch_channel">Задачи с телефона</string>

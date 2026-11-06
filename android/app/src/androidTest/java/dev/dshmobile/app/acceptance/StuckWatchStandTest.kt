@@ -25,7 +25,22 @@ class StuckWatchStandTest {
     @Test fun stage(): Unit = runBlocking {
         val stage = InstrumentationRegistry.getArguments().getString("watchStage") ?: return@runBlocking
         when (stage) {
-            "journey" -> {
+            "inspect" -> {
+                // Opt-in metadata only. Never export pairing credentials, chat text or cipher keys.
+                val local = store.read()
+                val report = org.json.JSONObject().apply {
+                    put("sampledAt", System.currentTimeMillis()); put("enabled", local.enabled)
+                    put("watches", org.json.JSONArray(local.watches.map { watch -> org.json.JSONObject().apply {
+                        put("sessionId", watch.sessionId); put("requestId", watch.requestId); put("expiresAt", watch.expiresAt)
+                    } }))
+                    put("outbox", org.json.JSONArray(local.outbox.map { alert -> org.json.JSONObject().apply {
+                        put("sessionId", alert.sessionId); put("kind", alert.kind); put("attempted", alert.attempted); put("expiresAt", alert.expiresAt)
+                    } }))
+                    put("serviceRunning", serviceRunning()); put("foregroundItemPresent", manager.activeNotifications.any { it.id == 1 })
+                }
+                java.io.File(context.cacheDir, "watch-diagnostics.json").writeText(report.toString(2))
+            }
+            "journey", "cancel-before", "cancel-after", "offline-after" -> {
                 val file = java.io.File(context.cacheDir, "watch-stand.json")
                 val config = JSONObject(file.readText()); file.delete()
                 val host = PairedHost(HostEndpoint(config.getString("baseUrl")), config.getString("deviceId"),
@@ -59,6 +74,35 @@ class StuckWatchStandTest {
                             java.io.File(context.getExternalFilesDir(null), "$name-$kind.txt").outputStream().use { input.copyTo(it) }
                         }
                     }
+                }
+                if (stage.startsWith("cancel-")) {
+                    send()
+                    if (stage == "cancel-after") capture("watch-active")
+                    control("cancel"); control("evidence")
+                    if (stage == "cancel-before") {
+                        delay(1500)
+                        assertEquals(1, store.read().watches.size)
+                        assertTrue(serviceRunning()); assertTrue(manager.activeNotifications.any { it.id == 1 })
+                        capture(stage)
+                    } else {
+                        waitFor { store.read().watches.isEmpty() && !serviceRunning() }
+                        assertTrue(manager.activeNotifications.none { it.id == 1 }); assertTrue(store.read().outbox.isEmpty())
+                        assertTrue(manager.activeNotifications.none { it.id == 2 })
+                        capture(stage)
+                    }
+                    return@runBlocking
+                }
+                if (stage == "offline-after") {
+                    send()
+                    // Suspend the actual service without erasing its encrypted watch; host settles independently.
+                    context.stopService(Intent(context, NotificationService::class.java))
+                    waitFor { !serviceRunning() }; control("complete")
+                    assertEquals(1, store.read().watches.size)
+                    resumePhoneWatches(context)
+                    waitFor { store.read().watches.isEmpty() && !serviceRunning() }
+                    assertTrue(manager.activeNotifications.none { it.id == 1 }); assertTrue(store.read().outbox.isEmpty())
+                    capture(stage)
+                    return@runBlocking
                 }
                 control("start"); send(); control("remove")
                 waitFor { store.read().watches.isEmpty() && !serviceRunning() }
