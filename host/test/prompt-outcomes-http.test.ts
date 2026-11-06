@@ -310,14 +310,14 @@ test('discarded queued prompt repairs persisted v1 unknown after restart without
   assert.equal(h.prompted.length, 1);
 });
 
-test('user stopped turn repairs durable v3 failed through HTTP after restart, without resending', async t => {
+test('user stopped turn repairs non-terminal v3 unknown through HTTP after restart, without resending', async t => {
   const h = await setup(t), phone = h.pair(), id = randomUUID();
   assert.equal((await h.send(phone.deviceToken, id)).status, 200); const rpcId = h.prompted[0]!;
   h.append('turn/start', { turn: 1 });
   h.append('user/message', { source: { kind: 'user', rpcId } });
   h.append('turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } });
   h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { consumptionVersion: 3, nextSeq: 3, caughtUp: true,
-    turn: 1, approvals: [], questions: [], outcome: { requestId: rpcId, status: 'failed', summary: 'Задача остановлена до получения результата.', turnId: '1', updatedAt: '1970-01-01T00:00:01.002Z' } });
+    turn: 1, approvals: [], questions: [], outcome: { requestId: rpcId, status: 'unknown', turnId: '1', updatedAt: '1970-01-01T00:00:01.002Z' } });
   await h.restart();
   const result = await json(await h.request(h.url([id]), phone.deviceToken));
   assert.deepEqual(result.outcomes, [{ requestId: id, status: 'rejected', turnId: '1', updatedAt: '1970-01-01T00:00:01.002Z' }]);
@@ -326,6 +326,44 @@ test('user stopped turn repairs durable v3 failed through HTTP after restart, wi
   h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, consumptionVersion: 3, nextSeq: 9000, outcome: { ...saved.outcome, status: 'failed' } });
   assert.deepEqual(await json(await h.request(h.url([id]), phone.deviceToken)), result);
   assert.equal(h.prompted.length, 1);
+});
+
+test('F1 HTTP restart preserves old proven completed over a valid journal above 16MiB without opening it', async t => {
+  const h = await setup(t), phone = h.pair(), id = randomUUID();
+  assert.equal((await h.send(phone.deviceToken, id)).status, 200); const rpcId = h.prompted[0]!;
+  h.append('turn/start', { turn: 1 }); h.append('user/message', { source: { kind: 'user', rpcId } }); h.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+  for (let i = 0; i < 40; i++) h.append('session/title', { title: 'x'.repeat(512 * 1024), messageSeqs: [], source: { kind: 'user' } });
+  assert.ok(Buffer.byteLength(JSON.stringify(h.journal)) > 16 * 1024 * 1024);
+  const outcome = { requestId: rpcId, status: 'completed' as const, turnId: '1', updatedAt: '1970-01-01T00:00:01.002Z' };
+  h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { consumptionVersion: 2, nextSeq: 3, caughtUp: true, turn: 1, approvals: [], questions: [], outcome });
+  await h.restart(); let opens = 0; h.beforeOpen(async () => { opens++; });
+  const result = await json(await h.request(h.url([id]), phone.deviceToken));
+  assert.deepEqual(result.outcomes, [{ ...outcome, requestId: id }]); assert.equal(opens, 0); assert.equal(h.calls.length, 0);
+  const saved = h.host().state.outcomeCheckpoint(phone.deviceId, id, rpcId)!;
+  assert.equal(saved.consumptionVersion, 4); assert.equal(saved.nextSeq, 3);
+  h.host().state.saveOutcomeCheckpoint(phone.deviceId, id, rpcId, { ...saved, consumptionVersion: 3, nextSeq: 9000, outcome: { ...outcome, status: 'failed' } });
+  await h.restart(); assert.deepEqual((await json(await h.request(h.url([id]), phone.deviceToken))).outcomes, result.outcomes);
+});
+
+test('F2 HTTP exposes consuming user-stop immediately during another IDs partial byte scan and survives restart', async t => {
+  const h = await setup(t), phone = h.pair(), ids = [randomUUID(), randomUUID()];
+  for (const id of ids) assert.equal((await h.send(phone.deviceToken, id)).status, 200);
+  h.append('turn/start', { turn: 1 }); h.append('user/message', { source: { kind: 'user', rpcId: h.prompted[0] } }); h.append('turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } });
+  h.append('turn/start', { turn: 2 }); h.append('user/message', { source: { kind: 'user', rpcId: h.prompted[1] } });
+  for (let i = 0; i < 40; i++) h.append('session/title', { title: 'x'.repeat(512 * 1024), messageSeqs: [], source: { kind: 'user' } });
+  h.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
+  const first = await json(await h.request(h.url(ids), phone.deviceToken));
+  assert.deepEqual(first.outcomes.map((o: any) => o.status), ['rejected', 'unknown']);
+  const stopped = h.host().state.outcomeCheckpoint(phone.deviceId, ids[0]!, h.prompted[0]!)!;
+  assert.equal((stopped as any).terminalReason, 'user-stop'); assert.equal(stopped.nextSeq, 3); assert.equal(stopped.caughtUp, true);
+  const continuing = h.host().state.outcomeCheckpoint(phone.deviceId, ids[1]!, h.prompted[1]!)!;
+  assert.equal(continuing.caughtUp, false); assert.ok(continuing.nextSeq > 5);
+  await h.restart(); const before = h.calls.length;
+  const second = await json(await h.request(h.url(ids), phone.deviceToken));
+  assert.deepEqual(second.outcomes.map((o: any) => o.status), ['rejected', 'completed']);
+  assert.equal(h.calls[before]!.offset, continuing.nextSeq);
+  const reads = h.calls.length; h.beforeOpen(async () => { throw Error('terminal batch must not open'); });
+  assert.deepEqual((await json(await h.request(h.url(ids), phone.deviceToken))).outcomes, second.outcomes); assert.equal(h.calls.length, reads);
 });
 
 test('R09 session remap while reader.close yields cannot publish outcome or checkpoint', async t => {

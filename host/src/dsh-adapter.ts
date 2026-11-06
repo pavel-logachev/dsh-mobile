@@ -1,5 +1,5 @@
 import { PhoneProjection, sessionModel, mutationAnswer } from './phone-projection.ts';
-import { derivePromptOutcomes, provenTerminal } from './prompt-outcomes.ts';
+import { derivePromptOutcomes, provenTerminal, restorePromptCheckpoint } from './prompt-outcomes.ts';
 import type { PromptJournal, PromptLookup, OutcomeCheckpoint } from './prompt-outcomes.ts';
 import { createHash } from 'node:crypto';
 import { attachmentRefs, questionsOf, queueOf, record, validateAnswer, safeFileMime, UPLOAD_LIMIT, IMAGE_MIMES } from './phone.ts';
@@ -582,7 +582,8 @@ export class DshAdapter implements HostAdapter {
       const { workspaceId, view, revision } = await this.pointScope(sessionId, active);
       if (workspaceId !== expectedWorkspaceId || !this.options.promptJournal) throw new HostError('not_found');
       // Proven terminal checkpoints need no journal open/decoder allocation.
-      if (lookups.every(item => item.checkpoint && provenTerminal(item.checkpoint))) return lookups.map(item => structuredClone(item.checkpoint!));
+      const restored = lookups.map(restorePromptCheckpoint);
+      if (restored.every(provenTerminal)) return restored;
       const reader = await this.options.promptJournal.open(sessionId, active);
       let results: OutcomeCheckpoint[];
       try { results = await derivePromptOutcomes(reader, lookups, active); }

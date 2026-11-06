@@ -8,6 +8,8 @@ export interface OutcomeCheckpoint {
   nextSeq: number; caughtUp?: boolean; openTurn?: number; turn?: number;
   /** v1 proves consumption; v2 distinguishes discard; v3 settles failures; v4 silences explicit user stops. */
   consumptionVersion?: 1 | 2 | 3 | 4;
+  /** Only consuming turn/end aborted/user, never a provisional inbox discard. */
+  terminalReason?: 'user-stop';
   pending?: { target: string; index: number }; approvals: string[]; questions: string[];
   outcome: PromptOutcome;
 }
@@ -28,8 +30,27 @@ const END_FAILURES: Readonly<Record<string, string>> = {
   'max-tokens': 'Достигнут лимит токенов. Полный результат не получен.',
   interrupted: 'Выполнение задачи прервано. Результат не получен.',
 };
-export const provenTerminal = (c: OutcomeCheckpoint) => c.consumptionVersion === 4 && !c.pending && (c.outcome.status === 'completed' || c.outcome.status === 'failed');
+export const provenTerminal = (c: OutcomeCheckpoint) => c.consumptionVersion === 4 && !c.pending &&
+  (c.outcome.status === 'completed' || c.outcome.status === 'failed' ||
+    (c.outcome.status === 'rejected' && c.terminalReason === 'user-stop' && c.turn !== undefined));
 const terminal = provenTerminal;
+/** Preserve results already proven under their own contract. Never bless cv1 or pending. */
+export function restorePromptCheckpoint(item: PromptLookup): OutcomeCheckpoint {
+  const prior = item.checkpoint;
+  const oldTerminal = prior && (prior.consumptionVersion === 2 || prior.consumptionVersion === 3) && !prior.pending &&
+    (prior.outcome.status === 'completed' || prior.outcome.status === 'failed');
+  if (oldTerminal || prior?.consumptionVersion === 4) {
+    const restored = structuredClone(prior!);
+    restored.consumptionVersion = 4;
+    // In the previous cv4 fold only consuming aborted/user produced rejected
+    // with a turn. Inbox discard always deleted turn; preserve that distinction
+    // when adding the explicit discriminator, without rewinding a cv4 cursor.
+    if (prior?.consumptionVersion === 4 && restored.outcome.status === 'rejected' && restored.turn !== undefined && !restored.pending) restored.terminalReason = 'user-stop';
+    if (terminal(restored)) restored.caughtUp = true;
+    return restored;
+  }
+  return { consumptionVersion: 4, nextSeq: 0, approvals: [], questions: [], outcome: unknownOutcome(item.requestId) };
+}
 export const unknownOutcome = (requestId: string): PromptOutcome => ({ requestId, status: 'unknown', updatedAt: '1970-01-01T00:00:00.000Z' });
 export function outcomeToken(outcomes: readonly PromptOutcome[]): string { return createHash('sha256').update(JSON.stringify(outcomes)).digest('base64url'); }
 
@@ -41,21 +62,25 @@ export function outcomeToken(outcomes: readonly PromptOutcome[]): string { retur
  */
 export async function derivePromptOutcomes(reader: JournalReader, lookups: readonly PromptLookup[], signal: AbortSignal): Promise<OutcomeCheckpoint[]> {
   if (lookups.length > 32) throw new HostError('invalid_request');
-  // Re-scan old proofs once: v1 lost discard, v2 lost unsuccessful endings,
-  // v3 alerted on explicit user stop. Pre-v1 could contain false consumption.
-  const states = lookups.map(item => item.checkpoint?.consumptionVersion === 4 ? structuredClone(item.checkpoint) : { consumptionVersion: 4, nextSeq: 0, approvals: [], questions: [], outcome: unknownOutcome(item.requestId) } as OutcomeCheckpoint);
+  const states = lookups.map(restorePromptCheckpoint);
   const active = states.filter(c => !terminal(c));
   if (!active.length) return states;
   let offset = Math.min(...active.map(c => c.nextSeq)), bytes = 0, count = 0, caughtUp = false;
-  while (count < MAX_EVENTS) {
+  scan: while (count < MAX_EVENTS) {
     signal.throwIfAborted();
     const { events } = await reader.read(offset, Math.min(PAGE, MAX_EVENTS - count), { signal });
     signal.throwIfAborted();
     if (events.length > PAGE) throw new HostError('unavailable');
     if (!events.length) { caughtUp = true; break; }
     for (const raw of events) {
-      bytes += Buffer.byteLength(JSON.stringify(raw));
-      if (bytes > MAX_BYTES) throw new HostError('unavailable');
+      const eventBytes = Buffer.byteLength(JSON.stringify(raw));
+      if (bytes + eventBytes > MAX_BYTES) {
+        // Yield only between events. A single >16MiB event at the cursor is
+        // unavailable, never skipped: its consuming evidence may be essential.
+        if (count === 0) throw new HostError('unavailable');
+        break scan;
+      }
+      bytes += eventBytes;
       const e = object(raw), d = object(e.data);
       if (e.seq !== offset || !Number.isSafeInteger(e.time) || Number(e.time) < 0) throw new HostError('unavailable');
       for (let i = 0; i < states.length; i++) {
@@ -112,7 +137,9 @@ export async function derivePromptOutcomes(reader: JournalReader, lookups: reado
           if (c.turn === d.turn) {
             const reason = object(d.reason);
             if (reason.kind === 'completed') update('completed');
-            else if (reason.kind === 'aborted' && object(reason.reason).kind === 'user') update('rejected');
+            else if (reason.kind === 'aborted' && object(reason.reason).kind === 'user') {
+              update('rejected'); c.terminalReason = 'user-stop';
+            }
             else if (reason.kind === 'error') update('failed', safeFailure(reason.error).message);
             else if (typeof reason.kind === 'string' && Object.hasOwn(END_FAILURES, reason.kind)) update('failed', END_FAILURES[reason.kind]);
             else update('unknown');
@@ -123,6 +150,9 @@ export async function derivePromptOutcomes(reader: JournalReader, lookups: reado
         c.nextSeq = offset + 1;
       }
       offset++; count++;
+      // Do not account for, validate or decode unrelated returned-page tail once
+      // every request is proven. Mixed batches keep scanning only active rows.
+      if (states.every(terminal)) break scan;
     }
     if (events.length < PAGE) { caughtUp = true; break; }
     if (states.every(terminal)) break;
