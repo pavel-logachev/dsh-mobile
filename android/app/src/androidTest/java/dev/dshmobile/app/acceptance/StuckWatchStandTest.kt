@@ -87,7 +87,7 @@ class StuckWatchStandTest {
                     } else {
                         waitFor { store.read().watches.isEmpty() && !serviceRunning() }
                         assertTrue(manager.activeNotifications.none { it.id == 1 }); assertTrue(store.read().outbox.isEmpty())
-                        assertTrue(manager.activeNotifications.any { it.notification.extras.getString("android.title") == context.getString(dev.dshmobile.app.R.string.notif_task_failed) })
+                        assertTrue(manager.activeNotifications.none { it.id == 2 })
                         capture(stage)
                     }
                     return@runBlocking

@@ -75,12 +75,26 @@ test('known unsuccessful turn endings settle failed, including persisted v2 unkn
   };
   for (const [kind, summary] of Object.entries(summaries)) {
     const events = [event('turn/start', { turn: 1 }, 0), event('user/message', message(), 1),
-      event('turn/end', { turn: 1, reason: { kind, ...(kind === 'aborted' ? { reason: { kind: 'user' } } : {}) } }, 2)];
+      event('turn/end', { turn: 1, reason: { kind, ...(kind === 'aborted' ? { reason: { kind: 'parent' } } : {}) } }, 2)];
     const old = { consumptionVersion: 2 as const, nextSeq: 3, caughtUp: true, turn: 1, approvals: [], questions: [],
       outcome: { requestId: id, status: 'unknown' as const, turnId: '1', updatedAt: '1970-01-01T00:00:01.002Z' } };
     for (const checkpoint of [undefined, JSON.parse(JSON.stringify(old))]) {
       const [result] = await derivePromptOutcomes(reader(events), [{ requestId: id, checkpoint }], signal());
       assert.deepEqual(result!.outcome, { requestId: id, status: 'failed', turnId: '1', summary, updatedAt: '1970-01-01T00:00:01.002Z' });
+    }
+  }
+});
+
+test('only explicit user abort settles silently, including rederived v3 failed checkpoints', async () => {
+  for (const cause of ['user', 'parent', 'disposed', 'hook', 'future', undefined]) {
+    const events = [event('turn/start', { turn: 1 }, 0), event('user/message', message(), 1),
+      event('turn/end', { turn: 1, reason: { kind: 'aborted', ...(cause ? { reason: { kind: cause } } : {}) } }, 2)];
+    const old = { consumptionVersion: 3 as const, nextSeq: 3, caughtUp: true, turn: 1, approvals: [], questions: [],
+      outcome: { requestId: id, status: 'failed' as const, turnId: '1', summary: 'Задача остановлена до получения результата.', updatedAt: '1970-01-01T00:00:01.002Z' } };
+    for (const checkpoint of [undefined, JSON.parse(JSON.stringify(old))]) {
+      const [result] = await derivePromptOutcomes(reader(events), [{ requestId: id, checkpoint }], signal());
+      assert.equal(result!.outcome.status, cause === 'user' ? 'rejected' : 'failed');
+      assert.equal(result!.outcome.summary, cause === 'user' ? undefined : old.outcome.summary);
     }
   }
 });

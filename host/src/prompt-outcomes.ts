@@ -6,8 +6,8 @@ export type PromptStatus = 'unknown' | 'queued' | 'running' | 'waiting' | 'compl
 export interface PromptOutcome { requestId: string; status: PromptStatus; turnId?: string; summary?: string; updatedAt: string }
 export interface OutcomeCheckpoint {
   nextSeq: number; caughtUp?: boolean; openTurn?: number; turn?: number;
-  /** v1 proves consumption; v2 distinguishes discard; v3 settles known unsuccessful endings. */
-  consumptionVersion?: 1 | 2 | 3;
+  /** v1 proves consumption; v2 distinguishes discard; v3 settles failures; v4 silences explicit user stops. */
+  consumptionVersion?: 1 | 2 | 3 | 4;
   pending?: { target: string; index: number }; approvals: string[]; questions: string[];
   outcome: PromptOutcome;
 }
@@ -28,7 +28,7 @@ const END_FAILURES: Readonly<Record<string, string>> = {
   'max-tokens': 'Достигнут лимит токенов. Полный результат не получен.',
   interrupted: 'Выполнение задачи прервано. Результат не получен.',
 };
-export const provenTerminal = (c: OutcomeCheckpoint) => c.consumptionVersion === 3 && !c.pending && (c.outcome.status === 'completed' || c.outcome.status === 'failed');
+export const provenTerminal = (c: OutcomeCheckpoint) => c.consumptionVersion === 4 && !c.pending && (c.outcome.status === 'completed' || c.outcome.status === 'failed');
 const terminal = provenTerminal;
 export const unknownOutcome = (requestId: string): PromptOutcome => ({ requestId, status: 'unknown', updatedAt: '1970-01-01T00:00:00.000Z' });
 export function outcomeToken(outcomes: readonly PromptOutcome[]): string { return createHash('sha256').update(JSON.stringify(outcomes)).digest('base64url'); }
@@ -41,9 +41,9 @@ export function outcomeToken(outcomes: readonly PromptOutcome[]): string { retur
  */
 export async function derivePromptOutcomes(reader: JournalReader, lookups: readonly PromptLookup[], signal: AbortSignal): Promise<OutcomeCheckpoint[]> {
   if (lookups.length > 32) throw new HostError('invalid_request');
-  // Re-scan old proofs once: v1 lost discard, v2 lost unsuccessful turn endings,
-  // and pre-v1 could contain a false consuming turn. Restoration is read-only.
-  const states = lookups.map(item => item.checkpoint?.consumptionVersion === 3 ? structuredClone(item.checkpoint) : { consumptionVersion: 3, nextSeq: 0, approvals: [], questions: [], outcome: unknownOutcome(item.requestId) } as OutcomeCheckpoint);
+  // Re-scan old proofs once: v1 lost discard, v2 lost unsuccessful endings,
+  // v3 alerted on explicit user stop. Pre-v1 could contain false consumption.
+  const states = lookups.map(item => item.checkpoint?.consumptionVersion === 4 ? structuredClone(item.checkpoint) : { consumptionVersion: 4, nextSeq: 0, approvals: [], questions: [], outcome: unknownOutcome(item.requestId) } as OutcomeCheckpoint);
   const active = states.filter(c => !terminal(c));
   if (!active.length) return states;
   let offset = Math.min(...active.map(c => c.nextSeq)), bytes = 0, count = 0, caughtUp = false;
@@ -112,6 +112,7 @@ export async function derivePromptOutcomes(reader: JournalReader, lookups: reado
           if (c.turn === d.turn) {
             const reason = object(d.reason);
             if (reason.kind === 'completed') update('completed');
+            else if (reason.kind === 'aborted' && object(reason.reason).kind === 'user') update('rejected');
             else if (reason.kind === 'error') update('failed', safeFailure(reason.error).message);
             else if (typeof reason.kind === 'string' && Object.hasOwn(END_FAILURES, reason.kind)) update('failed', END_FAILURES[reason.kind]);
             else update('unknown');
