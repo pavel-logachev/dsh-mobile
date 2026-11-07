@@ -51,10 +51,7 @@ internal fun ChatScreen(state: MobileState, model: MobileViewModel, requestedSes
         if (model.phoneError != null && model.phoneErrorAction == "model") snackbars.showSnackbar(modelChangeFailed)
     }
     val haptic = rememberActionHaptic()
-    val refreshChat = {
-        if (requestedSession != null) model.selectSession(requestedSession)
-        else model.refresh()
-    }
+    val refreshChat = { model.manualReconnect(requestedSession) }
     val onCopy: (String) -> Unit = { text -> scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("DSH", text))); haptic(); snackbars.showSnackbar(copied) } }
     var cancel by remember { mutableStateOf(false) }
     var rename by remember { mutableStateOf(false) }

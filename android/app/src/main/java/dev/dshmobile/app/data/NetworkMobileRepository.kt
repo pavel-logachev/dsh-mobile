@@ -115,7 +115,7 @@ internal class NetworkMobileRepository(
     @Volatile private var pairingTransport: HostApi? = null
     @Volatile private var foreground = false
     @Volatile private var desiredForeground = false
-    private val diagnostic = ConnectionDiagnostic(foreground = { foreground && desiredForeground }, network = connectionFlags)
+    private val diagnostic = ConnectionDiagnostic(foreground = { foreground && desiredForeground }, network = connectionFlags, reconnectAttempt = { reconnectAttempt })
     private var foregroundRevision = 0L
     private val lifecycle = Any()
     @Volatile private var closed = false
@@ -124,7 +124,7 @@ internal class NetworkMobileRepository(
     private var snapshotIngress: SnapshotIngress<SessionSnapshot>? = null
     private var firstSnapshotRead: kotlinx.coroutines.CompletableDeferred<SessionSnapshot>? = null
     private var reconnectJob: Job? = null
-    private var reconnectAttempt = 0
+    @Volatile private var reconnectAttempt = 0
     private var networkWakeJob: Job? = null
     private var unregisterNetworkWake: (() -> Unit)? = null
 
@@ -471,7 +471,8 @@ internal class NetworkMobileRepository(
         catch (failure: Exception) { safeDebugDiagnostic(checkpoint, failure); throw failure }
         finally { pairingTransport = null; pairingApi.close() }
     }
-    override suspend fun refresh() {
+    override suspend fun refresh() = manualReconnect()
+    override suspend fun manualReconnect(sessionId: String?) {
         diagnostic.record("manual-refresh", "queued")
         action {
         diagnostic.record("manual-refresh", "entered")
@@ -482,7 +483,22 @@ internal class NetworkMobileRepository(
         try {
             restoreLocked()
             if (stored.host == null) throw MobileFailure("not_paired")
-            if (foreground) refreshLocked()
+            if (foreground) {
+                if (sessionId == null) refreshLocked()
+                else {
+                    if (!validId(sessionId)) throw MobileFailure("invalid_selection")
+                    stopListRefresh()
+                    val revision = synchronized(selectionGuard) {
+                        selection?.cancel(); historyRead?.cancel()
+                        requestedSessionId = sessionId
+                        observingSession = true
+                        cancelProjectionRetry(); prefetch.cancel()
+                        ++selectionRevision
+                    }
+                    refreshLocked(readHistory = false)
+                    if (revision == selectionRevision && observingSession) selectLocked(sessionId, revision, metadataReady = true)
+                }
+            }
         } finally { mutableState.value = state.value.copy(manualRefreshing = false) }
         }
     }
@@ -1269,10 +1285,15 @@ internal class NetworkMobileRepository(
         })
     }
     private fun scheduleReconnect() {
+        if (reconnectAttempt >= 6) {
+            diagnostic.record("reconnect-scheduled", "exhausted")
+            return
+        }
+        if (!foreground || closed || stored.host == null || reconnectJob?.isActive == true) return
+        val attempt = reconnectAttempt++
         diagnostic.record("reconnect-scheduled", "queued")
-        if (!foreground || closed || stored.host == null || reconnectJob?.isActive == true || reconnectAttempt >= 6) return
         reconnectJob = scope.launch {
-            delay(retryDelay(reconnectAttempt++))
+            delay(retryDelay(attempt))
             reconnectJob = null
             action { if (foreground && state.value.connection == ConnectionState.OFFLINE) refreshLocked() }
         }

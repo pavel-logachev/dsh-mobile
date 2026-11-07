@@ -153,7 +153,20 @@ class MobileViewModel @JvmOverloads constructor(application: Application,
         val name = deviceName.trim().ifBlank { defaultName }
         pairingInput.pair(review, name)
     }
-    fun refresh() { viewModelScope.launch { repository.refresh() } }
+    fun refresh() = manualReconnect()
+    fun manualReconnect(sessionId: String? = null) {
+        if (interactionBlocked) return
+        interactionBlocked = true
+        viewModelScope.launch {
+            try {
+                editorActions.withLock { repository.manualReconnect(sessionId) }
+                if (pendingDraftWrites == 0) {
+                    editorSessionId = state.value.snapshot?.session?.id
+                    editorDraft = state.value.draft
+                }
+            } finally { interactionBlocked = false }
+        }
+    }
     fun selectSession(id: String) {
         if (interactionBlocked) return
         firstTaskContinuation = null // Explicit navigation supersedes the pending first-task intent.

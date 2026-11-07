@@ -24,6 +24,9 @@ class AuditViewModelFixTest {
             capabilities = MobileCapabilities(true, true, true, false, false, true, false, false),
             snapshot = SessionSnapshot(SessionSummary("chat", "Synthetic", "w", 1, false, true), emptyList(), 1, false, "idle")))
         override val acceptedCreate = MutableStateFlow<CreateAcceptance?>(null)
+        val manualTargets = mutableListOf<String?>()
+        var manualGate: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+        override suspend fun manualReconnect(sessionId: String?) { manualTargets.add(sessionId); manualGate?.await() }
         var forgetCalls = 0
         var answerStatus: String? = null
         var answerError: String? = null
@@ -45,6 +48,38 @@ class AuditViewModelFixTest {
         override suspend fun forget() { forgetCalls++; state.value = MobileState() }
         override suspend fun setForeground(active: Boolean) {}
         override fun close() {}
+    }
+    @Test fun `chat and details explicit retry share manual boundary and duplicate admission guard`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val repo = Repo(); val vm = MobileViewModel(RuntimeEnvironment.getApplication()) { repo }
+        val models = androidx.lifecycle.ViewModelStore().apply { put("vm", vm) }
+        try {
+            runCurrent()
+            vm.selectSession("chat"); runCurrent()
+            assertTrue(repo.manualTargets.isEmpty())
+            repo.manualGate = kotlinx.coroutines.CompletableDeferred()
+            vm.manualReconnect("chat"); vm.manualReconnect("chat"); runCurrent()
+            assertEquals(listOf("chat"), repo.manualTargets)
+            assertTrue(vm.interactionBlocked)
+            repo.manualGate!!.complete(Unit); runCurrent()
+            assertFalse(vm.interactionBlocked)
+            vm.refresh(); runCurrent()
+            assertEquals(listOf("chat", null), repo.manualTargets)
+        } finally { models.clear(); Dispatchers.resetMain() }
+    }
+    @Test fun `manual callback cancellation releases guard without a second retry`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val repo = Repo(); val vm = MobileViewModel(RuntimeEnvironment.getApplication()) { repo }
+        val models = androidx.lifecycle.ViewModelStore().apply { put("vm", vm) }
+        try {
+            runCurrent()
+            repo.manualGate = kotlinx.coroutines.CompletableDeferred()
+            vm.manualReconnect("chat"); runCurrent()
+            assertTrue(vm.interactionBlocked)
+            models.clear(); runCurrent()
+            assertFalse(vm.interactionBlocked)
+            assertEquals(listOf("chat"), repo.manualTargets)
+        } finally { models.clear(); Dispatchers.resetMain() }
     }
     @Test fun `AND04 legacy answers bounded across navigation and cleared by forget`() = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))

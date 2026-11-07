@@ -15,6 +15,7 @@ internal class ConnectionDiagnostic(
     private val sink: (String) -> Unit = { Log.i("DshMobileConn", it); Unit },
     private val foreground: () -> Boolean = { false },
     private val network: () -> ConnectionNetwork = { ConnectionNetwork() },
+    private val reconnectAttempt: () -> Int = { 0 },
 ) {
     private val attempts = AtomicInteger()
     private val origin = clock()
@@ -29,12 +30,12 @@ internal class ConnectionDiagnostic(
         emitted++
         runCatching {
             val flags = network().copy(blocked = blocked)
-            sink(line(stage, if (failure != null) code(failure) else code, failure, attempts.get(), instant - startedAt, foreground(), flags))
+            sink(line(stage, if (failure != null) code(failure) else code, failure, attempts.get(), instant - startedAt, foreground(), flags, reconnectAttempt()))
         }
     }
     companion object {
         private val stages = setOf("restore", "connect", "relay-open", "snapshot", "sse-open", "sse-fail", "reconnect-scheduled", "manual-refresh", "network-callback", "foreground", "http", "list-tick")
-        private val codes = setOf("ok", "start", "fail", "unknown", "timeout", "tls", "io", "dns", "cancelled", "closed", "available", "capabilities", "blocked", "unblocked", "lost", "queued", "entered", "background", "foreground", "network_unavailable", "tls_failed", "invalid_response", "host_error", "rate_limited", "unauthorized", "revoked", "forbidden", "chat_unavailable", "storage_failed", "incompatible_protocol")
+        private val codes = setOf("ok", "start", "fail", "unknown", "timeout", "tls", "io", "dns", "cancelled", "closed", "available", "capabilities", "blocked", "unblocked", "lost", "queued", "entered", "exhausted", "background", "foreground", "network_unavailable", "tls_failed", "invalid_response", "host_error", "rate_limited", "unauthorized", "revoked", "forbidden", "chat_unavailable", "storage_failed", "incompatible_protocol")
         fun code(failure: Throwable): String = when (failure) {
             is MobileFailure -> failure.key.takeIf { it in codes } ?: "unknown"
             is java.net.SocketTimeoutException, is java.io.InterruptedIOException -> "timeout"
@@ -60,8 +61,8 @@ internal class ConnectionDiagnostic(
             is kotlinx.coroutines.CancellationException -> "CancellationException"
             else -> "other"
         }
-        fun line(stage: String, code: String, failure: Throwable?, attempt: Int, elapsedMs: Long, foreground: Boolean, network: ConnectionNetwork): String =
-            "stage=${stage.takeIf { it in stages } ?: "unknown"} code=${code.takeIf { it in codes } ?: "unknown"} exception=${exception(failure)} attempt=${attempt.coerceAtLeast(0)} elapsedMs=${elapsedMs.coerceAtLeast(0)} foreground=$foreground validated=${network.validated ?: "unknown"} vpn=${network.vpn ?: "unknown"} blocked=${network.blocked ?: "unknown"}"
+        fun line(stage: String, code: String, failure: Throwable?, attempt: Int, elapsedMs: Long, foreground: Boolean, network: ConnectionNetwork, reconnectAttempt: Int = 0): String =
+            "stage=${stage.takeIf { it in stages } ?: "unknown"} code=${code.takeIf { it in codes } ?: "unknown"} exception=${exception(failure)} connectSequence=${attempt.coerceAtLeast(0)} reconnectAttempt=${reconnectAttempt.coerceAtLeast(0)} elapsedMs=${elapsedMs.coerceAtLeast(0)} foreground=$foreground validated=${network.validated ?: "unknown"} vpn=${network.vpn ?: "unknown"} blocked=${network.blocked ?: "unknown"}"
     }
 }
 

@@ -2036,7 +2036,37 @@ class RepositoryTest {
         }
     }
 
-    private suspend fun withRepository(now: () -> Long = System::currentTimeMillis, preHeaderRetryDelay: (Int) -> Long = { 0L }, block: suspend (NetworkMobileRepository, MemoryStore, Fixture, CoroutineScope) -> Unit) {
+    @Test fun `review r2 chat reconnect replenishes exhausted automatic recovery budget`() = runBlocking {
+        val retries = java.util.concurrent.CopyOnWriteArrayList<Int>()
+        withRepository(retryDelay = { retries.add(it); 0L }) { repo, _, fixture, _ ->
+            fixture.failIndex = true
+            repo.refresh()
+            withTimeout(5000) {
+                while (retries.size < 6 || repo.state.value.connection != ConnectionState.OFFLINE) kotlinx.coroutines.delay(10)
+            }
+            kotlinx.coroutines.delay(100)
+            assertEquals(listOf(0, 1, 2, 3, 4, 5), retries.toList())
+            val requests = fixture.requests.count { it.path == "/v1/capabilities" }
+            repo.selectSession("chat") // Automatic/navigation selection must NOT rearm the exhausted window.
+            kotlinx.coroutines.delay(100)
+            assertEquals(6, retries.size)
+            repo.manualReconnect("chat") // The explicit callback's new production boundary.
+            assertTrue("Chat reconnect must at least perform a direct fresh attempt", fixture.requests.count { it.path == "/v1/capabilities" } > requests)
+            kotlinx.coroutines.delay(100)
+            assertTrue("Explicit chat reconnect must grant a new recovery budget after a transient failed attempt", retries.size > 6)
+            withTimeout(5000) { while (retries.size < 12 || repo.state.value.connection != ConnectionState.OFFLINE) kotlinx.coroutines.delay(10) }
+            kotlinx.coroutines.delay(100)
+            assertEquals(listOf(0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5), retries.toList())
+            assertFalse(repo.state.value.manualRefreshing)
+            assertTrue(fixture.mutations.isEmpty())
+            fixture.failIndex = false
+            repo.manualReconnect("chat")
+            assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
+            assertEquals("chat", repo.state.value.snapshot?.session?.id)
+        }
+    }
+
+    private suspend fun withRepository(now: () -> Long = System::currentTimeMillis, preHeaderRetryDelay: (Int) -> Long = { 0L }, retryDelay: (Int) -> Long = { attempt -> val cap = minOf(30_000L, 1_000L shl minOf(attempt, 5)); kotlin.random.Random.nextLong(cap / 2, cap + 1) }, block: suspend (NetworkMobileRepository, MemoryStore, Fixture, CoroutineScope) -> Unit) {
         val scope = CoroutineScope(kotlin.coroutines.coroutineContext + SupervisorJob())
         val store = MemoryStore()
         val fixture = Fixture()
@@ -2044,7 +2074,7 @@ class RepositoryTest {
             server.dispatcher = fixture
             server.start()
             fixture.stopServer = { val port = server.port; server.shutdown(); port }
-            val repo = NetworkMobileRepository(store, scope, debug = true, now = now, preHeaderRetryDelay = preHeaderRetryDelay, openAttachment = { "test".byteInputStream() })
+            val repo = NetworkMobileRepository(store, scope, debug = true, now = now, retryDelay = retryDelay, preHeaderRetryDelay = preHeaderRetryDelay, openAttachment = { "test".byteInputStream() })
             try {
                 repo.setForeground(true)
                 // Bind the URL to this fixture's IPv4 listener, not localhost's unrelated IPv6 route.

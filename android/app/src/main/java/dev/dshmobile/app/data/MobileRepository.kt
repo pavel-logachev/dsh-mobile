@@ -14,6 +14,11 @@ interface MobileRepository {
     /** Pair only the immutable invitation which the user reviewed, not mutable input text. */
     suspend fun pair(invitation: Invitation, deviceName: String)
     suspend fun refresh()
+    /** Explicit user retry, never an automatic selection effect. Opens a fresh bounded recovery window. */
+    suspend fun manualReconnect(sessionId: String? = null) {
+        refresh()
+        if (sessionId != null) selectSession(sessionId)
+    }
     suspend fun selectSession(sessionId: String)
     /** Leave local observation/loading only; never cancel desktop work. */
     suspend fun leaveSession() {}
