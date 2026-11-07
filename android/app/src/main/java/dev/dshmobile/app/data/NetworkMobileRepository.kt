@@ -360,7 +360,9 @@ internal class NetworkMobileRepository(
     private suspend fun restoreLocked() {
         if (restored) return
         diagnostic.record("restore", "start")
-        stored = try { store.read() } catch (_: Exception) { throw MobileFailure("storage_failed") }
+        stored = try { store.read() }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { throw MobileFailure("storage_failed") }
         val host = stored.host
         if (host != null) {
             // Even expired trust material is a paired LOCAL record. Publish only safe metadata so
@@ -1290,22 +1292,32 @@ internal class NetworkMobileRepository(
     private fun cancelProjectionRetry() {
         projectionRetryJob?.cancel(); projectionRetryJob = null; projectionRetryAttempt = 0
     }
+    // A cancelled UI transition is repaired by the repository, never its cancelled caller.
+    private var foregroundRepair: Job? = null
     private val legacyForegroundOwner = Any()
     private val foregroundOwners = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
     override suspend fun setForeground(active: Boolean) = setForeground(active, legacyForegroundOwner)
-    override suspend fun setForeground(active: Boolean, owner: Any) {
+    override suspend fun setForeground(active: Boolean, owner: Any) = updateForeground(active, owner)
+    private suspend fun updateForeground(active: Boolean, owner: Any?) {
         val effective: Boolean
+        var repairToAwait: Job? = null
         val revision = synchronized(lifecycle) {
             if (closed) return
-            if (active) foregroundOwners.add(owner) else foregroundOwners.remove(owner)
+            if (owner != null) {
+                if (active) foregroundOwners.add(owner) else foregroundOwners.remove(owner)
+            }
             effective = foregroundOwners.isNotEmpty()
             // START(B), STOP(A) is not a process background transition. Duplicate STOP/dispose
             // is harmless. A pending transition can still be superseded under the same lock.
-            if (effective == desiredForeground && foreground == effective) return
+            if (effective == desiredForeground && foreground == effective) {
+                repairToAwait = foregroundRepair?.takeIf { it.isActive }
+                return@synchronized null
+            }
             desiredForeground = effective
             foregroundRevision++
             diagnostic.record("foreground", if (effective) "foreground" else "background")
             if (!effective) {
+                foregroundRepair?.cancel(); foregroundRepair = null
                 foreground = false
                 unregisterNetworkWake?.invoke(); unregisterNetworkWake = null
                 networkWakeJob?.cancel(); networkWakeJob = null
@@ -1316,6 +1328,11 @@ internal class NetworkMobileRepository(
             }
             foregroundRevision
         }
+        if (revision == null) {
+            repairToAwait?.takeUnless { it == kotlinx.coroutines.currentCoroutineContext()[Job] }?.join()
+            return
+        }
+        try {
         action {
             val wasForeground = synchronized(lifecycle) {
                 if (revision != foregroundRevision || desiredForeground != effective || closed) return@action
@@ -1334,6 +1351,20 @@ internal class NetworkMobileRepository(
                 reconnectAttempt = 0
                 refreshLocked()
             }
+        }
+        val pendingRepair = synchronized(lifecycle) { foregroundRepair?.takeIf { it.isActive } }
+        pendingRepair?.takeUnless { it == kotlinx.coroutines.currentCoroutineContext()[Job] }?.join()
+        } catch (cancelled: CancellationException) {
+            synchronized(lifecycle) {
+                if (!closed && revision == foregroundRevision && desiredForeground && foregroundOwners.isNotEmpty()) {
+                    // The mutex was released by action before this handoff. Keep the accepted
+                    // intent, but mark its work incomplete so the surviving owner can repair it.
+                    foreground = false
+                    foregroundRepair = scope.launch(start = CoroutineStart.LAZY) { updateForeground(true, null) }
+                    foregroundRepair?.start()
+                }
+            }
+            throw cancelled
         }
     }
     override suspend fun forget() = action {
@@ -1357,6 +1388,7 @@ internal class NetworkMobileRepository(
         synchronized(lifecycle) {
             if (closed) return
             closed = true; desiredForeground = false; foreground = false; foregroundRevision++; foregroundOwners.clear()
+            foregroundRepair?.cancel(); foregroundRepair = null
             unregisterNetworkWake?.invoke(); unregisterNetworkWake = null
             stopListRefresh(); stopObserver(); cancelReconnect(); prefetch.cancel(); cancelIndex()
             api?.close(); api = null; pairingTransport?.close()
