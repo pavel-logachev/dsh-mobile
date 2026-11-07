@@ -15,9 +15,24 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [28])
+@Config(sdk = [28], qualifiers = "w420dp-h900dp")
+@org.robolectric.annotation.ConscryptMode(org.robolectric.annotation.ConscryptMode.Mode.OFF)
 class ChatListBackTest {
     @get:Rule val compose = createComposeRule()
+
+    @Test fun `search keeps date order while normal project view puts active first`() {
+        val now = System.currentTimeMillis()
+        val sessions = listOf(SessionSummary("new-idle", "Match newer", "w", now, false, true),
+            SessionSummary("old-active", "Match older", "w", now - 30L * 86400000, true, true))
+        var query by mutableStateOf("Match")
+        compose.setContent { MaterialTheme {
+            ChatListScreen(MobileState(sessions = sessions), query, { query = it }, "w", {}, {}, {}, {}, {}, {}, false, {})
+        } }
+        fun top(id: String) = compose.onNodeWithTag("session_$id").fetchSemanticsNode().boundsInRoot.top
+        assertTrue("Search must preserve pre-fix date order", top("new-idle") < top("old-active"))
+        compose.runOnIdle { query = "" }
+        assertTrue("Normal project view remains active first", top("old-active") < top("new-idle"))
+    }
 
     @Test fun `back closes search clears query and preserves list anchor`() {
         var query by mutableStateOf("Synthetic")

@@ -26,7 +26,8 @@ internal val mobileJson = Json {
 @Serializable internal data class CapabilitiesResponse(val protocolVersion: Int, val hostName: String, val upstreamVersion: String, val capabilities: MobileCapabilities, val hostVersion: String? = null)
 @Serializable internal class WorkspaceResponse(val items: List<Workspace>)
 @Serializable internal class PresetResponse(val items: List<Preset>)
-@Serializable internal class SessionResponse(val items: List<SessionSummary>, val nextCursor: String?)
+@Serializable internal class SessionResponse(val items: List<SessionSummary>, val nextCursor: String?,
+    val activeItems: List<SessionSummary>? = null, val activeItemsTruncated: Boolean = false)
 @Serializable internal class ErrorEnvelope(val error: WireError)
 @Serializable internal class WireError(val code: String, val message: String, val retryable: Boolean)
 @Serializable internal data class ReceiptError(val code: String, val message: String)

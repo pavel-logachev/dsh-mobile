@@ -12,6 +12,70 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 class HostApiTest {
+    @Test fun `active supplement is available on first load and merges duplicate page rows`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            fun row(id: String, running: Boolean) = """{"id":"$id","title":"Synthetic","workspaceId":"w","updatedAt":1,"running":$running,"canExecute":true}"""
+            server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("""{"items":[${row("idle", false)}],"activeItems":[${row("active", true)}],"nextCursor":"next"}"""))
+            server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("""{"items":[${row("active", true)}],"nextCursor":null}"""))
+            val api = api(server)
+            try {
+                val first = api.sessions(firstPageOnly = true)
+                assertEquals(listOf("active", "idle"), first.items.map { it.id })
+                assertEquals(listOf("active", "idle"), api.sessions(after = first).items.map { it.id })
+            } finally { api.close() }
+        }
+    }
+
+    @Test fun `legacy host without active supplement retains date paging contract`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start(); server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("""{"items":[],"nextCursor":null}"""))
+            val api = api(server)
+            try { assertTrue(api.sessions(firstPageOnly = true).items.isEmpty()) } finally { api.close() }
+        }
+    }
+
+    @Test fun `later date page replaces all supplemental flags and metadata`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            val active = session("active").replace("\"running\":false", "\"running\":true,\"runningSubagents\":2,\"waitingForAnswer\":true")
+            server.enqueue(json("""{"items":[${session("idle")}],"activeItems":[$active],"nextCursor":"next"}"""))
+            server.enqueue(json("""{"items":[${session("active").replace("Synthetic", "Finished")}],"nextCursor":null}"""))
+            val api = api(server)
+            try {
+                val result = api.sessions()
+                val row = result.items.single { it.id == "active" }
+                assertFalse(row.running); assertFalse(row.waitingForAnswer); assertEquals(0, row.runningSubagents)
+                assertEquals("Finished", row.title)
+            } finally { api.close() }
+        }
+    }
+
+    @Test fun `supplement overlap never permits duplicate date page IDs`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            server.enqueue(json("""{"items":[${session("active")}],"activeItems":[${session("active")}],"nextCursor":"next"}"""))
+            server.enqueue(json("""{"items":[${session("active")}],"nextCursor":null}"""))
+            val api = api(server)
+            try { try { api.sessions(); fail("Duplicate date row accepted") } catch (failure: MobileFailure) { assertEquals("invalid_response", failure.key) } }
+            finally { api.close() }
+        }
+    }
+
+    @Test fun `optional roster read never recovers closed connection with another request`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            server.enqueue(MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST))
+            server.enqueue(json("""{"items":[],"nextCursor":null}"""))
+            val api = api(server)
+            try {
+                try { api.sessions(firstPageOnly = true, retryClosedRead = false); fail("Closed response must fail") }
+                catch (failure: MobileFailure) { assertEquals("network_unavailable", failure.key) }
+                assertEquals(1, server.requestCount)
+            } finally { api.close() }
+        }
+    }
+
     @Test fun `transparent gzip decodes bounded JSON and sequential reads reuse the connection`() = runBlocking {
         MockWebServer().use { server ->
             server.start()

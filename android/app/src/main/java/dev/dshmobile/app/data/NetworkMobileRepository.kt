@@ -65,6 +65,7 @@ internal class NetworkMobileRepository(
     private val unwatchPrompt: suspend (String) -> Unit = {},
     private val networkWake: (((() -> Unit)) -> (() -> Unit))? = null,
     private val firstSnapshotTimeoutMs: Long = 15_000L,
+    private val indexRefreshIntervalMs: Long = 5_000L,
 ) : MobileRepository {
     private val repositoryJob = SupervisorJob(ownerScope.coroutineContext[Job])
     private val scope = CoroutineScope(ownerScope.coroutineContext + repositoryJob)
@@ -143,6 +144,57 @@ internal class NetworkMobileRepository(
     // Connectivity is visible before the fresh metadata/history cut authorizes actions.
     private var syncing = false
     private var indexJob: Job? = null
+    private var listRefreshJob: Job? = null
+    private fun stopListRefresh() { listRefreshJob?.cancel(); listRefreshJob = null }
+    /** Only the foreground home route polls the roster. No transcript reads or command replay. */
+    private fun startListRefresh() {
+        if (listRefreshJob?.isActive == true || !foreground || !desiredForeground || observingSession || closed) return
+        listRefreshJob = scope.launch {
+            var waitMs = indexRefreshIntervalMs
+            while (true) {
+                delay(waitMs)
+                action {
+                    if (!foreground || !desiredForeground || observingSession || closed ||
+                        state.value.connection != ConnectionState.ONLINE || indexJob?.isActive == true) return@action
+                    val network = api()
+                    try {
+                        // One physical GET per tick, never a page chain or a closed-read retry.
+                        val first = network.sessions(firstPageOnly = true, retryClosedRead = false)
+                        checkHistoryEpoch()
+                        if (first.items.any { item -> state.value.workspaces.none { it.id == item.workspaceId } }) throw MobileFailure("invalid_response")
+                        val freshIds = first.items.map { it.id }.toSet()
+                        // Supplement rows may be far below the date cut. Compute the cut
+                        // from actual date-page IDs only, in host updatedAt-desc/id-asc order.
+                        val dateCut = first.items.filter { it.id in first.pageIds.orEmpty() }
+                            .minWithOrNull(compareBy<dev.dshmobile.app.model.SessionSummary> { it.updatedAt }.thenByDescending { it.id })
+                        val retained = state.value.sessions.filter { session ->
+                            first.nextCursor != null && dateCut != null &&
+                                (session.updatedAt < dateCut.updatedAt || session.updatedAt == dateCut.updatedAt && session.id > dateCut.id) &&
+                                state.value.workspaces.any { it.id == session.workspaceId }
+                        }.map { session ->
+                            // A capped or absent supplement proves nothing about missing IDs.
+                            if (first.activeComplete && session.id !in first.activeIds.orEmpty() && session.id !in freshIds)
+                                session.copy(running = false, runningSubagents = 0, waitingForAnswer = false)
+                            else session
+                        }
+                        // Complete date rosters are authoritative replacements. Only an
+                        // incomplete window retains older rows, including finished supplement-only rows.
+                        val items = (first.items + retained).distinctBy { it.id }
+                        val index = first.copy(items = items)
+                        saveIndex(state.value.workspaces, index)
+                        mutableState.value = state.value.copy(sessions = index.items, sessionsTruncated = index.truncated, lastSyncedAt = now())
+                        waitMs = indexRefreshIntervalMs
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (failure: MobileFailure) {
+                        if (failure.key in setOf("unauthorized", "revoked", "forbidden", "incompatible_protocol", "tls_failed") || network.isRetired) throw failure
+                        // Optional metadata failure is not an offline verdict. Leave ordinary
+                        // transport recovery in charge, honor Retry-After, and avoid tight retry.
+                        waitMs = maxOf(30_000L, minOf(60_000L, waitMs * 2), failure.retryAfterMs)
+                    }
+                }
+            }
+        }
+    }
     @Volatile private var indexRevision = 0L
     // Point reads / admitted mutations are newer evidence than an already-started page chain.
     private var sessionRevision = 0L
@@ -150,7 +202,9 @@ internal class NetworkMobileRepository(
         if (!preserveCurrent) return index
         val authorized = state.value.sessions.filter { session -> state.value.workspaces.any { it.id == session.workspaceId } }
         val items = (if (preferCurrent) authorized + index.items else index.items + authorized).distinctBy { it.id }
-        return index.copy(items = items.take(1000), truncated = index.truncated || items.size > 1000)
+        // The normal date window is 1000 rows; reserve the bounded supplement in addition.
+        val limit = 1000 + (index.activeIds?.size ?: 0)
+        return index.copy(items = items.take(limit), truncated = index.truncated || items.size > limit)
     }
     private fun cancelIndex() { indexRevision++; indexJob?.cancel(); indexJob = null }
     private suspend fun saveIndex(workspaces: List<dev.dshmobile.app.model.Workspace>, index: HostApi.SessionIndex) {
@@ -161,7 +215,7 @@ internal class NetworkMobileRepository(
                     checkHistoryEpoch()
                     stored.host?.let { diskHistory.bindAuthorized(historyBinding(it), historyEpoch) }
                     if (!index.truncated) diskHistory.retain(index.items.map { it.id }.toSet())
-                    diskHistory.updateIndex(HistoryIndex(workspaces, index.items, index.truncated, now()))
+                    diskHistory.updateIndex(HistoryIndex(workspaces, index.items.take(1000), index.truncated || index.items.size > 1000, now()))
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (failure: MobileFailure) { throw failure }
                 catch (_: Exception) { /* Optional cache cannot gate authenticated reads. */ }
@@ -522,10 +576,12 @@ internal class NetworkMobileRepository(
         if (requestedSessionId == null && (snapshot == null || !caps.capabilities.liveSnapshots)) reconnectAttempt = 0
         if (foreground && state.value.connection == ConnectionState.ONLINE) {
             startObserver()
+            startListRefresh()
             if (prefetchEnabled && requestedSessionId == null) prefetch.start(sessions.filterNot { observingSession && it.id == selected })
         }
     }
     override suspend fun selectSession(sessionId: String) {
+        stopListRefresh()
         val task = synchronized(selectionGuard) {
             selection?.cancel()
             historyRead?.cancel()
@@ -576,6 +632,7 @@ internal class NetworkMobileRepository(
             historyRead?.cancel(); historyRead = null
         }
         stopObserver()
+        startListRefresh()
         if (prefetchEnabled && foreground && state.value.connection == ConnectionState.ONLINE)
             prefetch.start(state.value.sessions.filter { diskHistory.get(it.id) == null })
     }
@@ -1226,7 +1283,7 @@ internal class NetworkMobileRepository(
                 unregisterNetworkWake?.invoke(); unregisterNetworkWake = null
                 networkWakeJob?.cancel(); networkWakeJob = null
                 receiptPoll?.cancel(); receiptPoll = null; receiptPollId = null
-                stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel(); cancelIndex()
+                stopListRefresh(); stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel(); cancelIndex()
                 api?.close(); api = null
                 pairingTransport?.close()
             }
@@ -1253,7 +1310,7 @@ internal class NetworkMobileRepository(
         }
     }
     override suspend fun forget() = action {
-        stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel(); cancelIndex()
+        stopListRefresh(); stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel(); cancelIndex()
         // Credentials are the mandatory outcome; optional cache/key failures cannot gate it.
         try { store.clear() }
         catch (_: Exception) { store.reset() }
@@ -1274,7 +1331,7 @@ internal class NetworkMobileRepository(
             if (closed) return
             closed = true; desiredForeground = false; foreground = false; foregroundRevision++
             unregisterNetworkWake?.invoke(); unregisterNetworkWake = null
-            stopObserver(); cancelReconnect(); prefetch.cancel(); cancelIndex()
+            stopListRefresh(); stopObserver(); cancelReconnect(); prefetch.cancel(); cancelIndex()
             api?.close(); api = null; pairingTransport?.close()
         }
         removeHistoryListener?.invoke(); removeHistoryListener = null

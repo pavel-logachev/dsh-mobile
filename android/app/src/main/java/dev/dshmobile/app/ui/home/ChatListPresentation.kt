@@ -9,7 +9,7 @@ import java.time.temporal.TemporalAdjusters
 import java.util.Locale
 
 internal data class ProjectSummary(val workspace: Workspace, val chatCount: Int, val latestActivity: Long)
-internal enum class DateSection { TODAY, YESTERDAY, THIS_WEEK, EARLIER }
+internal enum class DateSection { WORKING, TODAY, YESTERDAY, THIS_WEEK, EARLIER }
 internal data class SessionGroup(val section: DateSection, val sessions: List<SessionSummary>)
 
 /** Count once over the bounded host window; never pretend these are totals for truncated history. */
@@ -45,6 +45,7 @@ internal fun sessionTimestamp(timestamp: Long, section: DateSection, now: Long,
     val currentYear = Instant.ofEpochMilli(now).atZone(zone).year
     val time = java.time.format.DateTimeFormatter.ofLocalizedTime(java.time.format.FormatStyle.SHORT).withLocale(locale)
     return when (section) {
+        DateSection.WORKING -> sessionTimestamp(timestamp, dateSection(timestamp, now, zone, locale), now, zone, locale)
         DateSection.TODAY, DateSection.YESTERDAY -> date.format(time)
         DateSection.THIS_WEEK -> date.format(java.time.format.DateTimeFormatter.ofPattern("EEE", locale)) + ", " + date.format(time)
         DateSection.EARLIER -> {
@@ -58,6 +59,6 @@ internal fun sessionTimestamp(timestamp: Long, section: DateSection, now: Long,
     }
 }
 
-internal fun groupSessionsByDate(sessions: List<SessionSummary>, now: Long, zone: ZoneId = ZoneId.systemDefault(), locale: Locale = Locale.getDefault()): List<SessionGroup> =
-    sessions.groupBy { dateSection(it.updatedAt, now, zone, locale) }.entries.sortedBy { it.key.ordinal }
+internal fun groupSessionsByDate(sessions: List<SessionSummary>, now: Long, zone: ZoneId = ZoneId.systemDefault(), locale: Locale = Locale.getDefault(), activeFirst: Boolean = true): List<SessionGroup> =
+    sessions.groupBy { if (activeFirst && (it.running || it.runningSubagents > 0 || it.waitingForAnswer)) DateSection.WORKING else dateSection(it.updatedAt, now, zone, locale) }.entries.sortedBy { it.key.ordinal }
         .map { SessionGroup(it.key, it.value.sortedByDescending { session -> session.updatedAt }) }

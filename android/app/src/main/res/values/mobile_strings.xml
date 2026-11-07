@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="mobile_working_now">Working now</string>
     <string name="mobile_waiting_for_answer">Needs your decision</string>
     <string name="mobile_default_device">My Android phone</string>
     <string name="mobile_pair_title">Connect your computer</string>

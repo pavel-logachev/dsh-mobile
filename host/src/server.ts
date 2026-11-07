@@ -608,7 +608,12 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         nextCursor = randomBytes(24).toString('base64url');
         cursors.set(nextCursor, { deviceId: current.deviceId, workspaceId, after: { updatedAt: last.updatedAt, id: last.id }, expiresAt: Date.now() + 300_000 });
       }
-      sendJson(res, 200, { items, nextCursor }); return;
+      // Additive v1 field: legacy clients keep the exact date page and cursor contract.
+      // At most 50 newest active rows, in the same updatedAt/id order as date pages.
+      // Absence is completion evidence only when activeItemsTruncated is false.
+      const active = cursor === null ? scoped.filter(session => session.running || (session.runningSubagents ?? 0) > 0 || session.waitingForAnswer === true) : undefined;
+      const activeItems = active?.slice(0, 50).map(session => sessionForDevice(session, current.deviceId, ids));
+      sendJson(res, 200, { items, nextCursor, ...(activeItems ? { activeItems, activeItemsTruncated: active!.length > 50 } : {}) }); return;
     }
     if (outcomesRoute) {
       outcomeResponses.add(res);

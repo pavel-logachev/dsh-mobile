@@ -892,6 +892,49 @@ test('wildcard read and execute grants cover all configured scope, while read-on
   assert.equal((await (await request('/sessions', readOnly.deviceToken)).json()).items.every((item: { canExecute: boolean }) => !item.canExecute), true);
 });
 
+test('first load includes every scoped active session beyond the date page without changing legacy paging', async t => {
+  const adapter = new TestAdapter();
+  adapter.snapshots.clear();
+  for (let i = 0; i < 105; i++) adapter.snapshots.set(`idle-${i}`, { ...structuredClone(snapshot), session: { ...snapshot.session, id: `idle-${i}`, updatedAt: 1000 - i } });
+  for (const [id, flags] of Object.entries({ running: { running: true }, child: { runningSubagents: 2 }, waiting: { waitingForAnswer: true }, forbidden: { running: true, workspaceId: 'beta' } }))
+    adapter.snapshots.set(id, { ...structuredClone(snapshot), session: { ...snapshot.session, id, updatedAt: 1, ...flags } });
+  const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
+  const legacy = await (await request('/sessions?limit=100', deviceToken)).json();
+  assert.equal(legacy.items.length, 100);
+  const first = await (await request('/sessions?limit=100', deviceToken)).json();
+  assert.deepEqual(first.items, legacy.items);
+  assert.deepEqual(first.activeItems?.map((s: any) => s.id), ['child', 'running', 'waiting']);
+  const next = await (await request(`/sessions?limit=100&cursor=${first.nextCursor}`, deviceToken)).json();
+  assert.equal(next.items.length, 8); assert.equal(next.nextCursor, null);
+  adapter.snapshots.get('running')!.session.running = false;
+  const refreshed = await (await request('/sessions?workspaceId=alpha', deviceToken)).json();
+  assert.deepEqual(refreshed.activeItems.map((s: any) => s.id), ['child', 'waiting']);
+});
+
+test('active supplement is bounded for 4800 active rows and declares truncation', async t => {
+  const adapter = new TestAdapter(); adapter.snapshots.clear();
+  for (let i = 0; i < 4800; i++) adapter.snapshots.set(`active-${i}`, { ...structuredClone(snapshot), session: { ...snapshot.session, id: `active-${i}`, title: 'Я'.repeat(256), running: true, updatedAt: i } });
+  const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
+  const response = await request('/sessions?limit=100', deviceToken);
+  assert.equal(response.status, 200);
+  const first = await response.json();
+  assert.equal(first.items.length, 100); assert.equal(first.activeItems.length, 50);
+  assert.equal(first.activeItemsTruncated, true);
+  assert.deepEqual(first.activeItems.map((s: any) => s.id), Array.from({ length: 50 }, (_, i) => `active-${4799 - i}`));
+  const next = await (await request(`/sessions?limit=100&cursor=${first.nextCursor}`, deviceToken)).json();
+  assert.equal(next.activeItems, undefined); assert.equal(next.activeItemsTruncated, undefined);
+  for (const size of [50, 51]) {
+    adapter.snapshots.clear();
+    for (let i = 0; i < size; i++) adapter.snapshots.set(`active-${i}`, { ...structuredClone(snapshot), session: { ...snapshot.session, id: `active-${i}`, running: true, updatedAt: i } });
+    const boundary = await (await request('/sessions?limit=1', deviceToken)).json();
+    assert.equal(boundary.items.length, 1); assert.equal(boundary.activeItems.length, 50);
+    assert.equal(boundary.activeItemsTruncated, size > 50);
+  }
+  adapter.snapshots.clear();
+  const empty = await (await request('/sessions', deviceToken)).json();
+  assert.deepEqual(empty.activeItems, []); assert.equal(empty.activeItemsTruncated, false);
+});
+
 test('session pagination is keyset and does not repeat an item moved above the cut', async t => {
   const { adapter, request, pair } = await setup(t);
   const all = await pair({ readWorkspaceIds: ['*'], executeWorkspaceIds: ['*'] });
