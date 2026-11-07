@@ -163,17 +163,24 @@ internal class NetworkMobileRepository(
                         checkHistoryEpoch()
                         if (first.items.any { item -> state.value.workspaces.none { it.id == item.workspaceId } }) throw MobileFailure("invalid_response")
                         val freshIds = first.items.map { it.id }.toSet()
-                        val retained = state.value.sessions.filter { session -> state.value.workspaces.any { it.id == session.workspaceId } }
-                            .map { session ->
-                                // A capped or absent supplement proves nothing about missing IDs.
-                                if (first.activeComplete && session.id !in first.activeIds.orEmpty() && session.id !in freshIds)
-                                    session.copy(running = false, runningSubagents = 0, waitingForAnswer = false)
-                                else session
-                            }
-                        // Ticks update, not replace, the loaded window. Finished supplement-only
-                        // rows remain in their date section until a normal full index reload.
+                        // Supplement rows may be far below the date cut. Compute the cut
+                        // from actual date-page IDs only, in host updatedAt-desc/id-asc order.
+                        val dateCut = first.items.filter { it.id in first.pageIds.orEmpty() }
+                            .minWithOrNull(compareBy<dev.dshmobile.app.model.SessionSummary> { it.updatedAt }.thenByDescending { it.id })
+                        val retained = state.value.sessions.filter { session ->
+                            first.nextCursor != null && dateCut != null &&
+                                (session.updatedAt < dateCut.updatedAt || session.updatedAt == dateCut.updatedAt && session.id > dateCut.id) &&
+                                state.value.workspaces.any { it.id == session.workspaceId }
+                        }.map { session ->
+                            // A capped or absent supplement proves nothing about missing IDs.
+                            if (first.activeComplete && session.id !in first.activeIds.orEmpty() && session.id !in freshIds)
+                                session.copy(running = false, runningSubagents = 0, waitingForAnswer = false)
+                            else session
+                        }
+                        // Complete date rosters are authoritative replacements. Only an
+                        // incomplete window retains older rows, including finished supplement-only rows.
                         val items = (first.items + retained).distinctBy { it.id }
-                        val index = first.copy(items = items, truncated = state.value.sessionsTruncated || first.truncated || items.size > first.items.size)
+                        val index = first.copy(items = items)
                         saveIndex(state.value.workspaces, index)
                         mutableState.value = state.value.copy(sessions = index.items, sessionsTruncated = index.truncated, lastSyncedAt = now())
                         waitMs = indexRefreshIntervalMs

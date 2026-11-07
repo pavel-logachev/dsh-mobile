@@ -17,8 +17,9 @@ class RosterRefreshRegressionTest {
         override suspend fun clear() { value = StoredState() }
     }
     private fun json(text: String, status: Int = 200) = MockResponse().setHeader("Content-Type", "application/json").setResponseCode(status).setBody(text)
-    private fun row(id: String, running: Boolean = false, time: Int = 10) = """{"id":"$id","title":"Synthetic $id","workspaceId":"workspace","updatedAt":$time,"running":$running,"canExecute":true}"""
-    private suspend fun fixture(index: (RecordedRequest) -> MockResponse, run: suspend (NetworkMobileRepository, CopyOnWriteArrayList<RecordedRequest>) -> Unit) {
+    private fun row(id: String, running: Boolean = false, time: Int = 10, workspace: String = "workspace") = """{"id":"$id","title":"Synthetic $id","workspaceId":"$workspace","updatedAt":$time,"running":$running,"canExecute":true}"""
+    private suspend fun fixture(index: (RecordedRequest) -> MockResponse, workspaces: String = """{"items":[{"id":"workspace","name":"Synthetic","canExecute":true}]}""",
+        disk: HistoryStore = MemoryHistoryStore(), run: suspend (NetworkMobileRepository, CopyOnWriteArrayList<RecordedRequest>) -> Unit) {
         val scope = CoroutineScope(currentCoroutineContext() + SupervisorJob())
         val requests = CopyOnWriteArrayList<RecordedRequest>()
         MockWebServer().use { server ->
@@ -28,7 +29,7 @@ class RosterRefreshRegressionTest {
                     return when (request.requestUrl!!.encodedPath) {
                         "/v1/pairings" -> json("""{"deviceId":"fixture-device","deviceToken":"synthetic-device-token-for-tests","hostName":"Synthetic","protocolVersion":1}""", 201)
                         "/v1/capabilities" -> json("""{"protocolVersion":1,"hostName":"Synthetic","upstreamVersion":"fixture","capabilities":{"sessions":true,"textPrompt":true,"cancel":true,"liveSnapshots":false,"attachments":false,"questions":false,"approvals":false,"push":false}}""")
-                        "/v1/workspaces" -> json("""{"items":[{"id":"workspace","name":"Synthetic","canExecute":true}]}""")
+                        "/v1/workspaces" -> json(workspaces)
                         "/v1/presets" -> json("""{"items":[]}""")
                         "/v1/sessions" -> index(request)
                         else -> json("{}", 404)
@@ -37,7 +38,7 @@ class RosterRefreshRegressionTest {
             }
             server.start()
             val repo = NetworkMobileRepository(Store(), scope, debug = true, observeRestoredSession = false, prefetchEnabled = false,
-                indexRefreshIntervalMs = 100, retryDelay = { 60_000 })
+                indexRefreshIntervalMs = 100, retryDelay = { 60_000 }, historyStore = disk)
             try {
                 repo.setForeground(true)
                 repo.pair("""{"version":1,"baseUrl":"${server.url("/").newBuilder().host("127.0.0.1").build().toString().removeSuffix("/")}","pairingToken":"synthetic-pairing-token-for-tests"}""", "Synthetic")
@@ -47,6 +48,76 @@ class RosterRefreshRegressionTest {
     }
     private suspend fun await(condition: () -> Boolean) = withTimeout(10_000) { while (!condition()) delay(10) }
     private fun lists(requests: List<RecordedRequest>) = requests.filter { it.requestUrl!!.encodedPath == "/v1/sessions" }
+
+    @Test fun `complete tick removes deleted or archived rows from state and disk`() = runBlocking {
+        val removed = AtomicBoolean(false); val disk = MemoryHistoryStore()
+        fixture({ _ -> json("""{"items":[${row("keep")}${if (!removed.get()) "," + row("deleted") + "," + row("archived") else ""}],"activeItems":[],"activeItemsTruncated":false,"nextCursor":null}""") }, disk = disk) { repo, requests ->
+            assertEquals(3, repo.state.value.sessions.size)
+            removed.set(true)
+            await { lists(requests).size >= 3 }; repo.setForeground(false)
+            assertEquals(listOf("keep"), repo.state.value.sessions.map { it.id })
+            assertFalse("Complete host roster must remain complete", repo.state.value.sessionsTruncated)
+            assertEquals(listOf("keep"), disk.read().index!!.sessions.map { it.id })
+            assertFalse(disk.read().index!!.truncated)
+        }
+    }
+
+    @Test fun `complete authorized tick removes rows from narrowed grants`() = runBlocking {
+        val narrowed = AtomicBoolean(false); val disk = MemoryHistoryStore()
+        fixture({ _ -> json("""{"items":[${row("keep")}${if (!narrowed.get()) "," + row("previously-granted", workspace = "beta") else ""}],"activeItems":[],"activeItemsTruncated":false,"nextCursor":null}""") },
+            workspaces = """{"items":[{"id":"workspace","name":"Synthetic","canExecute":true},{"id":"beta","name":"Beta","canExecute":true}]}""", disk = disk) { repo, requests ->
+            assertTrue(repo.state.value.sessions.any { it.workspaceId == "beta" })
+            narrowed.set(true)
+            await { lists(requests).size >= 3 }; repo.setForeground(false)
+            assertEquals(listOf("keep"), repo.state.value.sessions.map { it.id })
+            assertFalse(repo.state.value.sessionsTruncated)
+            assertEquals(listOf("keep"), disk.read().index!!.sessions.map { it.id })
+        }
+    }
+
+    @Test fun `incomplete tick retains only rows below date page cut not supplemental cut`() = runBlocking {
+        val changed = AtomicBoolean(false)
+        fixture({ _ -> if (!changed.get()) json("""{"items":[${listOf(row("top", time = 100), row("removed-above", time = 90), row("a", time = 50), row("z", time = 50), row("older", time = 40)).joinToString(",")}],"activeItems":[],"nextCursor":null}""")
+            else json("""{"items":[${row("top", time = 100)},${row("m", time = 50)}],"activeItems":[${row("ancient-active", true, 1)}],"activeItemsTruncated":false,"nextCursor":"more"}""")
+        }) { repo, requests ->
+            changed.set(true)
+            await { lists(requests).size >= 3 }; repo.setForeground(false)
+            assertEquals(setOf("top", "m", "z", "older", "ancient-active"), repo.state.value.sessions.map { it.id }.toSet())
+            assertTrue(repo.state.value.sessionsTruncated)
+            assertEquals(0, lists(requests).count { it.requestUrl!!.queryParameter("cursor") != null })
+        }
+    }
+
+    @Test fun `complete date roster is authoritative independently of supplement coverage`() = runBlocking {
+        for (supplement in listOf("", ",\"activeItems\":[],\"activeItemsTruncated\":true", ",\"activeItems\":[${row("fresh-active", true, 1)}],\"activeItemsTruncated\":false")) {
+            val changed = AtomicBoolean(false)
+            fixture({ _ -> if (!changed.get()) json("""{"items":[${row("keep")},${row("removed")}],"nextCursor":null}""")
+                else json("""{"items":[${row("keep")}],"nextCursor":null$supplement}""")
+            }) { repo, requests ->
+                changed.set(true)
+                await { lists(requests).size >= 3 }; repo.setForeground(false)
+                val expected = if (supplement.contains("fresh-active")) setOf("keep", "fresh-active") else setOf("keep")
+                assertEquals(expected, repo.state.value.sessions.map { it.id }.toSet())
+                assertFalse(repo.state.value.sessionsTruncated)
+            }
+        }
+    }
+
+    @Test fun `complete empty tick replaces formerly truncated window`() = runBlocking {
+        val empty = AtomicBoolean(false)
+        fixture({ request -> if (empty.get()) json("""{"items":[],"activeItems":[],"nextCursor":null}""") else {
+            val page = request.requestUrl!!.queryParameter("cursor")?.toInt() ?: 0
+            json("""{"items":[${row("row-$page", time = 100 - page)}],"activeItems":[],"nextCursor":"${page + 1}"}""")
+        } }) { repo, requests ->
+            await { repo.state.value.sessions.size == 10 }
+            assertTrue(repo.state.value.sessionsTruncated)
+            empty.set(true)
+            await { lists(requests).count { it.requestUrl!!.queryParameter("cursor") == null } >= 3 }
+            repo.setForeground(false)
+            assertTrue(repo.state.value.sessions.isEmpty())
+            assertFalse(repo.state.value.sessionsTruncated)
+        }
+    }
 
     @Test fun `ticks fetch first page only and retain loaded older rows`() = runBlocking {
         fixture({ request ->
@@ -88,7 +159,7 @@ class RosterRefreshRegressionTest {
         for (supplement in listOf("", ",\"activeItems\":[],\"activeItemsTruncated\":true")) {
             val initial = AtomicBoolean(true)
             fixture({ _ -> if (initial.get()) json("""{"items":[${row("known")}],"activeItems":[${row("old-active", true, 1)}],"nextCursor":null}""")
-                else json("""{"items":[${row("known")}],"nextCursor":null$supplement}""")
+                else json("""{"items":[${row("known")}],"nextCursor":"more"$supplement}""")
             }) { repo, requests ->
                 initial.set(false)
                 await { lists(requests).size >= 3 }; delay(30)
