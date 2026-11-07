@@ -59,6 +59,6 @@ internal fun sessionTimestamp(timestamp: Long, section: DateSection, now: Long,
     }
 }
 
-internal fun groupSessionsByDate(sessions: List<SessionSummary>, now: Long, zone: ZoneId = ZoneId.systemDefault(), locale: Locale = Locale.getDefault()): List<SessionGroup> =
-    sessions.groupBy { if (it.running || it.runningSubagents > 0 || it.waitingForAnswer) DateSection.WORKING else dateSection(it.updatedAt, now, zone, locale) }.entries.sortedBy { it.key.ordinal }
+internal fun groupSessionsByDate(sessions: List<SessionSummary>, now: Long, zone: ZoneId = ZoneId.systemDefault(), locale: Locale = Locale.getDefault(), activeFirst: Boolean = true): List<SessionGroup> =
+    sessions.groupBy { if (activeFirst && (it.running || it.runningSubagents > 0 || it.waitingForAnswer)) DateSection.WORKING else dateSection(it.updatedAt, now, zone, locale) }.entries.sortedBy { it.key.ordinal }
         .map { SessionGroup(it.key, it.value.sortedByDescending { session -> session.updatedAt }) }

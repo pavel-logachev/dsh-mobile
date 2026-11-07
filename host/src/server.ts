@@ -609,10 +609,11 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         cursors.set(nextCursor, { deviceId: current.deviceId, workspaceId, after: { updatedAt: last.updatedAt, id: last.id }, expiresAt: Date.now() + 300_000 });
       }
       // Additive v1 field: legacy clients keep the exact date page and cursor contract.
-      // New clients receive every authorized active row on the opening load, even below the cut.
-      const activeItems = cursor === null ? scoped.filter(session => session.running || (session.runningSubagents ?? 0) > 0 || session.waitingForAnswer === true)
-        .map(session => sessionForDevice(session, current.deviceId, ids)) : undefined;
-      sendJson(res, 200, { items, nextCursor, ...(activeItems ? { activeItems } : {}) }); return;
+      // At most 50 newest active rows, in the same updatedAt/id order as date pages.
+      // Absence is completion evidence only when activeItemsTruncated is false.
+      const active = cursor === null ? scoped.filter(session => session.running || (session.runningSubagents ?? 0) > 0 || session.waitingForAnswer === true) : undefined;
+      const activeItems = active?.slice(0, 50).map(session => sessionForDevice(session, current.deviceId, ids));
+      sendJson(res, 200, { items, nextCursor, ...(activeItems ? { activeItems, activeItemsTruncated: active!.length > 50 } : {}) }); return;
     }
     if (outcomesRoute) {
       outcomeResponses.add(res);

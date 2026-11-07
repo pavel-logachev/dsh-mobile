@@ -150,20 +150,40 @@ internal class NetworkMobileRepository(
     private fun startListRefresh() {
         if (listRefreshJob?.isActive == true || !foreground || !desiredForeground || observingSession || closed) return
         listRefreshJob = scope.launch {
+            var waitMs = indexRefreshIntervalMs
             while (true) {
-                delay(indexRefreshIntervalMs)
+                delay(waitMs)
                 action {
                     if (!foreground || !desiredForeground || observingSession || closed ||
                         state.value.connection != ConnectionState.ONLINE || indexJob?.isActive == true) return@action
                     val network = api()
-                    val first = network.sessions(firstPageOnly = true)
-                    checkHistoryEpoch()
-                    if (first.items.any { item -> state.value.workspaces.none { it.id == item.workspaceId } }) throw MobileFailure("invalid_response")
-                    cancelIndex()
-                    val index = mergeIndex(first)
-                    saveIndex(state.value.workspaces, index)
-                    mutableState.value = state.value.copy(sessions = index.items, sessionsTruncated = index.truncated, lastSyncedAt = now())
-                    loadRemainingIndex(network, first)
+                    try {
+                        // One physical GET per tick, never a page chain or a closed-read retry.
+                        val first = network.sessions(firstPageOnly = true, retryClosedRead = false)
+                        checkHistoryEpoch()
+                        if (first.items.any { item -> state.value.workspaces.none { it.id == item.workspaceId } }) throw MobileFailure("invalid_response")
+                        val freshIds = first.items.map { it.id }.toSet()
+                        val retained = state.value.sessions.filter { session -> state.value.workspaces.any { it.id == session.workspaceId } }
+                            .map { session ->
+                                // A capped or absent supplement proves nothing about missing IDs.
+                                if (first.activeComplete && session.id !in first.activeIds.orEmpty() && session.id !in freshIds)
+                                    session.copy(running = false, runningSubagents = 0, waitingForAnswer = false)
+                                else session
+                            }
+                        // Ticks update, not replace, the loaded window. Finished supplement-only
+                        // rows remain in their date section until a normal full index reload.
+                        val items = (first.items + retained).distinctBy { it.id }
+                        val index = first.copy(items = items, truncated = state.value.sessionsTruncated || first.truncated || items.size > first.items.size)
+                        saveIndex(state.value.workspaces, index)
+                        mutableState.value = state.value.copy(sessions = index.items, sessionsTruncated = index.truncated, lastSyncedAt = now())
+                        waitMs = indexRefreshIntervalMs
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (failure: MobileFailure) {
+                        if (failure.key in setOf("unauthorized", "revoked", "forbidden", "incompatible_protocol", "tls_failed") || network.isRetired) throw failure
+                        // Optional metadata failure is not an offline verdict. Leave ordinary
+                        // transport recovery in charge, honor Retry-After, and avoid tight retry.
+                        waitMs = maxOf(30_000L, minOf(60_000L, waitMs * 2), failure.retryAfterMs)
+                    }
                 }
             }
         }
@@ -175,7 +195,9 @@ internal class NetworkMobileRepository(
         if (!preserveCurrent) return index
         val authorized = state.value.sessions.filter { session -> state.value.workspaces.any { it.id == session.workspaceId } }
         val items = (if (preferCurrent) authorized + index.items else index.items + authorized).distinctBy { it.id }
-        return index.copy(items = items.take(1000), truncated = index.truncated || items.size > 1000)
+        // The normal date window is 1000 rows; reserve the bounded supplement in addition.
+        val limit = 1000 + (index.activeIds?.size ?: 0)
+        return index.copy(items = items.take(limit), truncated = index.truncated || items.size > limit)
     }
     private fun cancelIndex() { indexRevision++; indexJob?.cancel(); indexJob = null }
     private suspend fun saveIndex(workspaces: List<dev.dshmobile.app.model.Workspace>, index: HostApi.SessionIndex) {
@@ -186,7 +208,7 @@ internal class NetworkMobileRepository(
                     checkHistoryEpoch()
                     stored.host?.let { diskHistory.bindAuthorized(historyBinding(it), historyEpoch) }
                     if (!index.truncated) diskHistory.retain(index.items.map { it.id }.toSet())
-                    diskHistory.updateIndex(HistoryIndex(workspaces, index.items, index.truncated, now()))
+                    diskHistory.updateIndex(HistoryIndex(workspaces, index.items.take(1000), index.truncated || index.items.size > 1000, now()))
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (failure: MobileFailure) { throw failure }
                 catch (_: Exception) { /* Optional cache cannot gate authenticated reads. */ }

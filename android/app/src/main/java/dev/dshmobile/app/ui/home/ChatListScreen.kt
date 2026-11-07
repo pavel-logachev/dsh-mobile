@@ -58,7 +58,7 @@ internal fun ChatListScreen(state: MobileState, query: String, onQuery: (String)
     val visible = remember(sessions, query, projectId) { filterSessions(sessions, projectId, query) }
     val locale = LocalConfiguration.current.locales[0]
     val now = remember(visible, locale, state.lastSyncedAt) { System.currentTimeMillis() }
-    val groups = remember(visible, locale, now) { groupSessionsByDate(visible, now, locale = locale) }
+    val groups = remember(visible, locale, now, query) { groupSessionsByDate(visible, now, locale = locale, activeFirst = query.trim().isEmpty()) }
     val list = rememberLazyListState()
     var searchOpen by rememberSaveable { mutableStateOf(query.isNotEmpty()) }
     androidx.activity.compose.BackHandler(enabled = searchOpen) { searchOpen = false; onQuery("") }

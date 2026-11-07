@@ -911,6 +911,30 @@ test('first load includes every scoped active session beyond the date page witho
   assert.deepEqual(refreshed.activeItems.map((s: any) => s.id), ['child', 'waiting']);
 });
 
+test('active supplement is bounded for 4800 active rows and declares truncation', async t => {
+  const adapter = new TestAdapter(); adapter.snapshots.clear();
+  for (let i = 0; i < 4800; i++) adapter.snapshots.set(`active-${i}`, { ...structuredClone(snapshot), session: { ...snapshot.session, id: `active-${i}`, title: 'Я'.repeat(256), running: true, updatedAt: i } });
+  const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
+  const response = await request('/sessions?limit=100', deviceToken);
+  assert.equal(response.status, 200);
+  const first = await response.json();
+  assert.equal(first.items.length, 100); assert.equal(first.activeItems.length, 50);
+  assert.equal(first.activeItemsTruncated, true);
+  assert.deepEqual(first.activeItems.map((s: any) => s.id), Array.from({ length: 50 }, (_, i) => `active-${4799 - i}`));
+  const next = await (await request(`/sessions?limit=100&cursor=${first.nextCursor}`, deviceToken)).json();
+  assert.equal(next.activeItems, undefined); assert.equal(next.activeItemsTruncated, undefined);
+  for (const size of [50, 51]) {
+    adapter.snapshots.clear();
+    for (let i = 0; i < size; i++) adapter.snapshots.set(`active-${i}`, { ...structuredClone(snapshot), session: { ...snapshot.session, id: `active-${i}`, running: true, updatedAt: i } });
+    const boundary = await (await request('/sessions?limit=1', deviceToken)).json();
+    assert.equal(boundary.items.length, 1); assert.equal(boundary.activeItems.length, 50);
+    assert.equal(boundary.activeItemsTruncated, size > 50);
+  }
+  adapter.snapshots.clear();
+  const empty = await (await request('/sessions', deviceToken)).json();
+  assert.deepEqual(empty.activeItems, []); assert.equal(empty.activeItemsTruncated, false);
+});
+
 test('session pagination is keyset and does not repeat an item moved above the cut', async t => {
   const { adapter, request, pair } = await setup(t);
   const all = await pair({ readWorkspaceIds: ['*'], executeWorkspaceIds: ['*'] });

@@ -43,13 +43,15 @@ class ChatListPresentationTest {
         assertEquals(listOf("idle", "old"), groups.flatMap { it.sessions }.map { it.id })
     }
 
-    @Test fun `active section intersects project and existing grouped search`() {
-        val rows = listOf(session("idle", "Match", "a", 0), session("a", "Match", "a", 10).copy(running = true),
+    @Test fun `project active first and search date only preserve their distinct contracts`() {
+        val rows = listOf(session("idle", "Match", "a", 0), session("a", "Match", "a", 86400000 * 30L).copy(running = true),
             session("b", "Match", "b", 5).copy(waitingForAnswer = true))
-        val groups = groupSessionsByDate(filterSessions(rows, "a", "Match"), now, zone)
-        assertEquals(listOf("a"), groups.first().sessions.map { it.id })
-        assertEquals("WORKING", groups.first().section.name)
-        assertEquals(listOf("a", "idle"), groups.flatMap { it.sessions }.map { it.id })
+        val project = groupSessionsByDate(filterSessions(rows, "a", ""), now, zone)
+        assertEquals(listOf("a", "idle"), project.flatMap { it.sessions }.map { it.id })
+        assertEquals(DateSection.WORKING, project.first().section)
+        val search = groupSessionsByDate(filterSessions(rows, "a", "Match"), now, zone, activeFirst = false)
+        assertEquals(listOf("idle", "a"), search.flatMap { it.sessions }.map { it.id })
+        assertEquals(listOf(DateSection.TODAY, DateSection.EARLIER), search.map { it.section })
         assertTrue(groupSessionsByDate(emptyList(), now, zone).isEmpty())
     }
 

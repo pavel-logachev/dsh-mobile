@@ -50,6 +50,23 @@ class ActiveChatsStandTest {
         if (name.startsWith("after")) compose.onNodeWithText("Сейчас работают").assertIsDisplayed()
         capture(name)
     }
+    @Test fun searchKeepsDateOrderOnRenderedScreen() {
+        val now = System.currentTimeMillis()
+        var query by mutableStateOf("Проверка")
+        val rows = listOf(SessionSummary("new-idle", "Проверка новая", "w", now, false, true),
+            SessionSummary("old-active", "Проверка старая", "w", now - 30L * 86400000, true, true))
+        compose.setContent { RussianTheme {
+            ChatListScreen(MobileState(connection = ConnectionState.ONLINE, sessions = rows), query, { query = it }, null, {}, {}, {}, {}, {}, {}, false, {})
+        } }
+        fun top(id: String) = compose.onNodeWithTag("session_$id").fetchSemanticsNode().boundsInRoot.top
+        assertTrue(top("new-idle") < top("old-active"))
+        compose.onNodeWithText("Сейчас работают").assertDoesNotExist()
+        capture("review-search-date-order")
+        compose.runOnIdle { query = "" }
+        assertTrue(top("old-active") < top("new-idle"))
+        compose.onNodeWithText("Сейчас работают").assertIsDisplayed()
+        capture("review-normal-active-first")
+    }
     @Test fun finishingOffscreenActiveKeepsVisibleAnchor() {
         val now = System.currentTimeMillis()
         var rows by mutableStateOf(listOf(SessionSummary("active", "Активный чат", "w", now - 86400000 * 30L, true, true)) +
