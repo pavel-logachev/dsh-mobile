@@ -2066,6 +2066,170 @@ class RepositoryTest {
         }
     }
 
+    @Test fun `review r3 cancellation of manual target history clears busy and indicator`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.chatSnapshot = { entered.complete(Unit); release.await(4, TimeUnit.SECONDS); json(snapshot()) }
+            val retry = async(Dispatchers.Default) { repo.manualReconnect("chat") }
+            try {
+                withTimeout(2000) { entered.await() }
+                assertTrue(repo.state.value.busy)
+                assertTrue(repo.state.value.manualRefreshing)
+                retry.cancel(); retry.join()
+                assertFalse("Cancelled explicit target retry must release busy", repo.state.value.busy)
+                assertFalse(repo.state.value.manualRefreshing)
+            } finally { release.countDown(); retry.cancel(); retry.join() }
+        }
+    }
+
+    @Test fun `review r3 Back during manual target history releases busy after request finishes`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.chatSnapshot = { entered.complete(Unit); release.await(4, TimeUnit.SECONDS); json(snapshot()) }
+            val retry = async(start = CoroutineStart.UNDISPATCHED) { repo.manualReconnect("chat") }
+            try {
+                withTimeout(2000) { entered.await() }
+                repo.leaveSession()
+                assertFalse(repo.state.value.observingSession)
+                release.countDown()
+                withTimeout(2000) { retry.await() }
+                assertFalse(repo.state.value.manualRefreshing)
+                assertFalse("Completed manual whose target was left must release busy", repo.state.value.busy)
+            } finally { release.countDown(); retry.cancel(); retry.join() }
+        }
+    }
+
+    @Test fun `review r3 Back during live SSE manual target releases busy and permits new task`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            fixture.capabilities = fixture.capabilities.replace("\"liveSnapshots\":false", "\"liveSnapshots\":true")
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.events = { entered.complete(Unit); release.await(4, TimeUnit.SECONDS); MockResponse().setHeader("Content-Type", "text/event-stream").setBody("event: snapshot\ndata: ${snapshot()}\n\n") }
+            val retry = async(start = CoroutineStart.UNDISPATCHED) { repo.manualReconnect("chat") }
+            try {
+                withTimeout(2000) { entered.await() }
+                assertTrue(repo.state.value.capabilities!!.liveSnapshots)
+                repo.leaveSession()
+                retry.join()
+                assertFalse(repo.state.value.manualRefreshing)
+                assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
+                assertNull(repo.state.value.pending)
+                assertTrue(repo.state.value.workspaces.any { it.canExecute })
+                assertTrue("Back must permit New task after cancelling first SSE snapshot; busy=${repo.state.value.busy}", dev.dshmobile.app.ui.components.canCreate(repo.state.value))
+                assertFalse(repo.state.value.busy)
+            } finally { release.countDown(); retry.cancel(); retry.join() }
+        }
+    }
+
+    @Test fun `review r3 cancellation during manual metadata clears busy and indicator`() = runBlocking {
+        withRepository(retryDelay = { 60_000L }) { repo, _, fixture, _ ->
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.metadataGate = { entered.complete(Unit); release.await(4, TimeUnit.SECONDS); Unit }
+            val retry = async(start = CoroutineStart.UNDISPATCHED) { repo.manualReconnect("chat") }
+            try {
+                withTimeout(2000) { entered.await() }
+                retry.cancel(); retry.join()
+                assertFalse(repo.state.value.manualRefreshing)
+                assertFalse(repo.state.value.busy)
+                assertEquals(ConnectionState.OFFLINE, repo.state.value.connection)
+            } finally { release.countDown(); retry.cancel(); retry.join() }
+        }
+    }
+
+    @Test fun `review r3 cancelled queued manual does not start network or rearm`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.metadataGate = { entered.complete(Unit); release.await(4, TimeUnit.SECONDS); Unit }
+            val active = async(start = CoroutineStart.UNDISPATCHED) { repo.manualReconnect("chat") }
+            try {
+                withTimeout(2000) { entered.await() }
+                val queued = async(start = CoroutineStart.UNDISPATCHED) { repo.manualReconnect("chat") }
+                queued.cancel(); queued.join()
+                release.countDown(); active.await()
+                assertEquals("Only the admitted refresh plus initial pair", 2, fixture.requests.count { it.path == "/v1/capabilities" })
+                assertFalse(repo.state.value.busy); assertFalse(repo.state.value.manualRefreshing)
+                assertTrue(fixture.mutations.isEmpty())
+            } finally { release.countDown(); active.cancel(); active.join() }
+        }
+    }
+
+    @Test fun `review r3 last STOP cancels manual transport and background manual opens nothing`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.metadataGate = { entered.complete(Unit); release.await(4, TimeUnit.SECONDS); Unit }
+            val active = async(start = CoroutineStart.UNDISPATCHED) { repo.manualReconnect("chat") }
+            try {
+                withTimeout(2000) { entered.await() }
+                val stop = async(start = CoroutineStart.UNDISPATCHED) { repo.setForeground(false) }
+                release.countDown()
+                withTimeout(2000) { active.await(); stop.await() }
+                assertEquals(ConnectionState.OFFLINE, repo.state.value.connection)
+                val stopped = fixture.requests.size
+                repo.manualReconnect("chat"); repo.refresh()
+                kotlinx.coroutines.delay(100)
+                assertEquals(stopped, fixture.requests.size)
+                assertFalse(repo.state.value.busy); assertFalse(repo.state.value.manualRefreshing)
+                repo.close(); repo.manualReconnect("chat")
+                assertEquals(stopped, fixture.requests.size)
+            } finally { release.countDown(); active.cancel(); active.join() }
+        }
+    }
+
+    @Test fun `review r3 Back supersedes target manual waiting behind admitted mutation`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.message = { request -> entered.complete(Unit); release.await(4, TimeUnit.SECONDS); json("""{"requestId":"${requestId(request)}","status":"uncertain","updatedAt":20}""", 202) }
+            val send = async(start = CoroutineStart.UNDISPATCHED) { repo.sendMessage("Synthetic preserved intent") }
+            try {
+                withTimeout(2000) { entered.await() }
+                val manual = async(start = CoroutineStart.UNDISPATCHED) { repo.manualReconnect("chat") }
+                repo.leaveSession()
+                assertFalse(repo.state.value.observingSession)
+                release.countDown()
+                withTimeout(3000) { send.await(); manual.await() }
+                assertFalse("A stale queued retry must not revive a chat left before admission", repo.state.value.observingSession)
+                assertEquals(1, fixture.mutations.size)
+            } finally { release.countDown(); send.cancel(); send.join() }
+        }
+    }
+
+    @Test fun `review r3 manual waits for admitted mutation without cancel or replay`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.message = { request -> entered.complete(Unit); release.await(4, TimeUnit.SECONDS); json("""{"requestId":"${requestId(request)}","status":"uncertain","updatedAt":20}""", 202) }
+            val send = async(start = CoroutineStart.UNDISPATCHED) { repo.sendMessage("Synthetic preserved intent") }
+            try {
+                withTimeout(2000) { entered.await() }
+                val before = fixture.requests.count { it.path == "/v1/capabilities" }
+                val manual = async(start = CoroutineStart.UNDISPATCHED) { repo.manualReconnect("chat") }
+                assertEquals(before, fixture.requests.count { it.path == "/v1/capabilities" })
+                assertEquals(1, fixture.mutations.size)
+                release.countDown()
+                withTimeout(3000) { send.await(); manual.await() }
+                assertEquals(1, fixture.mutations.size)
+                assertEquals(before + 1, fixture.requests.count { it.path == "/v1/capabilities" })
+                assertFalse(repo.state.value.manualRefreshing)
+            } finally { release.countDown(); send.cancel(); send.join() }
+        }
+    }
+
+    @Test fun `review r3 navigation during target manual metadata supersedes old target`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            val entered = CompletableDeferred<Unit>(); val release = java.util.concurrent.CountDownLatch(1)
+            fixture.metadataGate = { entered.complete(Unit); release.await(4, TimeUnit.SECONDS); Unit }
+            val oldGets = fixture.requests.count { it.path == "/v1/sessions/chat" }
+            val manual = async(start = CoroutineStart.UNDISPATCHED) { repo.manualReconnect("chat") }
+            try {
+                withTimeout(2000) { entered.await() }
+                val nav = async(start = CoroutineStart.UNDISPATCHED) { repo.selectSession("other") }
+                release.countDown()
+                withTimeout(3000) { manual.await(); nav.await() }
+                assertEquals(oldGets, fixture.requests.count { it.path == "/v1/sessions/chat" })
+                assertEquals("other", repo.state.value.snapshot?.session?.id)
+                assertFalse(repo.state.value.busy); assertFalse(repo.state.value.manualRefreshing)
+            } finally { release.countDown(); manual.cancel(); manual.join() }
+        }
+    }
+
     private suspend fun withRepository(now: () -> Long = System::currentTimeMillis, preHeaderRetryDelay: (Int) -> Long = { 0L }, retryDelay: (Int) -> Long = { attempt -> val cap = minOf(30_000L, 1_000L shl minOf(attempt, 5)); kotlin.random.Random.nextLong(cap / 2, cap + 1) }, block: suspend (NetworkMobileRepository, MemoryStore, Fixture, CoroutineScope) -> Unit) {
         val scope = CoroutineScope(kotlin.coroutines.coroutineContext + SupervisorJob())
         val store = MemoryStore()

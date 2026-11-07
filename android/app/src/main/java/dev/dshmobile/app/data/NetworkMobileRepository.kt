@@ -474,6 +474,10 @@ internal class NetworkMobileRepository(
     override suspend fun refresh() = manualReconnect()
     override suspend fun manualReconnect(sessionId: String?) {
         diagnostic.record("manual-refresh", "queued")
+        if (sessionId != null) {
+            selectSession(sessionId, manual = true)
+            return
+        }
         action {
         diagnostic.record("manual-refresh", "entered")
         // An explicit retry owns a fresh bounded recovery window, even if this read fails.
@@ -483,22 +487,7 @@ internal class NetworkMobileRepository(
         try {
             restoreLocked()
             if (stored.host == null) throw MobileFailure("not_paired")
-            if (foreground) {
-                if (sessionId == null) refreshLocked()
-                else {
-                    if (!validId(sessionId)) throw MobileFailure("invalid_selection")
-                    stopListRefresh()
-                    val revision = synchronized(selectionGuard) {
-                        selection?.cancel(); historyRead?.cancel()
-                        requestedSessionId = sessionId
-                        observingSession = true
-                        cancelProjectionRetry(); prefetch.cancel()
-                        ++selectionRevision
-                    }
-                    refreshLocked(readHistory = false)
-                    if (revision == selectionRevision && observingSession) selectLocked(sessionId, revision, metadataReady = true)
-                }
-            }
+            if (foreground) refreshLocked()
         } finally { mutableState.value = state.value.copy(manualRefreshing = false) }
         }
     }
@@ -614,7 +603,9 @@ internal class NetworkMobileRepository(
             if (prefetchEnabled && requestedSessionId == null) prefetch.start(sessions.filterNot { observingSession && it.id == selected })
         }
     }
-    override suspend fun selectSession(sessionId: String) {
+    override suspend fun selectSession(sessionId: String) = selectSession(sessionId, manual = false)
+    private suspend fun selectSession(sessionId: String, manual: Boolean) {
+        if (closed || (manual && !desiredForeground)) return
         stopListRefresh()
         val task = synchronized(selectionGuard) {
             selection?.cancel()
@@ -635,8 +626,23 @@ internal class NetworkMobileRepository(
             if (cached != null) StartupPerf.mark("chat_cache_shown")
             scope.async(start = CoroutineStart.LAZY) {
                 action {
-                    try { selectLocked(sessionId, revision) }
-                    finally {
+                    try {
+                        if (revision != selectionRevision || !observingSession) return@action
+                        if (manual) {
+                            diagnostic.record("manual-refresh", "entered")
+                            cancelReconnect()
+                            reconnectAttempt = 0
+                            mutableState.value = state.value.copy(manualRefreshing = true)
+                            restoreLocked()
+                            if (stored.host == null) throw MobileFailure("not_paired")
+                            if (!foreground) return@action
+                            if (!validId(sessionId)) throw MobileFailure("invalid_selection")
+                            refreshLocked(readHistory = false)
+                            if (revision == selectionRevision && observingSession)
+                                selectLocked(sessionId, revision, metadataReady = true)
+                        } else selectLocked(sessionId, revision)
+                    } finally {
+                        if (manual) mutableState.value = state.value.copy(manualRefreshing = false)
                         if (revision == selectionRevision || !observingSession)
                             mutableState.value = state.value.copy(busy = false)
                     }
