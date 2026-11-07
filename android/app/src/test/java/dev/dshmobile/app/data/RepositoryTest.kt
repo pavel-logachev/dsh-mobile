@@ -159,6 +159,43 @@ class RepositoryTest {
             } finally { repo.close() }
         }
     }
+    @Test fun `manual reconnect after exhausted retries rearms recovery without replaying uncertain send`() = runBlocking {
+        val fixture = Fixture()
+        val store = MemoryStore()
+        val attempts = CopyOnWriteArrayList<Int>()
+        MockWebServer().use { server ->
+            server.dispatcher = fixture; server.start()
+            val repo = NetworkMobileRepository(store, this, true, retryDelay = { attempts += it; 100L })
+            try {
+                repo.setForeground(true)
+                repo.pair("""{"version":1,"baseUrl":"${server.url("/").newBuilder().host("127.0.0.1").build().toString().removeSuffix("/")}","pairingToken":"synthetic-invitation-token"}""", "Synthetic")
+                repo.selectSession("chat")
+                repo.sendMessage("Synthetic uncertain intent")
+                // Use an explicit 503 so each failed refresh has one index GET, not EOF recovery.
+                val indexReads = fixture.requests.count { it.path?.startsWith("/v1/sessions?") == true }
+                fixture.sessionPage = { json("""{"error":{"code":"unavailable","message":"Synthetic","retryable":true}}""", 503) }
+                repo.refresh()
+                // Initial refresh plus all six failed scheduled refreshes have finished.
+                withTimeout(5000) {
+                    while (fixture.requests.count { it.path?.startsWith("/v1/sessions?") == true } < indexReads + 7 ||
+                        repo.state.value.busy) kotlinx.coroutines.delay(1)
+                }
+                assertEquals(listOf(0, 1, 2, 3, 4, 5), attempts.toList())
+                assertEquals(ConnectionState.OFFLINE, repo.state.value.connection)
+                // The explicit tap can itself fail just before the network becomes usable.
+                repo.refresh()
+                fixture.sessionPage = null
+                withTimeout(1500) { while (attempts.size < 7) kotlinx.coroutines.delay(1) }
+                assertEquals("An explicit reconnect starts a fresh bounded retry budget", 0, attempts[6])
+                withTimeout(5000) { repo.state.first { it.connection == ConnectionState.ONLINE && !it.busy } }
+                // ONLINE is published before receipt reconciliation completes.
+                withTimeout(5000) { while (fixture.requests.none { it.path?.startsWith("/v1/commands/") == true }) kotlinx.coroutines.delay(1) }
+                assertEquals(1, fixture.mutations.size)
+                assertNotNull(store.value.pending)
+                assertTrue(fixture.requests.any { it.path?.startsWith("/v1/commands/") == true })
+            } finally { repo.close() }
+        }
+    }
     @Test fun `first authorized page is online while remaining pages load and cached selection survives`() = runBlocking {
         withRepository { repo, _, fixture, scope ->
             repo.leaveSession()
