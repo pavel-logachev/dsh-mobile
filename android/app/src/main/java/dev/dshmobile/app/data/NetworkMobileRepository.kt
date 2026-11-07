@@ -462,6 +462,9 @@ internal class NetworkMobileRepository(
         finally { pairingTransport = null; pairingApi.close() }
     }
     override suspend fun refresh() = action {
+        // An explicit retry owns a fresh bounded recovery window, even if this read fails.
+        cancelReconnect()
+        reconnectAttempt = 0
         mutableState.value = state.value.copy(manualRefreshing = true)
         try {
             restoreLocked()
