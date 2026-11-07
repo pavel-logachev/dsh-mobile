@@ -1193,7 +1193,9 @@ internal class NetworkMobileRepository(
     private var receiptPoll: Job? = null
     private var receiptPollId: String? = null
     private fun scheduleReceiptPoll(command: StoredCommand) {
-        if (command.kind !in setOf("send", "create", "answer", "queue") || command.status != "pending" || !foreground || closed) return
+        // A stopped SSE snapshot can arrive before the cancel receipt settles. It is not
+        // a command-status stream and need not emit again, so cancel needs this owner too.
+        if (command.kind !in setOf("send", "create", "answer", "queue", "cancel") || command.status != "pending" || !foreground || closed) return
         if (receiptPollId == command.requestId && receiptPoll?.isActive == true) return
         receiptPoll?.cancel()
         receiptPollId = command.requestId
@@ -1276,7 +1278,12 @@ internal class NetworkMobileRepository(
             reconnectAttempt = 0
             projectionRetryAttempt = 0
             reconcileSnapshot(replacement)
-            if (stored.pending?.kind == "cancel" && !replacement.session.running) resolveLocked(reloadSnapshot = false)
+            if (stored.pending?.kind == "cancel" && !replacement.session.running) {
+                resolveLocked(reloadSnapshot = false)
+                // The lookup may accept the cancel after the first reconciliation above.
+                // Reuse this authoritative idle cut; another SSE event is not required.
+                reconcileSnapshot(replacement)
+            }
         }
     }
     private fun startObserver() {

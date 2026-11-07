@@ -1933,6 +1933,84 @@ class RepositoryTest {
             } finally { release.countDown(); send.await() }
         }
     }
+    @Test fun `pending cancel settles without another snapshot event or POST`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true, cursor = 7)
+            repo.refresh()
+            val polls = java.util.concurrent.atomic.AtomicInteger()
+            fixture.message = { json("""{"requestId":"${requestId(it)}","status":"pending","updatedAt":20}""", 202) }
+            fixture.receipt = { id -> json("""{"requestId":"$id","status":"${if (polls.incrementAndGet() == 1) "pending" else "accepted"}","updatedAt":21}""") }
+            repo.cancelRun()
+            assertEquals("pending", repo.state.value.pending?.status)
+            // The host stops before its command receipt settles. No SSE event is required
+            // after this idle cut, so receipt recovery must own its next read.
+            fixture.snapshotText = snapshot(running = false, cursor = 8)
+            withTimeout(3000) { repo.state.first { it.pending == null } }
+            assertNull(store.value.pending)
+            assertFalse(repo.state.value.snapshot!!.session.running)
+            assertNull(repo.state.value.error)
+            assertEquals(2, polls.get())
+            assertEquals(1, fixture.mutations.size)
+            assertTrue(fixture.mutations.single().path!!.endsWith("/cancellations"))
+        }
+    }
+    @Test fun `idle SSE cut reconciles cancel receipt accepted during the same cut`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            fixture.capabilities = fixture.capabilities.replace("\"liveSnapshots\":false", "\"liveSnapshots\":true")
+            fixture.snapshotText = snapshot(running = true, cursor = 7)
+            val initial = "event: snapshot\ndata: ${fixture.snapshotText}\n\n"
+            fixture.events = { MockResponse().setHeader("Content-Type", "text/event-stream").setBody(initial + ": held\n\n")
+                .throttleBody(initial.toByteArray().size.toLong(), 1, TimeUnit.SECONDS) }
+            repo.refresh()
+            withTimeout(3000) { repo.state.first { it.snapshot?.session?.running == true } }
+            fixture.message = { json("""{"requestId":"${requestId(it)}","status":"pending","updatedAt":20}""", 202) }
+            fixture.receipt = { id -> json("""{"requestId":"$id","status":"accepted","updatedAt":21}""") }
+            fixture.snapshotText = snapshot(running = false, cursor = 8)
+            val idle = "event: snapshot\ndata: ${fixture.snapshotText}\n\n"
+            fixture.events = { MockResponse().setHeader("Content-Type", "text/event-stream").setBody(idle + ": held\n\n")
+                .throttleBody(idle.toByteArray().size.toLong(), 1, TimeUnit.SECONDS) }
+            repo.cancelRun()
+            withTimeout(3000) { repo.state.first { !it.busy && it.snapshot?.cursor == 8L && it.pending == null } }
+            assertNull(store.value.pending)
+            assertNull(repo.state.value.error)
+            assertEquals(1, fixture.mutations.size)
+        }
+    }
+    @Test fun `pending cancel receipt acceptance still waits for authoritative idle snapshot`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true, cursor = 7)
+            repo.refresh()
+            fixture.message = { json("""{"requestId":"${requestId(it)}","status":"pending","updatedAt":20}""", 202) }
+            fixture.receipt = { id -> json("""{"requestId":"$id","status":"accepted","updatedAt":21}""") }
+            repo.cancelRun()
+            withTimeout(3000) { repo.state.first { it.pending?.status == "accepted" && !it.busy } }
+            assertTrue(repo.state.value.snapshot!!.session.running)
+            fixture.snapshotText = snapshot(running = false, cursor = 8)
+            repo.refresh()
+            assertNull(repo.state.value.pending)
+            assertNull(repo.state.value.error)
+            assertEquals(1, fixture.mutations.size)
+        }
+    }
+    @Test fun `pending cancel timeout is bounded and manual resolution never repeats Stop`() = runBlocking {
+        withRepository { repo, store, fixture, _ ->
+            fixture.snapshotText = snapshot(running = true, cursor = 7)
+            repo.refresh()
+            val polls = java.util.concurrent.atomic.AtomicInteger()
+            fixture.message = { json("""{"requestId":"${requestId(it)}","status":"pending","updatedAt":20}""", 202) }
+            fixture.receipt = { id -> polls.incrementAndGet(); json("""{"requestId":"$id","status":"pending","updatedAt":21}""") }
+            repo.cancelRun()
+            withTimeout(15000) { repo.state.first { it.pending?.status == "uncertain" } }
+            assertEquals(6, polls.get())
+            assertEquals("uncertain", store.value.pending?.status)
+            fixture.receipt = { id -> json("""{"requestId":"$id","status":"accepted","updatedAt":22}""") }
+            fixture.snapshotText = snapshot(running = false, cursor = 8)
+            repo.resolvePending()
+            assertNull(store.value.pending)
+            assertNull(repo.state.value.error)
+            assertEquals(1, fixture.mutations.size)
+        }
+    }
     @Test fun `pending answer and skip settle by receipt without another POST`() = runBlocking {
         for (skip in listOf(false, true)) withRepository { repo, store, fixture, _ ->
             fixture.capabilities = fixture.capabilities.replace("\"questions\":false", "\"questions\":true,\"questionSkip\":true")
