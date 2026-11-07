@@ -192,7 +192,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
     }
     suspend fun sessions(firstPageOnly: Boolean = false, after: SessionIndex? = null): SessionIndex {
         val items = after?.items.orEmpty().toMutableList()
-        val ids = items.map { it.id }.toMutableSet()
+        val ids = (after?.pageIds ?: items.map { it.id }.toSet()).toMutableSet()
         val cursors = after?.cursors.orEmpty().toMutableSet()
         var cursor: String? = after?.nextCursor
         if (after != null && cursor == null) return after
@@ -206,12 +206,20 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
                     page.items.forEach { it.checked() }
                 }
             }
-            items += page.items
+            // Supplement rows can legitimately recur in the date page chain. Page duplicates
+            // still fail validation above; only supplemental overlap is merged by identity.
+            if (cursor == null) {
+                if (page.activeItems.map { it.id }.distinct().size != page.activeItems.size) throw MobileFailure("invalid_response")
+                page.activeItems.forEach { it.checked() }
+                items += page.activeItems
+            }
+            val existing = items.map { it.id }.toSet()
+            items += page.items.filterNot { it.id in existing }
             val pages = (after?.pages ?: 0) + offset + 1
-            val next = page.nextCursor ?: return SessionIndex(items, false, pages = pages)
+            val next = page.nextCursor ?: return SessionIndex(items, false, pages = pages, pageIds = ids.toSet())
             if (next.isBlank() || next.length > 4096 || next.any { it.isISOControl() } || !cursors.add(next) || page.items.isEmpty()) throw MobileFailure("invalid_response")
             cursor = next
-            if (firstPageOnly || pages == 10) return SessionIndex(items, true, next, cursors.toSet(), pages)
+            if (firstPageOnly || pages == 10) return SessionIndex(items, true, next, cursors.toSet(), pages, ids.toSet())
         }
         return SessionIndex(items, true)
     }
@@ -420,7 +428,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
     suspend fun closeAndAwait() { close(); awaitClosed() }
 
     internal data class SessionIndex(val items: List<dev.dshmobile.app.model.SessionSummary>, val truncated: Boolean,
-        val nextCursor: String? = null, val cursors: Set<String> = emptySet(), val pages: Int = 0)
+        val nextCursor: String? = null, val cursors: Set<String> = emptySet(), val pages: Int = 0, val pageIds: Set<String>? = null)
     private data class HttpResult(val status: Int, val text: String, val retryAfterMs: Long = 0)
     /** Internal category only: never retain the raw exception, its message, cause or request. */
     private class ReadConnectionClosed(val call: Call) : Exception("network_unavailable")

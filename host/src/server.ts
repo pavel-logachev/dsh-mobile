@@ -608,7 +608,11 @@ export async function createHostServer(options: HostServerOptions): Promise<Mobi
         nextCursor = randomBytes(24).toString('base64url');
         cursors.set(nextCursor, { deviceId: current.deviceId, workspaceId, after: { updatedAt: last.updatedAt, id: last.id }, expiresAt: Date.now() + 300_000 });
       }
-      sendJson(res, 200, { items, nextCursor }); return;
+      // Additive v1 field: legacy clients keep the exact date page and cursor contract.
+      // New clients receive every authorized active row on the opening load, even below the cut.
+      const activeItems = cursor === null ? scoped.filter(session => session.running || (session.runningSubagents ?? 0) > 0 || session.waitingForAnswer === true)
+        .map(session => sessionForDevice(session, current.deviceId, ids)) : undefined;
+      sendJson(res, 200, { items, nextCursor, ...(activeItems ? { activeItems } : {}) }); return;
     }
     if (outcomesRoute) {
       outcomeResponses.add(res);

@@ -92,6 +92,34 @@ class RepositoryTest {
             }
         }
     }
+    @Test fun `home roster refreshes flags without manual refresh and stops on background or chat`() = runBlocking {
+        val scope = CoroutineScope(kotlin.coroutines.coroutineContext + SupervisorJob())
+        val fixture = Fixture(); val store = MemoryStore()
+        MockWebServer().use { server ->
+            server.dispatcher = fixture; server.start()
+            val repo = NetworkMobileRepository(store, scope, debug = true, observeRestoredSession = false, prefetchEnabled = false, indexRefreshIntervalMs = 100)
+            suspend fun awaitFlag(running: Boolean) = kotlinx.coroutines.withTimeout(5000) {
+                while (repo.state.value.sessions.singleOrNull()?.running != running) kotlinx.coroutines.delay(20)
+            }
+            fun lists() = fixture.requests.count { it.requestUrl?.encodedPath == "/v1/sessions" }
+            try {
+                repo.setForeground(true)
+                repo.pair("""{"version":1,"baseUrl":"${server.url("/").newBuilder().host("127.0.0.1").build().toString().removeSuffix("/")}","pairingToken":"synthetic-invitation-token"}""", "Synthetic")
+                fixture.index = """{"items":[${session(true)}],"nextCursor":null}"""
+                awaitFlag(true)
+                fixture.index = """{"items":[${session(false)}],"nextCursor":null}"""
+                awaitFlag(false)
+                repo.setForeground(false)
+                val paused = lists(); kotlinx.coroutines.delay(250); assertEquals(paused, lists())
+                repo.setForeground(true); repo.selectSession("chat")
+                val selected = lists(); kotlinx.coroutines.delay(250); assertEquals(selected, lists())
+                repo.leaveSession(); fixture.index = """{"items":[${session(true)}],"nextCursor":null}"""
+                awaitFlag(true)
+                assertTrue(fixture.mutations.isEmpty())
+            } finally { repo.close(); scope.cancel() }
+        }
+    }
+
     @Test fun `manual reconnect replaces self retired read transport without replaying uncertain prompt`() = runBlocking {
         withRepository { repo, store, fixture, _ ->
             repo.sendMessage("Synthetic uncertain intent")

@@ -14,6 +14,45 @@ class ChatListPresentationTest {
     private fun session(id: String, title: String, project: String, age: Long) =
         SessionSummary(id, title, project, now - age, false, true)
 
+    @Test fun `observed interleaved running chats precede idle chats in a distinct section`() {
+        val rows = listOf(session("r1", "12-27", "a", 0).copy(running = true),
+            session("i1", "12-15", "a", 12), session("r2", "12-12", "a", 15).copy(running = true),
+            session("r3", "11-55", "a", 32).copy(running = true), session("i2", "11-10", "a", 77))
+        val groups = groupSessionsByDate(filterSessions(rows, null, ""), now, zone)
+        assertEquals(listOf("r1", "r2", "r3"), groups.first().sessions.map { it.id })
+        assertEquals("WORKING", groups.first().section.name)
+        assertEquals(listOf("i1", "i2"), groups.last().sessions.map { it.id })
+    }
+
+    @Test fun `subagents alone and waiting alone are active including older dates`() {
+        val rows = listOf(session("idle", "Idle", "a", 0),
+            session("child", "Child", "a", 86400000).copy(runningSubagents = 2),
+            session("wait", "Wait", "a", 86400000 * 30L).copy(waitingForAnswer = true))
+        val groups = groupSessionsByDate(rows, now, zone)
+        assertEquals(listOf("child", "wait"), groups.first().sessions.map { it.id })
+        assertEquals("WORKING", groups.first().section.name)
+        assertTrue(groups.first().sessions.last().waitingForAnswer)
+    }
+
+    @Test fun `finishing active chat returns to original date without duplication`() {
+        val idle = session("idle", "Idle", "a", 0)
+        val active = session("old", "Old", "a", 86400000 * 30L).copy(running = true)
+        assertEquals("WORKING", groupSessionsByDate(listOf(idle, active), now, zone).first().section.name)
+        val groups = groupSessionsByDate(listOf(idle, active.copy(running = false)), now, zone)
+        assertEquals(listOf(DateSection.TODAY, DateSection.EARLIER), groups.map { it.section })
+        assertEquals(listOf("idle", "old"), groups.flatMap { it.sessions }.map { it.id })
+    }
+
+    @Test fun `active section intersects project and existing grouped search`() {
+        val rows = listOf(session("idle", "Match", "a", 0), session("a", "Match", "a", 10).copy(running = true),
+            session("b", "Match", "b", 5).copy(waitingForAnswer = true))
+        val groups = groupSessionsByDate(filterSessions(rows, "a", "Match"), now, zone)
+        assertEquals(listOf("a"), groups.first().sessions.map { it.id })
+        assertEquals("WORKING", groups.first().section.name)
+        assertEquals(listOf("a", "idle"), groups.flatMap { it.sessions }.map { it.id })
+        assertTrue(groupSessionsByDate(emptyList(), now, zone).isEmpty())
+    }
+
     @Test fun `project filters count all chats and order by latest activity`() {
         val projects = listOf(Workspace("a", "Alpha", true), Workspace("b", "Beta", false), Workspace("c", "Empty", true))
         val sessions = listOf(session("1", "Old", "a", 5000), session("2", "New", "b", 0), session("3", "Other", "a", 1000))

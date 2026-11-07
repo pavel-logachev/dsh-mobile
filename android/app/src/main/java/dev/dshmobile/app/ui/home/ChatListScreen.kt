@@ -150,6 +150,7 @@ internal fun ChatListScreen(state: MobileState, query: String, onQuery: (String)
                     groups.forEach { group ->
                         item(key = LazyItemKeys.section(group.section.name)) {
                             Text(stringResource(when (group.section) {
+                                DateSection.WORKING -> R.string.mobile_working_now
                                 DateSection.TODAY -> R.string.mobile_today
                                 DateSection.YESTERDAY -> R.string.mobile_yesterday
                                 DateSection.THIS_WEEK -> R.string.mobile_this_week

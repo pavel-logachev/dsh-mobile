@@ -892,6 +892,25 @@ test('wildcard read and execute grants cover all configured scope, while read-on
   assert.equal((await (await request('/sessions', readOnly.deviceToken)).json()).items.every((item: { canExecute: boolean }) => !item.canExecute), true);
 });
 
+test('first load includes every scoped active session beyond the date page without changing legacy paging', async t => {
+  const adapter = new TestAdapter();
+  adapter.snapshots.clear();
+  for (let i = 0; i < 105; i++) adapter.snapshots.set(`idle-${i}`, { ...structuredClone(snapshot), session: { ...snapshot.session, id: `idle-${i}`, updatedAt: 1000 - i } });
+  for (const [id, flags] of Object.entries({ running: { running: true }, child: { runningSubagents: 2 }, waiting: { waitingForAnswer: true }, forbidden: { running: true, workspaceId: 'beta' } }))
+    adapter.snapshots.set(id, { ...structuredClone(snapshot), session: { ...snapshot.session, id, updatedAt: 1, ...flags } });
+  const { request, pair } = await setup(t, adapter), { deviceToken } = await pair();
+  const legacy = await (await request('/sessions?limit=100', deviceToken)).json();
+  assert.equal(legacy.items.length, 100);
+  const first = await (await request('/sessions?limit=100', deviceToken)).json();
+  assert.deepEqual(first.items, legacy.items);
+  assert.deepEqual(first.activeItems?.map((s: any) => s.id), ['child', 'running', 'waiting']);
+  const next = await (await request(`/sessions?limit=100&cursor=${first.nextCursor}`, deviceToken)).json();
+  assert.equal(next.items.length, 8); assert.equal(next.nextCursor, null);
+  adapter.snapshots.get('running')!.session.running = false;
+  const refreshed = await (await request('/sessions?workspaceId=alpha', deviceToken)).json();
+  assert.deepEqual(refreshed.activeItems.map((s: any) => s.id), ['child', 'waiting']);
+});
+
 test('session pagination is keyset and does not repeat an item moved above the cut', async t => {
   const { adapter, request, pair } = await setup(t);
   const all = await pair({ readWorkspaceIds: ['*'], executeWorkspaceIds: ['*'] });

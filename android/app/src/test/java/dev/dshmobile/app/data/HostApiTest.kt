@@ -12,6 +12,29 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 class HostApiTest {
+    @Test fun `active supplement is available on first load and merges duplicate page rows`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start()
+            fun row(id: String, running: Boolean) = """{"id":"$id","title":"Synthetic","workspaceId":"w","updatedAt":1,"running":$running,"canExecute":true}"""
+            server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("""{"items":[${row("idle", false)}],"activeItems":[${row("active", true)}],"nextCursor":"next"}"""))
+            server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("""{"items":[${row("active", true)}],"nextCursor":null}"""))
+            val api = api(server)
+            try {
+                val first = api.sessions(firstPageOnly = true)
+                assertEquals(listOf("active", "idle"), first.items.map { it.id })
+                assertEquals(listOf("active", "idle"), api.sessions(after = first).items.map { it.id })
+            } finally { api.close() }
+        }
+    }
+
+    @Test fun `legacy host without active supplement retains date paging contract`() = runBlocking {
+        MockWebServer().use { server ->
+            server.start(); server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("""{"items":[],"nextCursor":null}"""))
+            val api = api(server)
+            try { assertTrue(api.sessions(firstPageOnly = true).items.isEmpty()) } finally { api.close() }
+        }
+    }
+
     @Test fun `transparent gzip decodes bounded JSON and sequential reads reuse the connection`() = runBlocking {
         MockWebServer().use { server ->
             server.start()

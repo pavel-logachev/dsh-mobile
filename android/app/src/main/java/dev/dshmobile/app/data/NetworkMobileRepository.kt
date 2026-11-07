@@ -65,6 +65,7 @@ internal class NetworkMobileRepository(
     private val unwatchPrompt: suspend (String) -> Unit = {},
     private val networkWake: (((() -> Unit)) -> (() -> Unit))? = null,
     private val firstSnapshotTimeoutMs: Long = 15_000L,
+    private val indexRefreshIntervalMs: Long = 5_000L,
 ) : MobileRepository {
     private val repositoryJob = SupervisorJob(ownerScope.coroutineContext[Job])
     private val scope = CoroutineScope(ownerScope.coroutineContext + repositoryJob)
@@ -143,6 +144,30 @@ internal class NetworkMobileRepository(
     // Connectivity is visible before the fresh metadata/history cut authorizes actions.
     private var syncing = false
     private var indexJob: Job? = null
+    private var listRefreshJob: Job? = null
+    private fun stopListRefresh() { listRefreshJob?.cancel(); listRefreshJob = null }
+    /** Only the foreground home route polls the roster. No transcript reads or command replay. */
+    private fun startListRefresh() {
+        if (listRefreshJob?.isActive == true || !foreground || !desiredForeground || observingSession || closed) return
+        listRefreshJob = scope.launch {
+            while (true) {
+                delay(indexRefreshIntervalMs)
+                action {
+                    if (!foreground || !desiredForeground || observingSession || closed ||
+                        state.value.connection != ConnectionState.ONLINE || indexJob?.isActive == true) return@action
+                    val network = api()
+                    val first = network.sessions(firstPageOnly = true)
+                    checkHistoryEpoch()
+                    if (first.items.any { item -> state.value.workspaces.none { it.id == item.workspaceId } }) throw MobileFailure("invalid_response")
+                    cancelIndex()
+                    val index = mergeIndex(first)
+                    saveIndex(state.value.workspaces, index)
+                    mutableState.value = state.value.copy(sessions = index.items, sessionsTruncated = index.truncated, lastSyncedAt = now())
+                    loadRemainingIndex(network, first)
+                }
+            }
+        }
+    }
     @Volatile private var indexRevision = 0L
     // Point reads / admitted mutations are newer evidence than an already-started page chain.
     private var sessionRevision = 0L
@@ -522,10 +547,12 @@ internal class NetworkMobileRepository(
         if (requestedSessionId == null && (snapshot == null || !caps.capabilities.liveSnapshots)) reconnectAttempt = 0
         if (foreground && state.value.connection == ConnectionState.ONLINE) {
             startObserver()
+            startListRefresh()
             if (prefetchEnabled && requestedSessionId == null) prefetch.start(sessions.filterNot { observingSession && it.id == selected })
         }
     }
     override suspend fun selectSession(sessionId: String) {
+        stopListRefresh()
         val task = synchronized(selectionGuard) {
             selection?.cancel()
             historyRead?.cancel()
@@ -576,6 +603,7 @@ internal class NetworkMobileRepository(
             historyRead?.cancel(); historyRead = null
         }
         stopObserver()
+        startListRefresh()
         if (prefetchEnabled && foreground && state.value.connection == ConnectionState.ONLINE)
             prefetch.start(state.value.sessions.filter { diskHistory.get(it.id) == null })
     }
@@ -1226,7 +1254,7 @@ internal class NetworkMobileRepository(
                 unregisterNetworkWake?.invoke(); unregisterNetworkWake = null
                 networkWakeJob?.cancel(); networkWakeJob = null
                 receiptPoll?.cancel(); receiptPoll = null; receiptPollId = null
-                stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel(); cancelIndex()
+                stopListRefresh(); stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel(); cancelIndex()
                 api?.close(); api = null
                 pairingTransport?.close()
             }
@@ -1253,7 +1281,7 @@ internal class NetworkMobileRepository(
         }
     }
     override suspend fun forget() = action {
-        stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel(); cancelIndex()
+        stopListRefresh(); stopObserver(); cancelReconnect(); cancelProjectionRetry(); prefetch.cancel(); cancelIndex()
         // Credentials are the mandatory outcome; optional cache/key failures cannot gate it.
         try { store.clear() }
         catch (_: Exception) { store.reset() }
@@ -1274,7 +1302,7 @@ internal class NetworkMobileRepository(
             if (closed) return
             closed = true; desiredForeground = false; foreground = false; foregroundRevision++
             unregisterNetworkWake?.invoke(); unregisterNetworkWake = null
-            stopObserver(); cancelReconnect(); prefetch.cancel(); cancelIndex()
+            stopListRefresh(); stopObserver(); cancelReconnect(); prefetch.cancel(); cancelIndex()
             api?.close(); api = null; pairingTransport?.close()
         }
         removeHistoryListener?.invoke(); removeHistoryListener = null
