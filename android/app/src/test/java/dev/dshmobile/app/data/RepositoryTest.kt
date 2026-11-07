@@ -92,6 +92,29 @@ class RepositoryTest {
             }
         }
     }
+    @Test fun `late stop from previous activity cannot take visible activity offline or suppress manual reconnect`() = runBlocking {
+        withRepository { repo, _, fixture, _ ->
+            repo.setForeground(false)
+            val previous = Any(); val visible = Any()
+            repo.setForeground(true, previous)
+            repo.setForeground(true, visible)
+            repo.setForeground(false, previous)
+            repo.setForeground(false, previous) // Disposal after ON_STOP is idempotent.
+            assertEquals("The visible owner still authorizes networking", ConnectionState.ONLINE, repo.state.value.connection)
+            val before = fixture.requests.count { it.path == "/v1/capabilities" }
+            withTimeout(1000) { repo.refresh() }
+            assertEquals(before + 1, fixture.requests.count { it.path == "/v1/capabilities" })
+            repo.setForeground(false, visible)
+            assertEquals(ConnectionState.OFFLINE, repo.state.value.connection)
+            val stopped = fixture.requests.size
+            repo.refresh()
+            assertEquals("No reads with zero foreground owners", stopped, fixture.requests.size)
+            repo.setForeground(true, visible)
+            assertEquals(ConnectionState.ONLINE, repo.state.value.connection)
+            assertTrue(fixture.mutations.isEmpty())
+        }
+    }
+
     @Test fun `home roster refreshes flags without manual refresh and stops on background or chat`() = runBlocking {
         val scope = CoroutineScope(kotlin.coroutines.coroutineContext + SupervisorJob())
         val fixture = Fixture(); val store = MemoryStore()

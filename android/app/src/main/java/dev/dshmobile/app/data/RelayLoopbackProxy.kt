@@ -34,7 +34,8 @@ import javax.net.ssl.SSLParameters
 
 /** Private app-only CONNECT endpoint. Ordinary inner TLS owns all host authentication. */
 internal class RelayLoopbackProxy(
-    private val endpoint: HostEndpoint, owner: TransportIoOwner? = null, private val onOverflow: (() -> Unit)? = null,
+    private val endpoint: HostEndpoint, owner: TransportIoOwner? = null,
+    private val diagnostic: ConnectionDiagnostic = ConnectionDiagnostic(), private val onOverflow: (() -> Unit)? = null,
 ) : AutoCloseable {
     private val io = owner ?: TransportIoOwner()
     private val ownsIo = owner == null
@@ -124,6 +125,7 @@ internal class RelayLoopbackProxy(
                     rawOuter = raw // Owned before DNS/connect; cleanup can abort it at every startup phase.
                 }
                 raw.tcpNoDelay = true
+                diagnostic.record("relay-open", "start", startedAt = openedAt / 1_000_000)
                 raw.connect(InetSocketAddress(url.host, port), 10_000)
                 if (terminal.get()) return
                 val network = if (url.scheme == "wss") {
@@ -150,6 +152,7 @@ internal class RelayLoopbackProxy(
                         if (parameters.protocols.isEmpty()) throw IOException("relay TLS unavailable")
                     }
                     override fun onOpen(handshake: ServerHandshake) {
+                        diagnostic.record("relay-open", startedAt = openedAt / 1_000_000)
                         // Java-WebSocket uses receiveBufferSize for both its decode byte[] and SO_RCVBUF.
                         // Keep the 8-KiB decode/header guard, but restore a separate TCP window after upgrade.
                         // Linux's tiny window otherwise trickles a burst response so slowly that its queued
@@ -175,7 +178,7 @@ internal class RelayLoopbackProxy(
                     }
                     override fun onClosing(code: Int, reason: String, remote: Boolean) { outerEnded(code, remote) }
                     override fun onClose(code: Int, reason: String, remote: Boolean) { outerEnded(code, remote) }
-                    override fun onError(exception: Exception) { this@Tunnel.close() }
+                    override fun onError(exception: Exception) { diagnostic.record("relay-open", failure = exception, startedAt = openedAt / 1_000_000); this@Tunnel.close() }
                     override fun onWebsocketPing(connection: WebSocket, frame: Framedata) {
                         synchronized(writes) {
                             if (!controlAllowed() || queueCount() >= 8) { this@Tunnel.close(); return }
@@ -221,7 +224,7 @@ internal class RelayLoopbackProxy(
                     if (count == 0) continue
                     send(bytes.copyOf(count))
                 }
-            } catch (_: Exception) { /* Only a safe network failure reaches the inner API. */ }
+            } catch (failure: Exception) { diagnostic.record("relay-open", failure = failure, startedAt = openedAt / 1_000_000) }
             finally {
                 // After outer EOF the incoming pump owns final close, with the same stall watchdog.
                 // Upload failure must not overtake a response already accepted from the peer.

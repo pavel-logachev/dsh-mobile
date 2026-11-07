@@ -376,13 +376,13 @@ class MobileViewModel @JvmOverloads constructor(application: Application,
     }, failed = {})
     fun foreground(active: Boolean) {
         notificationResume.foreground(active)
-        viewModelScope.launch { repository.setForeground(active) }
+        viewModelScope.launch { repository.setForeground(active, this@MobileViewModel) }
     }
     override fun onCleared() {
         cleared = true
         sendScope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
             try {
-                repository.setForeground(false) // Retire presentation reads, never the admitted POST.
+                repository.setForeground(false, this@MobileViewModel) // Release only this UI owner's presentation reads.
                 admittedSend?.join()
             } finally {
                 if (ownsRepository) repository.close()

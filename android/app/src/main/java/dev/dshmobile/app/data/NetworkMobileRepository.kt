@@ -31,6 +31,7 @@ fun createMobileRepository(context: Context, scope: CoroutineScope): MobileRepos
     NetworkMobileRepository(EncryptedStateStore(context.applicationContext), scope, BuildConfig.DEBUG, observeRestoredSession = false,
         historyStore = EncryptedHistoryStore(context.applicationContext), prefetchEnabled = true,
         networkWake = repositoryNetworkWake(context.applicationContext),
+        connectionFlags = connectionNetwork(context.applicationContext),
         watchPrompt = { device, session, request, title -> registerPhoneWatch(context.applicationContext, device, session, request, title) },
         unwatchPrompt = { request -> NotificationStore(context.applicationContext).update { it.copy(watches = it.watches.filterNot { w -> w.requestId == request }) }; Unit },
         openAttachment = { source -> context.contentResolver.openInputStream(android.net.Uri.parse(source.uri)) ?: throw java.io.IOException("unavailable") })
@@ -66,6 +67,7 @@ internal class NetworkMobileRepository(
     private val networkWake: (((() -> Unit)) -> (() -> Unit))? = null,
     private val firstSnapshotTimeoutMs: Long = 15_000L,
     private val indexRefreshIntervalMs: Long = 5_000L,
+    connectionFlags: () -> ConnectionNetwork = { ConnectionNetwork() },
 ) : MobileRepository {
     private val repositoryJob = SupervisorJob(ownerScope.coroutineContext[Job])
     private val scope = CoroutineScope(ownerScope.coroutineContext + repositoryJob)
@@ -113,6 +115,7 @@ internal class NetworkMobileRepository(
     @Volatile private var pairingTransport: HostApi? = null
     @Volatile private var foreground = false
     @Volatile private var desiredForeground = false
+    private val diagnostic = ConnectionDiagnostic(foreground = { foreground && desiredForeground }, network = connectionFlags)
     private var foregroundRevision = 0L
     private val lifecycle = Any()
     @Volatile private var closed = false
@@ -127,6 +130,7 @@ internal class NetworkMobileRepository(
 
     /** Read-only wake; flaps coalesce and never cancel or replay an admitted command. */
     fun networkRestored() {
+        diagnostic.record("network-callback")
         synchronized(lifecycle) {
             if (!foreground || !desiredForeground || closed || state.value.connection != ConnectionState.OFFLINE || networkWakeJob?.isActive == true) return
             networkWakeJob = scope.launch(start = CoroutineStart.LAZY) {
@@ -157,6 +161,7 @@ internal class NetworkMobileRepository(
                     if (!foreground || !desiredForeground || observingSession || closed ||
                         state.value.connection != ConnectionState.ONLINE || indexJob?.isActive == true) return@action
                     val network = api()
+                    diagnostic.record("list-tick", "start")
                     try {
                         // One physical GET per tick, never a page chain or a closed-read retry.
                         val first = network.sessions(firstPageOnly = true, retryClosedRead = false)
@@ -273,6 +278,7 @@ internal class NetworkMobileRepository(
             try { block(); checkHistoryEpoch() }
             catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: Exception) {
+                diagnostic.record("connect", failure = failure)
                 fail(if (failure is MobileFailure) failure.key else "storage_failed", failure is MobileFailure && failure.retryable)
             } finally {
                 if (historyEpoch != historyStore.authority.epoch) hideRejectedHistory("revoked")
@@ -343,7 +349,7 @@ internal class NetworkMobileRepository(
         // keep handing that terminal instance to manual, backoff or restored-network reads.
         api?.takeUnless { it.isRetired } ?: run {
             val host = stored.host ?: throw MobileFailure("not_paired")
-            HostApi(host.endpoint, host.deviceToken).also { api = it }
+            HostApi(host.endpoint, host.deviceToken, diagnostic).also { api = it }
         }
     }
     private fun online() {
@@ -353,6 +359,7 @@ internal class NetworkMobileRepository(
     }
     private suspend fun restoreLocked() {
         if (restored) return
+        diagnostic.record("restore", "start")
         stored = try { store.read() } catch (_: Exception) { throw MobileFailure("storage_failed") }
         val host = stored.host
         if (host != null) {
@@ -378,7 +385,7 @@ internal class NetworkMobileRepository(
                 }
             }
             synchronized(lifecycle) {
-                if (foreground && desiredForeground && !closed) api = HostApi(host.endpoint, host.deviceToken)
+                if (foreground && desiredForeground && !closed) api = HostApi(host.endpoint, host.deviceToken, diagnostic)
             }
         } else if (stored.pending != null || stored.acceptedPrompts.isNotEmpty() || stored.drafts.isNotEmpty() || stored.selectedSessionId != null || stored.attachmentDrafts.isNotEmpty() || stored.answerDrafts.isNotEmpty()) {
             throw MobileFailure("storage_failed")
@@ -404,6 +411,7 @@ internal class NetworkMobileRepository(
             draftsRestored = true, attachmentDrafts = stored.attachmentDrafts, answerDrafts = stored.answerDrafts,
             retainedAttachmentSources = stored.acceptedPrompts.flatMap { it.attachmentSources } + stored.pending?.attachmentSources.orEmpty(),
         )
+        diagnostic.record("restore")
         if (lastIndex != null) StartupPerf.mark("cache_list_shown")
     }
     override suspend fun restore() = action {
@@ -450,7 +458,7 @@ internal class NetworkMobileRepository(
             pairingApi.closeAndAwait() // Suspend outside lifecycle monitor; no bootstrap overlap.
             checkpoint = "pair.create-device-transport"
             synchronized(lifecycle) {
-                if (foreground && desiredForeground && !closed) api = HostApi(host.endpoint, host.deviceToken)
+                if (foreground && desiredForeground && !closed) api = HostApi(host.endpoint, host.deviceToken, diagnostic)
             }
             mutableState.value = MobileState(paired = true, draftsRestored = true, hostName = host.hostName, localPromptActions = promptActions,
                 remoteMode = host.endpoint.relay != null, relayHost = host.endpoint.relay?.let { safeRelayOrigin(it) },
@@ -461,7 +469,10 @@ internal class NetworkMobileRepository(
         catch (failure: Exception) { safeDebugDiagnostic(checkpoint, failure); throw failure }
         finally { pairingTransport = null; pairingApi.close() }
     }
-    override suspend fun refresh() = action {
+    override suspend fun refresh() {
+        diagnostic.record("manual-refresh", "queued")
+        action {
+        diagnostic.record("manual-refresh", "entered")
         // An explicit retry owns a fresh bounded recovery window, even if this read fails.
         cancelReconnect()
         reconnectAttempt = 0
@@ -471,6 +482,7 @@ internal class NetworkMobileRepository(
             if (stored.host == null) throw MobileFailure("not_paired")
             if (foreground) refreshLocked()
         } finally { mutableState.value = state.value.copy(manualRefreshing = false) }
+        }
     }
     private data class RefreshMetadata(
         val capabilities: CapabilitiesResponse,
@@ -479,6 +491,7 @@ internal class NetworkMobileRepository(
         val index: HostApi.SessionIndex,
     )
     private suspend fun refreshLocked(readHistory: Boolean = true) {
+        diagnostic.begin()
         try {
             val target = requestedSessionId?.takeIf { observingSession && readHistory }
             val revision = selectionRevision
@@ -775,7 +788,7 @@ internal class NetworkMobileRepository(
         if (ids.isEmpty()) return
         scope.launch {
             // Best effort and independent of foreground/UI; never retry a mutation or an admitted source.
-            val cleanupApi = HostApi(host.endpoint, host.deviceToken)
+            val cleanupApi = HostApi(host.endpoint, host.deviceToken, diagnostic)
             try { ids.forEach { id -> runCatching { cleanupApi.discardUpload(session, id) } } }
             finally { cleanupApi.close() }
         }
@@ -906,7 +919,7 @@ internal class NetworkMobileRepository(
         // Capture mutation transport before persistence can suspend. ON_STOP retires only reads.
         // Only a fresh proof that no headers left permits bounded transport recovery.
         val host = stored.host ?: throw MobileFailure("not_paired")
-        val mutation = HostApi(host.endpoint, host.deviceToken)
+        val mutation = HostApi(host.endpoint, host.deviceToken, diagnostic)
         try { dispatchOn(mutation, command, drafts) } finally { mutation.close() }
     }
     private suspend fun commandWithPreHeaderRecovery(initial: HostApi, command: StoredCommand): CommandReceipt {
@@ -921,7 +934,7 @@ internal class NetworkMobileRepository(
                     delay(preHeaderRetryDelay(attempt))
                     if (transport !== initial) transport.close()
                     val host = stored.host ?: throw failure
-                    transport = HostApi(host.endpoint, host.deviceToken) // New VPN route/tunnel, never stale pool.
+                    transport = HostApi(host.endpoint, host.deviceToken, diagnostic) // New VPN route/tunnel, never stale pool.
                 }
             }
             error("unreachable")
@@ -1254,6 +1267,7 @@ internal class NetworkMobileRepository(
         })
     }
     private fun scheduleReconnect() {
+        diagnostic.record("reconnect-scheduled", "queued")
         if (!foreground || closed || stored.host == null || reconnectJob?.isActive == true || reconnectAttempt >= 6) return
         reconnectJob = scope.launch {
             delay(retryDelay(reconnectAttempt++))
@@ -1276,12 +1290,22 @@ internal class NetworkMobileRepository(
     private fun cancelProjectionRetry() {
         projectionRetryJob?.cancel(); projectionRetryJob = null; projectionRetryAttempt = 0
     }
-    override suspend fun setForeground(active: Boolean) {
+    private val legacyForegroundOwner = Any()
+    private val foregroundOwners = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
+    override suspend fun setForeground(active: Boolean) = setForeground(active, legacyForegroundOwner)
+    override suspend fun setForeground(active: Boolean, owner: Any) {
+        val effective: Boolean
         val revision = synchronized(lifecycle) {
             if (closed) return
-            desiredForeground = active
+            if (active) foregroundOwners.add(owner) else foregroundOwners.remove(owner)
+            effective = foregroundOwners.isNotEmpty()
+            // START(B), STOP(A) is not a process background transition. Duplicate STOP/dispose
+            // is harmless. A pending transition can still be superseded under the same lock.
+            if (effective == desiredForeground && foreground == effective) return
+            desiredForeground = effective
             foregroundRevision++
-            if (!active) {
+            diagnostic.record("foreground", if (effective) "foreground" else "background")
+            if (!effective) {
                 foreground = false
                 unregisterNetworkWake?.invoke(); unregisterNetworkWake = null
                 networkWakeJob?.cancel(); networkWakeJob = null
@@ -1294,14 +1318,14 @@ internal class NetworkMobileRepository(
         }
         action {
             val wasForeground = synchronized(lifecycle) {
-                if (revision != foregroundRevision || desiredForeground != active || closed) return@action
+                if (revision != foregroundRevision || desiredForeground != effective || closed) return@action
                 foreground.also {
-                    foreground = active
-                    if (active && unregisterNetworkWake == null) unregisterNetworkWake = networkWake?.invoke(::networkRestored)
+                    foreground = effective
+                    if (effective && unregisterNetworkWake == null) unregisterNetworkWake = networkWake?.invoke(::networkRestored)
                 }
             }
             restoreLocked()
-            if (!active) {
+            if (!effective) {
                 synchronized(lifecycle) { api?.close(); api = null }
                 cacheMutex.withLock { diskHistory.flush() }
                 if (stored.host != null && state.value.connection !in setOf(ConnectionState.REVOKED, ConnectionState.INCOMPATIBLE))
@@ -1332,7 +1356,7 @@ internal class NetworkMobileRepository(
     override fun close() {
         synchronized(lifecycle) {
             if (closed) return
-            closed = true; desiredForeground = false; foreground = false; foregroundRevision++
+            closed = true; desiredForeground = false; foreground = false; foregroundRevision++; foregroundOwners.clear()
             unregisterNetworkWake?.invoke(); unregisterNetworkWake = null
             stopListRefresh(); stopObserver(); cancelReconnect(); prefetch.cancel(); cancelIndex()
             api?.close(); api = null; pairingTransport?.close()

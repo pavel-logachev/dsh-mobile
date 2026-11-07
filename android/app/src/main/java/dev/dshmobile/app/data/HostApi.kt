@@ -26,12 +26,12 @@ import javax.net.ssl.SSLException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-internal class HostApi(val endpoint: HostEndpoint, private val token: String? = null) {
+internal class HostApi(val endpoint: HostEndpoint, private val token: String? = null, private val diagnostic: ConnectionDiagnostic = ConnectionDiagnostic()) {
     private val io = TransportIoOwner()
     private val retired = java.util.concurrent.atomic.AtomicBoolean()
     internal val isRetired: Boolean get() = retired.get()
     private val admission = Any()
-    private val relayProxy = endpoint.relay?.let { RelayLoopbackProxy(endpoint, io, ::close) }
+    private val relayProxy = endpoint.relay?.let { RelayLoopbackProxy(endpoint, io, diagnostic, ::close) }
     private val client: OkHttpClient = try { SecureTransport.client(endpoint, relayProxy) }
         catch (failure: Exception) { relayProxy?.retire(); io.close { relayProxy?.closePhysical() }; throw failure }
     private val eventClient = client.newBuilder().callTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -98,6 +98,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
             continuation.invokeOnCancellation { cancelOnIo { call.cancel(); mutationPool?.evictAll() } }
             call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                diagnostic.record("http", failure = e)
                 if (upload) UploadDiagnostic.record("transport", UploadDiagnostic.code(e), endpoint.relay != null)
                 mutationPool?.evictAll()
                 val headerEof = e.javaClass == IOException::class.java && e.cause is java.io.EOFException
@@ -109,6 +110,7 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
                         requestNotSent = mutationPool != null && !headersAttempted.get()))
             }
             override fun onResponse(call: Call, response: Response) {
+                diagnostic.record("http")
                 if (upload) UploadDiagnostic.record("response", "ok", endpoint.relay != null, response.code)
                 try {
                     val result = response.use {
@@ -379,11 +381,14 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
         val source = synchronized(admission) {
             if (retired.get()) throw MobileFailure("network_unavailable")
             EventSources.createFactory(eventClient).newEventSource(request, object : EventSourceListener() {
+            override fun onOpen(eventSource: EventSource, response: Response) { diagnostic.record("sse-open") }
             override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
                 if (retired.get() || cancelled.get() || type != "snapshot") return // No unversioned event is interpreted as a state patch.
                 try {
                     if (data.toByteArray().size > SNAPSHOT_LIMIT) throw MobileFailure("invalid_response")
-                    onSnapshot(decodeWire<SessionSnapshot>(data).checked(sessionId))
+                    val snapshot = decodeWire<SessionSnapshot>(data).checked(sessionId)
+                    diagnostic.record("snapshot")
+                    onSnapshot(snapshot)
                 } catch (failure: MobileFailure) {
                     // Terminal decode failure owns cancellation synchronously: later buffered
                     // frames or the physical close must not reclassify it as a host outage.
@@ -394,9 +399,11 @@ internal class HostApi(val endpoint: HostEndpoint, private val token: String? = 
                 }
             }
             override fun onClosed(eventSource: EventSource) {
+                diagnostic.record("sse-fail", "closed")
                 if (!retired.get() && !cancelled.get()) onFailure(MobileFailure("network_unavailable"))
             }
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
+                diagnostic.record("sse-fail", "fail", t)
                 if (retired.get() || cancelled.get()) return
                 val status = response?.code
                 onFailure(MobileFailure(when (status) {

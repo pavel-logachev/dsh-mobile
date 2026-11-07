@@ -44,5 +44,7 @@ interface MobileRepository {
     /** Erases local state only; does not claim to revoke the device on the host. */
     suspend fun forget()
     suspend fun setForeground(active: Boolean)
+    /** Activity/ViewModel owners must not stop another visible owner's shared transport. */
+    suspend fun setForeground(active: Boolean, owner: Any) { setForeground(active) }
     fun close()
 }
