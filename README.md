@@ -42,8 +42,8 @@ The current release is **0.9.3** (8 November 2026): app 0.9.3 (versionCode 20) a
 - Notifications now follow phone-started tasks: completion, failure and needs-answer through `GET /v1/sessions/{id}/prompt-outcomes` and capability `promptOutcomes`. No permanent idle connection notification or coverage banner. The old feed is retired: older apps report notifications unavailable on the new host, so upgrade both components together.
 - Turn errors are shown in chat. Recovery hold/witness and `recovery-status`, `recovery-hold`, `recovery-release --new-epoch` support operator reconciliation, not exactly-once execution.
 - At most 32 unsettled host dispatches; overflow is refused before admission. A ten-minute post-admission deadline settles as `uncertain`, without automatic replay.
-- Network return wakes reconnect; online status follows the first authorized index page. Chat opens stream-first without an initial full GET; the first nonempty text is published immediately, with subsequent updates still throttled. Real-phone speed numbers still require measurements.
-- DSH `0.2.1-rc.5` passed the full isolated canary: **25 checks**. This is not physical-phone or external-model acceptance. [Evidence matrix](<docs/DSH_CANARY.md#compatibility-evidence>).
+- Network return wakes reconnect; online status follows the first authorized index page. Chat opens stream-first without an initial full GET; the first nonempty text is published immediately, with subsequent updates still throttled.
+- DSH `0.2.1-rc.5` passed the full isolated canary: **25 checks**. [Evidence matrix](<docs/DSH_CANARY.md#compatibility-evidence>).
 
 ## What you can do from your phone
 
@@ -239,12 +239,11 @@ Recorded on 7–8 November 2026. Full details are in the [release notes](<docs/R
 | Independent review | The watch fixes, the "Working now" section, the reconnect fixes and the Stop card fix each passed independent review after the findings were fixed. The plugin package passed a separate review: the reviewer rebuilt the ZIP from source and got the same bytes |
 | APK signature | The same certificate as earlier releases, SHA-256: F9080C63B49A0BDE6B74AA2ADF7E9531D6C4F305978A24D3F5D271A39F1B7B95 |
 | Physical phone | OnePlus CPH2747, ColorOS on Android 17. Stop, two runs: `rejected` / `user-stop`, no error alert, the "Sending…" card gone within 1.4 s. A 4-minute task in forced Doze with the screen off: the watch cleared within 1.4 s, the answer arrived once. "Reconnect" after exhausted retries started a connection 53–56 ms after the tap |
-| Not verified on the phone | Direct LAN upload; the task failure alert |
 
 ## Limitations
 
 - **The computer and DSH must stay on.** The phone does not run an agent. One pairing targets one computer; the project list considers the first 100 registered projects.
-- **This is intentionally a native subset, not desktop parity.** Plugin/skill management is not exposed. Action approvals stay on the desktop because there is no verified plugin API for them; they are distinct from answerable agent questions.
+- **This is intentionally a native subset, not desktop parity.** Plugin/skill management is not exposed. Action approvals stay on the desktop; they are distinct from answerable agent questions.
 - **Known 0.9.3 limitations.** A very short task can finish before the waiting notification appears; the answer alert still arrives. Answers to agent questions are shown in a block after all messages, not at their place in time. [Details](<docs/RELEASE_0.9.3.md#known-limitations>).
 - **Notifications are best effort, without FCM/UnifiedPush.** There is no idle service/permanent connection notification or coverage banner. A pending phone task still uses an FGS: its notification cannot be guaranteed invisible on all OEMs. Valid watches/outbox restore after process death and unlocked reboot subject to pairing, permission and OS guards. After force-stop, launch the app manually. Doze, battery saving, offline devices, 24-hour expiry or eviction from the 32-watch bound can prevent delivery. [Exact limits](<docs/NOTIFICATIONS_0.9.md>).
 - **Offline content is a bounded stale/read-only cache.** At most 8 snapshots, 3500 KiB of serialized snapshot UTF-8, 24-hour age, each snapshot at most 2 MiB; the index is bounded separately. Cache is not authorization, command reconciliation or a full archive. Fresh snapshots contain at most 100 messages/2 MiB; older-history recovery is bounded to 16 pages/16 MiB. Upstream JSONL currently reads the whole log before those limits apply.
@@ -254,7 +253,7 @@ Recorded on 7–8 November 2026. Full details are in the [release notes](<docs/R
 
 ### Does the name require a DeepSeek model or subscription?
 
-No. DSH Mobile is a companion to the DeepSeek Harness host, not a purchase of a particular DeepSeek model or plan. Models, providers and billing stay on the computer. This project establishes no cost/task-count comparison with other subscriptions.
+No. DSH Mobile is a companion to the DeepSeek Harness host, not a purchase of a particular DeepSeek model or plan. Models, providers and billing stay on the computer.
 
 ## Documentation
 

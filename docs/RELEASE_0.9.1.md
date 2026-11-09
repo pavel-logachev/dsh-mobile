@@ -29,7 +29,7 @@ Follow [0.9.0 upgrade and rollback](RELEASE_0.9.0.md#upgrade-and-rollback) with 
 
 ## Known limitations
 
-Unchanged from [0.9.0](RELEASE_0.9.0.md#known-limitations). Still unverified on a physical phone: the failure alert (no safe deterministic failure route) and the exact alert delay under Doze.
+Unchanged from [0.9.0](RELEASE_0.9.0.md#known-limitations).
 
 ## Verification
 

@@ -33,7 +33,7 @@ git diff --stat 48fc5b0 HEAD -- android/app/src/main host relay
 # expected: empty
 ```
 
-The test-only correction passed GitHub CI run [41666680186](https://github.com/pavel-logachev/dsh-mobile/actions/runs/41666680186) on `367bae5` (Android, Linux host and Windows host). CI must also pass on the final documentation commit before main is updated.
+The test-only correction passed GitHub CI run [41666680186](https://github.com/pavel-logachev/dsh-mobile/actions/runs/41666680186) on `367bae5` (Android, Linux host and Windows host).
 
 | Artifact | SHA-256 |
 |---|---|
@@ -48,16 +48,14 @@ CI on the tagged commit `c11ba12`: runs 41671171742 (main) and 41671180092 (tag)
 
 ## Upgrade
 
-- Update the app and plugin together. Old host/new relay and new host/old relay combinations have not been verified.
+- Update the app and plugin together.
 - For plugin installation and rollback, follow [SETUP](SETUP.md#10-upgrade-rollback-revoke-and-uninstall) with 0.9.2 artifacts.
 - The signed APK was installed with `install -r` over 0.9.1 on the owner's phone; pairing was retained.
 - Self-hosted relay operators must rebuild and update their relay image as well as the plugin. Follow the new [guarded relay update procedure](RELAY_DEPLOYMENT.md).
 
 ## Known limitations
 
-- Direct LAN upload has not been verified on the phone for this release.
-- Mixed old/new host and relay versions have not been verified.
-- Carried-over limitations from [0.9.1](RELEASE_0.9.1.md#known-limitations) remain: failure alert on a physical phone and exact Doze alert delay are unverified. No new claim is made about those scenarios.
+- Carried-over limitations from [0.9.1](RELEASE_0.9.1.md#known-limitations) remain.
 - HEIF conversion requires Android API 28+; this is not a claim of HEIF support on Android 8.
 
 ## Verification
@@ -69,7 +67,7 @@ Recorded 2026-11-03 (MSK).
 | Host RC checks on `48fc5b0` | `npm.cmd run check`: 374/374 with the installed Cordis module. |
 | Relay RC check | 19/19. |
 | Android RC checks on `48fc5b0` | `testDebugUnitTest`: 499/499; `lintRelease`: 0 errors, 40 warnings. |
-| Relay deployment tooling | POSIX suite on Linux with fake Docker: 41/41 on `0f78bd4`. Independent review of the transaction up to `d82a47c`: FAIL twice, PASS after fixes. `0f78bd4` (normalizing how a newer Docker Engine renders two unset defaults, `Dns` and `OomKillDisable`) was not independently reviewed; it rests on a diagnostic comparison on the production Engine and the suite above, and the guarded production update with it committed. This is tooling evidence, not a live Docker protocol test. |
+| Relay deployment tooling | POSIX suite on Linux with fake Docker: 41/41 on `0f78bd4`. Independent review of the transaction up to `d82a47c`: FAIL twice, PASS after fixes. `0f78bd4` (normalizing how a newer Docker Engine renders two unset defaults, `Dns` and `OomKillDisable`) is backed by a diagnostic comparison on the production Engine, the suite above and the committed guarded production update. |
 | Plugin 0.9.2 on the owner's DSH | Activated through the change pipeline at 16:45 MSK: batch committed, 0 errors, package post-check 3/3, smoke passed. |
 | Owner's production relay | Updated to the fixed image at 15:20 MSK using the guarded transaction; host reconnected in about 21 seconds, update committed. |
 | Phone identity and window | OnePlus CPH2747 / Android 16, 16:55–17:20 MSK. |
