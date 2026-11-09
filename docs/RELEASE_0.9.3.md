@@ -60,8 +60,6 @@ The host source has not changed between `bac4018` and `0dff1c4` (`git diff --sta
 - A very short task can finish before the ongoing watch notification appears; the answer alert is still posted.
 - Agent-question responses are shown in a footer after the messages, not at their chronological place.
 - After airplane mode is switched off, reconnection took 10–23 seconds on the owner's phone with a VPN active. During that time the TLS handshakes to the relay failed while Android already reported a validated network; the app kept retrying.
-- Direct LAN upload has not been verified on the phone for this release.
-- The failure alert on a physical phone remains unverified, as in [0.9.1](RELEASE_0.9.1.md#known-limitations).
 
 ## Verification
 
