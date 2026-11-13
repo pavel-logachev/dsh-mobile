@@ -268,9 +268,9 @@ No. DSH Mobile is a companion to the DeepSeek Harness host, not a purchase of a 
 - [Signing and releasing the Android APK](<docs/ANDROID_RELEASE.md>)
 - [Contributing](<CONTRIBUTING.md>)
 
-## Need something similar?
+## Author
 
-This project was built by [Pavel Logachev](https://github.com/pavel-logachev). I build websites, web services, Telegram bots, apps and automation for your task. AI agents write the code under my direction. I scope the task, review and ship. 20 years in IT: first as an engineer, then as a project manager. Tell me about your task [by email](mailto:pavel@logachev.net) or [on Telegram](https://t.me/pavel_logachev) — a 20–30 minute review is free, and you do not need a ready-made specification. Prices and other projects are on [logachev.net](https://logachev.net/) and [in my profile](https://github.com/pavel-logachev).
+Built by [Pavel Logachev](https://github.com/pavel-logachev). I build AI agents for sales and procurement: [logachev.net](https://logachev.net/).
 
 ## License
 

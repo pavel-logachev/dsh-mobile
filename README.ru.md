@@ -268,9 +268,9 @@ DSH Mobile — companion к хосту DeepSeek Harness, а не покупка 
 - [Подпись и выпуск Android APK](<docs/ANDROID_RELEASE.md>)
 - [Участие в проекте](<CONTRIBUTING.md>)
 
-## Нужно похожее решение?
+## Автор
 
-Проект сделал [Павел Логачев](https://github.com/pavel-logachev). Делаю сайты, веб-сервисы, Telegram-ботов, приложения и автоматизацию под задачу. Код пишут ИИ-агенты под моим руководством, я разбираю задачу, проверяю и запускаю. 20 лет в ИТ: инженер, затем руководитель проектов. Расскажите о задаче [на почту](mailto:pavel@logachev.net) или [в Telegram](https://t.me/pavel_logachev) — разбор на 20–30 минут бесплатный, готовое ТЗ не нужно. Цены и другие проекты — на [logachev.net](https://logachev.net/) и [в профиле](https://github.com/pavel-logachev).
+Проект сделал [Павел Логачев](https://github.com/pavel-logachev). Делаю ИИ-агентов для продаж и закупок: [logachev.net](https://logachev.net/).
 
 ## English
 
@@ -280,7 +280,7 @@ Pair with a one-use QR code and connect over Wi‑Fi, Tailscale or your own opti
 
 Requires Android 8.0+, Windows, DSH `0.2.0-rc.2`, `0.2.1-alpha.1` or `0.2.1-rc.5`, Node.js 24.x and OpenSSL 3. The current release is app/plugin **0.9.3** ([release notes](<docs/RELEASE_0.9.3.md>)). Upgrade both together: phone-task notifications use `promptOutcomes`, not the retired feed. No idle permanent notification or coverage banner; active-task FGS disclosure is still OEM-dependent. Pending watches may restore after unlocked reboot; force-stop requires a user launch. Approvals and plugin/skill management remain desktop-only. Follow the [setup guide](<docs/SETUP.md>) and use only reviewed published release assets.
 
-Built by [Pavel Logachev](https://github.com/pavel-logachev): 20 years in IT, first as an engineer, then as a project manager. I build websites, web services, Telegram bots, apps and automation for your task. Have a similar one? [pavel@logachev.net](mailto:pavel@logachev.net) · [logachev.net](https://logachev.net/)
+Built by [Pavel Logachev](https://github.com/pavel-logachev). I build AI agents for sales and procurement: [logachev.net](https://logachev.net/).
 
 ## Лицензия
 
