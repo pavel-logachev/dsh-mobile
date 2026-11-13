@@ -2,7 +2,7 @@
 
 # DSH Mobile
 
-Кейс на сайте: <https://logachev.net/#case-dsh-mobile> · Статья в журнале: [DeepSeek Harness с телефона: как управлять агентом на компьютере с Android](https://logachev.net/journal/deepseek-harness-s-telefona-android/) · Разборы на Хабре: [плагин и привязка телефона](https://habr.com/ru/articles/1099110/), [уведомления о задачах без пушей Google](https://habr.com/ru/articles/1103324/)
+Кейс на сайте: <https://logachev.net/projects/#case-dsh-mobile> · Статья в журнале: [DeepSeek Harness с телефона: как управлять агентом на компьютере с Android](https://logachev.net/journal/deepseek-harness-s-telefona-android/) · Разборы на Хабре: [плагин и привязка телефона](https://habr.com/ru/articles/1099110/), [уведомления о задачах без пушей Google](https://habr.com/ru/articles/1103324/)
 
 [![Последний релиз](https://img.shields.io/github/v/release/pavel-logachev/dsh-mobile?style=flat-square&labelColor=0b0f14&label=%D1%80%D0%B5%D0%BB%D0%B8%D0%B7&color=c3f451)](https://github.com/pavel-logachev/dsh-mobile/releases/latest) [![Проверки в CI](https://img.shields.io/github/actions/workflow/status/pavel-logachev/dsh-mobile/ci.yml?branch=main&style=flat-square&labelColor=0b0f14&label=CI)](https://github.com/pavel-logachev/dsh-mobile/actions/workflows/ci.yml) [![Лицензия](https://img.shields.io/github/license/pavel-logachev/dsh-mobile?style=flat-square&labelColor=0b0f14&label=%D0%BB%D0%B8%D1%86%D0%B5%D0%BD%D0%B7%D0%B8%D1%8F&color=7f99ad)](<LICENSE>)
 

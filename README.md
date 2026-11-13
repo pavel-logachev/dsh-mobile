@@ -2,7 +2,7 @@
 
 # DSH Mobile
 
-Case study on the website: <https://logachev.net/#case-dsh-mobile> · Technical write-ups (in Russian) on Habr: [the plugin and pairing](https://habr.com/ru/articles/1099110/), [task notifications without Google push](https://habr.com/ru/articles/1103324/)
+Case study on the website: <https://logachev.net/projects/#case-dsh-mobile> · Technical write-ups (in Russian) on Habr: [the plugin and pairing](https://habr.com/ru/articles/1099110/), [task notifications without Google push](https://habr.com/ru/articles/1103324/)
 
 [![Latest release](https://img.shields.io/github/v/release/pavel-logachev/dsh-mobile?style=flat-square&labelColor=0b0f14&label=release&color=c3f451)](https://github.com/pavel-logachev/dsh-mobile/releases/latest) [![CI checks](https://img.shields.io/github/actions/workflow/status/pavel-logachev/dsh-mobile/ci.yml?branch=main&style=flat-square&labelColor=0b0f14&label=CI)](https://github.com/pavel-logachev/dsh-mobile/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/pavel-logachev/dsh-mobile?style=flat-square&labelColor=0b0f14&label=license&color=7f99ad)](<LICENSE>)
 
