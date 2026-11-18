@@ -51,7 +51,7 @@ Use synthetic fixtures and fresh disposable grants for reproductions. Identify w
 
 ## Responsible reporting
 
-Do not put exploitable details or secrets in public issues. Contact the project maintainer privately through a channel you already know. No public security-reporting contact or dedicated intake URL has been established yet; the owner must provide one before public release. If no private channel is available, ask for a private reporting route without posting the vulnerability details.
+Do not put exploitable details or secrets in public issues. Report vulnerabilities privately through GitHub: open the repository's Security tab and choose "Report a vulnerability" (https://github.com/pavel-logachev/dsh-mobile/security/advisories/new). Only the maintainer sees these reports.
 
 A useful private report includes affected versions, the trust boundary crossed, a minimal synthetic reproduction, expected/observed behavior and possible impact. Send only scrubbed diagnostics. No response-time or remediation SLA is promised during this preview.
 
